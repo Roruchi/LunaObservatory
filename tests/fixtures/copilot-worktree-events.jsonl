@@ -1,0 +1,2 @@
+{"type":"tool.execution_start","data":{"toolCallId":"call_view","toolName":"view","arguments":{"path":"C:\\Repo\\Personal\\Games\\Satori.worktrees\\copilot-worktree-1\\project.godot"}},"id":"worktree-start-1","timestamp":"2026-03-31T11:30:06.701Z"}
+{"type":"tool.execution_complete","data":{"toolCallId":"call_view","success":true,"result":{"content":"ok"},"status":"success"},"id":"worktree-complete-1","timestamp":"2026-03-31T11:30:06.766Z"}

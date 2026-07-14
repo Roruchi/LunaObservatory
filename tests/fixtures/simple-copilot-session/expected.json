@@ -1,0 +1,25 @@
+{
+  "turns": 1,
+  "assistantMessages": 1,
+  "models": {
+    "gpt-5.4": 1
+  },
+  "outputTokens": {
+    "value": 328,
+    "source": "reported"
+  },
+  "toolRequests": 4,
+  "toolExecutionsStarted": 4,
+  "hookInvocations": 1,
+  "hookFailures": 0,
+  "totalHookLatencyMs": 24,
+  "filesViewed": 2,
+  "uniqueFilesViewed": 2,
+  "repeatedFileViews": 0,
+  "globCalls": 1,
+  "editCalls": 0,
+  "verificationEvents": 0,
+  "declaredIntents": [
+    "Validating test project"
+  ]
+}
