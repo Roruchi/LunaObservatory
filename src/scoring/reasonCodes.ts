@@ -1,0 +1,15 @@
+export const reasonCodes = [
+  "HIGH_OUTPUT_TOKEN_OUTLIER",
+  "MANY_TURNS",
+  "HIGH_TOOL_CHURN",
+  "REPEATED_FILE_VIEWS",
+  "REPEATED_GLOB_SEARCH",
+  "FAILED_COMMAND_LOOP",
+  "MISSING_VERIFICATION",
+  "EXPENSIVE_NO_OP",
+  "LOW_SIGNAL_EXPLORATION",
+  "HOOK_FAILURES",
+  "UNKNOWN_INPUT_TOKENS"
+] as const;
+
+export type ReasonCode = (typeof reasonCodes)[number];

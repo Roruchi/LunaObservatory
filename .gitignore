@@ -1,0 +1,7 @@
+node_modules/
+.pnpm-store/
+dist/
+.lunaobs/
+.agents/skills/lunaobs-dream/
+.github/skills/lunaobs-dream/
+.claude/skills/lunaobs-dream/
