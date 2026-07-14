@@ -2,6 +2,7 @@ import type { SourceName } from "../sources/types.js";
 import { stableId } from "../utils/stableId.js";
 import { durationMs, maxIso, minIso } from "../utils/time.js";
 import { calculateMetrics, reported, unavailable } from "./metrics.js";
+import { isEditTool } from "./toolSemantics.js";
 import type {
   EvidenceRef,
   NormalizedAssistantMessage,
@@ -183,7 +184,7 @@ function extractSessionId(events: RawLogEvent[], sourceFile: string): string {
   for (const event of events) {
     const data = objectData(event);
     const input = data.input && typeof data.input === "object" ? (data.input as Record<string, unknown>) : undefined;
-    const sessionId = stringValue(input?.sessionId) ?? stringValue(data.sessionId) ?? stringValue(data.session_id) ?? stringValue(data.id);
+    const sessionId = stringValue(data.id) ?? stringValue(input?.sessionId) ?? stringValue(data.sessionId) ?? stringValue(data.session_id);
     if (sessionId) return sessionId;
   }
   return stableId(sourceFile);
@@ -212,6 +213,18 @@ function extractTextContent(content: unknown): string {
       const item = nestedObject(part);
       return stringValue(item?.text) ?? stringValue(item?.message) ?? "";
     })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function toolOutputText(value: unknown, depth = 0): string {
+  if (depth > 5 || value === null || value === undefined) return "";
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.map((item) => toolOutputText(item, depth + 1)).filter(Boolean).join("\n");
+  if (typeof value !== "object") return String(value);
+  const record = value as Record<string, unknown>;
+  return ["text", "value", "output", "result", "content"]
+    .map((key) => toolOutputText(record[key], depth + 1))
     .filter(Boolean)
     .join("\n");
 }
@@ -247,7 +260,8 @@ function stripContextBlocks(text: string): string {
     "apps_instructions",
     "skills_instructions",
     "plugins_instructions",
-    "collaboration_mode"
+    "collaboration_mode",
+    "recommended_plugins"
   ].reduce((current, tag) => stripBlock(current, tag), text);
 }
 
@@ -270,6 +284,30 @@ function extractUserIntentText(text: string): string {
     return clipText(withoutBlocks.slice(requestMarker.index + requestMarker[0].length), 2400);
   }
   return clipText(withoutBlocks, 2400);
+}
+
+function scopeSubagentEvents(events: RawLogEvent[]): RawLogEvent[] {
+  const childMetaIndex = events.findIndex((event) => event.type === "session_meta" && Boolean(stringValue(objectData(event).agent_path)));
+  if (childMetaIndex < 0) return events;
+  const childMeta = events[childMetaIndex];
+  const childData = objectData(childMeta);
+  const childId = stringValue(childData.id);
+  const copiedParentMetaIndex = events.findIndex(
+    (event, index) => index > childMetaIndex && event.type === "session_meta" && stringValue(objectData(event).id) !== childId
+  );
+  if (copiedParentMetaIndex < 0) return events;
+
+  const bootstrapIndex = events.findIndex((event, index) => {
+    if (index <= copiedParentMetaIndex || event.type !== "response_item") return false;
+    const data = objectData(event);
+    return data.type === "message" && data.role === "developer" && /^You are an agent in a team of agents\b/i.test(extractTextContent(data.content));
+  });
+  const timestampBoundary = events.findIndex(
+    (event, index) => index > copiedParentMetaIndex && event.timestamp >= childMeta.timestamp && event.type !== "session_meta"
+  );
+  const boundary = bootstrapIndex >= 0 ? bootstrapIndex : timestampBoundary;
+  if (boundary < 0) return [childMeta];
+  return [childMeta, ...events.slice(boundary).filter((event) => event.type !== "session_meta")];
 }
 
 function instructionSnippets(text: string): string[] {
@@ -296,9 +334,7 @@ function addInstructionSnippets(
   text: string,
   event: RawLogEvent
 ): void {
-  if (instructions.length >= 24) return;
   for (const snippet of instructionSnippets(text)) {
-    if (instructions.length >= 24) return;
     const exists = instructions.some((instruction) => instruction.role === role && instruction.text === snippet);
     if (exists) continue;
     instructions.push({
@@ -311,20 +347,21 @@ function addInstructionSnippets(
 
 function finalClaimTexts(finalAnswer: string): string[] {
   const withoutCode = finalAnswer.replace(/```[\s\S]*?```/g, " ");
-  const lineParts = withoutCode.split(/\n+/);
-  const sentenceParts = withoutCode.split(/(?<=[.!?])\s+/);
+  const parts = withoutCode.split(/\n+/).flatMap((line) => (line.length > 320 ? line.split(/(?<=[.!?])\s+/) : [line]));
   const claimPattern =
     /\b(added|built|captured|changed|committed|completed|created|documented|done|fixed|implemented|passed|pushed|ran|removed|tested|updated|validated|verified|wired)\b/i;
   const claims: string[] = [];
-  for (const part of [...lineParts, ...sentenceParts]) {
+  for (const part of parts) {
     if (claims.length >= 8) break;
     const normalized = normalizeText(part.replace(/^[-*#>\s]+/, "").replace(/\*\*/g, ""));
     if (normalized.length < 8) continue;
     if (/^(changed|result|resultaat|tests?|validation|verificatie|verified|what changed):?$/i.test(normalized)) continue;
+    if (/^::[a-z-]+\b/i.test(normalized) || /^[a-z_]+\s*=/i.test(normalized)) continue;
+    if (/^(done|completed|implemented|fixed)\.?$/i.test(normalized)) continue;
     if (/^if you want\b/i.test(normalized)) continue;
     if (!claimPattern.test(normalized)) continue;
     const clipped = clipText(normalized, 260);
-    if (!claims.includes(clipped)) claims.push(clipped);
+    if (!claims.some((claim) => claim === clipped || claim.includes(clipped) || clipped.includes(claim))) claims.push(clipped);
   }
   return claims;
 }
@@ -354,13 +391,21 @@ export function normalizeEventsToSession(
   sourceFile: string,
   parseErrors = 0
 ): NormalizedSession {
+  events = scopeSubagentEvents(events);
   const turns = new Map<string, MutableTurn>();
   const sessionId = extractSessionId(events, sourceFile);
   const interactions = new Set<string>();
   const turnModels = new Map<string, string>();
-  const instructions: NormalizedInstructionEvidence[] = [];
+  const directUserInstructions: NormalizedInstructionEvidence[] = [];
+  const contextInstructions: NormalizedInstructionEvidence[] = [];
+  const developerInstructions: NormalizedInstructionEvidence[] = [];
+  const systemInstructions: NormalizedInstructionEvidence[] = [];
   let userIntent: NormalizedTextEvidence | undefined;
   let finalAnswer: NormalizedTextEvidence | undefined;
+  let parentSessionId: string | undefined;
+  let agentPath: string | undefined;
+  let sessionCwd: string | undefined;
+  let sessionModel: string | undefined;
   let currentTurnId = "unknown";
 
   for (const event of events) {
@@ -370,13 +415,11 @@ export function normalizeEventsToSession(
     if (interactionId) interactions.add(interactionId);
 
     if (event.type === "session_meta") {
-      const metaTurnId = stringValue(data.id) ?? currentTurnId;
-      currentTurnId = metaTurnId;
-      const turn = getTurn(turns, metaTurnId);
-      touchTurnTime(turn, event.timestamp);
-      addSyntheticCwdHook(turn, event, stringValue(data.cwd));
-      const model = stringValue(data.model);
-      if (model) turnModels.set(metaTurnId, model);
+      const parent = stringValue(data.parent_thread_id) ?? stringValue(data.session_id);
+      if (parent && parent !== sessionId) parentSessionId = parent;
+      agentPath = stringValue(data.agent_path) ?? agentPath;
+      sessionCwd = stringValue(data.cwd) ?? sessionCwd;
+      sessionModel = stringValue(data.model) ?? sessionModel;
       continue;
     }
 
@@ -385,8 +428,8 @@ export function normalizeEventsToSession(
       currentTurnId = contextTurnId;
       const turn = getTurn(turns, contextTurnId);
       touchTurnTime(turn, event.timestamp);
-      addSyntheticCwdHook(turn, event, stringValue(data.cwd));
-      const model = stringValue(data.model);
+      addSyntheticCwdHook(turn, event, stringValue(data.cwd) ?? sessionCwd);
+      const model = stringValue(data.model) ?? sessionModel;
       if (model) turnModels.set(contextTurnId, model);
       continue;
     }
@@ -399,6 +442,7 @@ export function normalizeEventsToSession(
         touchTurnTime(turn, event.timestamp);
         turn.assistantMessages.push({
           messageId: event.id,
+          kind: "token_usage",
           tokenScope: "session",
           model: stringValue(data.currentModel),
           contentLength: 0,
@@ -425,11 +469,17 @@ export function normalizeEventsToSession(
       const turn = getTurn(turns, eventTurnId);
       if (eventTurnId !== "unknown") currentTurnId = eventTurnId;
       touchTurnTime(turn, event.timestamp);
+      addSyntheticCwdHook(turn, event, sessionCwd);
+      if (!turnModels.has(eventTurnId) && sessionModel) turnModels.set(eventTurnId, sessionModel);
+
+      if (eventType === "task_started") turn.lifecycleStatus = "in_progress";
+      if (eventType === "task_complete") turn.lifecycleStatus = "completed";
+      if (eventType === "task_aborted" || eventType === "turn_aborted") turn.lifecycleStatus = "aborted";
 
       if (eventType === "agent_message") {
         const content = stringValue(data.message) ?? "";
+        const text = clipText(content, 2400);
         if (content.trim()) {
-          const text = clipText(content, 2400);
           finalAnswer = {
             text,
             evidence: [evidence(event, "data.message", `captured final assistant answer: ${excerpt(text)}`)]
@@ -437,6 +487,9 @@ export function normalizeEventsToSession(
         }
         turn.assistantMessages.push({
           messageId: event.id,
+          kind: "text",
+          text,
+          contentFingerprint: content.trim() ? stableId(normalizeText(content)) : undefined,
           model: turnModels.get(eventTurnId),
           contentLength: content.length,
           hasContent: content.length > 0,
@@ -452,13 +505,17 @@ export function normalizeEventsToSession(
 
       if (eventType === "token_count") {
         const info = nestedObject(data.info);
+        const totalUsage = nestedObject(info?.total_token_usage);
         const lastUsage = nestedObject(info?.last_token_usage);
-        const inputTokens = numberValue(lastUsage?.input_tokens);
-        const outputTokens = numberValue(lastUsage?.output_tokens);
-        const cachedTokens = numberValue(lastUsage?.cached_input_tokens);
+        const usage = totalUsage ?? lastUsage;
+        const inputTokens = numberValue(usage?.input_tokens);
+        const outputTokens = numberValue(usage?.output_tokens);
+        const cachedTokens = numberValue(usage?.cached_input_tokens);
         if (inputTokens !== undefined || outputTokens !== undefined || cachedTokens !== undefined) {
           turn.assistantMessages.push({
             messageId: `${event.id}:token_count`,
+            kind: "token_usage",
+            tokenScope: totalUsage ? "session" : "message",
             contentLength: 0,
             hasContent: false,
             hasEncryptedContent: false,
@@ -468,9 +525,9 @@ export function normalizeEventsToSession(
             cachedTokens: cachedTokens === undefined ? unavailable() : reported(cachedTokens),
             toolRequestIds: [],
             evidence: [
-              ...(inputTokens === undefined ? [] : [evidence(event, "data.info.last_token_usage.input_tokens", `inputTokens=${inputTokens}`)]),
-              ...(outputTokens === undefined ? [] : [evidence(event, "data.info.last_token_usage.output_tokens", `outputTokens=${outputTokens}`)]),
-              ...(cachedTokens === undefined ? [] : [evidence(event, "data.info.last_token_usage.cached_input_tokens", `cachedTokens=${cachedTokens}`)])
+              ...(inputTokens === undefined ? [] : [evidence(event, "data.info.total_token_usage.input_tokens", `inputTokens=${inputTokens}`)]),
+              ...(outputTokens === undefined ? [] : [evidence(event, "data.info.total_token_usage.output_tokens", `outputTokens=${outputTokens}`)]),
+              ...(cachedTokens === undefined ? [] : [evidence(event, "data.info.total_token_usage.cached_input_tokens", `cachedTokens=${cachedTokens}`)])
             ]
           });
         }
@@ -488,18 +545,38 @@ export function normalizeEventsToSession(
       if (payloadType === "message") {
         const role = roleValue(data.role);
         const contentText = extractTextContent(data.content);
+        const contextOnly = role === "user" && isContextOnlyUserMessage(contentText);
 
         if ((role === "system" || role === "developer" || role === "user") && contentText.trim()) {
-          addInstructionSnippets(instructions, role, contentText, event);
+          const target =
+            role === "user"
+              ? contextOnly
+                ? contextInstructions
+                : directUserInstructions
+              : role === "developer"
+                ? developerInstructions
+                : systemInstructions;
+          addInstructionSnippets(target, role, contentText, event);
         }
 
-        if (role === "user" && !userIntent && !isContextOnlyUserMessage(contentText)) {
+        if (role === "user" && !userIntent && !contextOnly) {
           const intentText = extractUserIntentText(contentText);
           if (intentText) {
             userIntent = {
               text: intentText,
               evidence: [evidence(event, "data.content", `captured original user intent: ${excerpt(intentText)}`)]
             };
+          }
+        }
+
+        if (role === "user" && !contextOnly) {
+          const taskText = extractUserIntentText(contentText);
+          if (taskText) {
+            turn.userMessages ??= [];
+            turn.userMessages.push({
+              text: taskText,
+              evidence: [evidence(event, "data.content", `captured task-window user request: ${excerpt(taskText)}`)]
+            });
           }
         }
 
@@ -514,6 +591,9 @@ export function normalizeEventsToSession(
           }
           turn.assistantMessages.push({
             messageId: stringValue(data.id) ?? event.id,
+            kind: "text",
+            text,
+            contentFingerprint: text ? stableId(normalizeText(contentText)) : undefined,
             model: turnModels.get(responseTurnId),
             contentLength,
             hasContent: contentLength > 0,
@@ -526,9 +606,23 @@ export function normalizeEventsToSession(
               : undefined
           });
         }
+      } else if (payloadType === "agent_message") {
+        const recipient = stringValue(data.recipient);
+        const author = stringValue(data.author);
+        if (agentPath && recipient === agentPath && author !== agentPath && !userIntent) {
+          const messageText = extractTextContent(data.content);
+          const payload = /\bPayload:\s*([\s\S]*)$/i.exec(messageText)?.[1]?.trim();
+          if (payload) {
+            userIntent = {
+              text: clipText(payload, 2400),
+              evidence: [evidence(event, "data.content", `captured subagent task intent: ${excerpt(payload)}`)]
+            };
+          }
+        }
       } else if (payloadType === "reasoning") {
         turn.assistantMessages.push({
           messageId: stringValue(data.id) ?? event.id,
+          kind: "reasoning",
           model: turnModels.get(responseTurnId),
           contentLength: 0,
           hasContent: false,
@@ -548,8 +642,7 @@ export function normalizeEventsToSession(
             name: toolName,
             arguments: parsedArgs,
             requestedAt: event.timestamp,
-            executionStartedAt: event.timestamp,
-            status: "started",
+            status: "requested",
             evidence: [
               evidence(event, "data.name", `tool=${toolName}`),
               ...(pathArg ? [evidence(event, "data.arguments.path", `${toolName} path=${pathArg}`)] : [])
@@ -564,13 +657,21 @@ export function normalizeEventsToSession(
         const toolCallId = stringValue(data.call_id);
         if (toolCallId) {
           const toolTurn = findTurnByToolCall(turns, [toolCallId]) ?? turn;
-          const output = stringValue(data.output) ?? "";
-          const failed = /Exit code:\s*(?!0\b)\d+/i.test(output);
+          const output = toolOutputText(data.output);
+          const existing = toolTurn.toolMap.get(toolCallId);
+          const isOrchestration = /(?:^|[.:/])exec(?:_command)?$/i.test(existing?.name ?? "") &&
+            typeof existing?.arguments === "string" && /\btools\.[\w_]+\s*\(/.test(existing.arguments);
+          const editFailed = Boolean(existing && isEditTool(existing)) &&
+            /\b(?:apply_patch verification failed|failed to find expected|invalid context|patch failed|could not apply patch)\b/i.test(output);
+          const failed = isOrchestration
+            ? /\bScript (?:failed|timed out|terminated)\b|\bTool call failed\b/i.test(output)
+            : /Exit code:\s*(?!0\b)\d+/i.test(output) || editFailed;
           touchTurnTime(toolTurn, event.timestamp);
           addOrUpdateTool(toolTurn, {
             toolCallId,
             name: toolTurn.toolMap.get(toolCallId)?.name ?? "unknown",
             executionEndedAt: event.timestamp,
+            outputText: output,
             status: failed ? "failed" : "completed",
             evidence: output
               ? [evidence(event, "data.output", `${failed ? "failed" : "completed"} output: ${excerpt(output, 220)}`)]
@@ -596,6 +697,9 @@ export function normalizeEventsToSession(
       const model = stringValue(data.model);
       const message: NormalizedAssistantMessage = {
         messageId: stringValue(data.messageId),
+        kind: "text",
+        text: typeof data.content === "string" ? clipText(data.content, 2400) : undefined,
+        contentFingerprint: typeof data.content === "string" && data.content.trim() ? stableId(normalizeText(data.content)) : undefined,
         model,
         contentLength: typeof data.content === "string" ? data.content.length : 0,
         hasContent: typeof data.content === "string" && data.content.length > 0,
@@ -668,14 +772,10 @@ export function normalizeEventsToSession(
       const status = stringValue(data.status)?.toLowerCase();
       const failed = data.success === false || status === "failed" || status === "error" || status === "cancelled";
       const existingArguments = turn.toolMap.get(toolCallId)?.arguments;
-      const completionArguments =
-        event.type === "tool.execution_complete" && data.result !== undefined
-          ? { arguments: existingArguments, result: data.result }
-          : existingArguments;
       addOrUpdateTool(turn, {
         toolCallId,
         name: stringValue(data.toolName) ?? turn.toolMap.get(toolCallId)?.name ?? "unknown",
-        arguments: completionArguments,
+        arguments: existingArguments,
         executionEndedAt: event.timestamp,
         status: failed ? "failed" : "completed"
       });
@@ -742,7 +842,17 @@ export function normalizeEventsToSession(
 
   const normalizedTurns = [...turns.values()]
     .map(({ toolMap: _toolMap, hookMap: _hookMap, ...turn }) => turn)
+    .filter((turn) => Boolean(turn.lifecycleStatus || turn.assistantMessages.length || turn.toolCalls.length || turn.hooks.length))
     .sort((a, b) => (a.startedAt ?? "").localeCompare(b.startedAt ?? ""));
+  const instructions = [
+    ...directUserInstructions,
+    ...contextInstructions.slice(0, 8),
+    ...developerInstructions.slice(0, 12),
+    ...systemInstructions.slice(0, 4)
+  ].slice(0, 32);
+  const lifecycleStatus = [...normalizedTurns]
+    .reverse()
+    .find((turn) => turn.lifecycleStatus && turn.lifecycleStatus !== "unknown")?.lifecycleStatus ?? "unknown";
 
   const finalClaims = finalAnswer
     ? finalClaimTexts(finalAnswer.text).map((text) => ({
@@ -753,11 +863,14 @@ export function normalizeEventsToSession(
 
   const sessionBase = {
     sessionId,
+    ...(parentSessionId ? { parentSessionId } : {}),
+    ...(agentPath ? { agentPath } : {}),
     source,
     sourceFiles: [sourceFile],
     repoMatch: "unknown" as const,
     startedAt: minIso(events.map((event) => event.timestamp)),
     endedAt: maxIso(events.map((event) => event.timestamp)),
+    lifecycleStatus,
     interactions: [...interactions].sort(),
     turns: normalizedTurns,
     ...(userIntent ? { userIntent } : {}),

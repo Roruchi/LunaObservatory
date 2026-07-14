@@ -2,16 +2,22 @@ import fs from "node:fs";
 import path from "node:path";
 import type {
   ClaimCheck,
+  DreamChangeClassification,
   DreamConfidence,
   DreamEvidenceRef,
   DreamFinding,
+  DreamFindingDisposition,
   DreamPacket,
   DreamReport,
   DreamScore,
   DreamSession,
   DreamSeverity,
+  DreamTaskWindow,
+  DreamVerificationType,
   InstructionCheck
 } from "./types.js";
+import type { VerificationClosure } from "../normalize/types.js";
+import { buildDreamDecisionReport } from "./decisionReport.js";
 
 function packetRef(session: DreamSession, metric: string, summary: string): DreamEvidenceRef {
   return {
@@ -32,6 +38,20 @@ function metricNumber(session: DreamSession, key: string): number {
   return 0;
 }
 
+function verificationClosure(session: DreamSession): VerificationClosure {
+  const explicit = session.verificationClosure ?? (session.metrics as { verificationClosure?: VerificationClosure }).verificationClosure;
+  if (explicit) return explicit;
+  if (metricNumber(session, "editCalls") === 0) return "not_applicable";
+  const freshChecks = session.verificationChecks.filter((check) => check.fresh !== false);
+  if (!freshChecks.length) return "missing";
+  const latestByLane = new Map<string, DreamSession["verificationChecks"][number]>();
+  for (const check of freshChecks) latestByLane.set(check.lane ?? commandKey(check.command), check);
+  const statuses = [...latestByLane.values()].map((check) => check.status);
+  if (statuses.some((status) => status === "failed")) return "failed";
+  if (statuses.length && statuses.every((status) => status === "passed")) return "passed";
+  return "missing";
+}
+
 function confidenceForRefs(refs: DreamEvidenceRef[]): DreamConfidence {
   if (refs.some((ref) => ref.sourceFile && ref.lineNumber)) return "high";
   if (refs.length) return "medium";
@@ -48,13 +68,46 @@ function addFinding(
     evidenceRefs: DreamEvidenceRef[];
     confidence?: DreamConfidence;
     suggestedImprovement: string;
+    patternKey?: string;
+    sessionId?: string;
+    taskId?: string;
+    disposition?: DreamFindingDisposition;
+    observation?: string;
+    interpretation?: string;
+    alternativeExplanation?: string;
+    recommendedAction?: string;
+    applyTarget?: string;
   }
 ): void {
   if (!options.evidenceRefs.length) return;
+  const prefix = options.category === "Verification quality"
+    ? "VER"
+    : options.category === "Evidence grounding"
+      ? "EVD"
+      : options.category === "Instruction adherence"
+        ? "INS"
+        : options.category === "Intent adherence"
+          ? "INT"
+          : options.category === "Efficiency"
+            ? "EFF"
+            : "FND";
+  const findingNumber = findings.filter((finding) => finding.findingId.startsWith(`${prefix}-`)).length + 1;
+  const patternKey = options.patternKey ?? `${prefix}-${options.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "")}`;
   findings.push({
+    findingId: `${prefix}-${String(findingNumber).padStart(3, "0")}`,
+    patternKey,
+    sessionId: options.sessionId ?? options.evidenceRefs.find((ref) => ref.sessionId)?.sessionId,
+    taskId: options.taskId,
     severity: options.severity,
     category: options.category,
     title: options.title,
+    disposition: options.disposition ?? "reliable",
+    observation: options.observation ?? options.explanation,
+    interpretation: options.interpretation ?? options.explanation,
+    alternativeExplanation:
+      options.alternativeExplanation ?? "The frozen packet may omit context that would change this interpretation.",
+    recommendedAction: options.recommendedAction ?? options.suggestedImprovement,
+    applyTarget: options.applyTarget ?? "the applicable repository or agent workflow",
     explanation: options.explanation,
     evidenceRefs: options.evidenceRefs,
     confidence: options.confidence ?? confidenceForRefs(options.evidenceRefs),
@@ -73,15 +126,18 @@ function commandKey(command?: string): string {
 function failedVerificationChecks(session: DreamSession): VerificationCheckWithIndex[] {
   return session.verificationChecks
     .map((check, index) => ({ ...check, index }))
-    .filter((check) => check.status === "failed");
+    .filter((check) => check.status === "failed" && check.fresh !== false);
 }
 
 type VerificationCheckWithIndex = DreamSession["verificationChecks"][number] & { index: number };
 
 function hasLaterPassingCheck(session: DreamSession, failed: VerificationCheckWithIndex): boolean {
-  const key = commandKey(failed.command);
+  const key = failed.lane ?? commandKey(failed.command);
   if (!key) return false;
-  return session.verificationChecks.some((check, index) => index > failed.index && check.status === "passed" && commandKey(check.command) === key);
+  return session.verificationChecks.some(
+    (check, index) =>
+      index > failed.index && check.fresh !== false && check.status === "passed" && (check.lane ?? commandKey(check.command)) === key
+  );
 }
 
 function verificationCheckSummary(checks: VerificationCheckWithIndex[]): string {
@@ -99,65 +155,248 @@ function recoveredVerificationChecks(session: DreamSession): VerificationCheckWi
   return failedVerificationChecks(session).filter((check) => hasLaterPassingCheck(session, check));
 }
 
+type TaskVerificationAssessment = {
+  status: "verified" | "missing" | "failed" | "not_required" | "insufficient_evidence";
+  changes: DreamChangeClassification[];
+  matchingChecks: DreamTaskWindow["verificationChecks"];
+};
+
+function legacyVerificationType(command = ""): DreamVerificationType {
+  const normalized = command.toLowerCase().replace(/\\/g, "/");
+  if (/render_docx|build_whitepaper|export[^\s]*docx|pandoc|mkdocs\s+build|sphinx-build/.test(normalized)) return "document_build";
+  if (/\bgit\b[^\r\n;|]*\bdiff\s+--check\b/.test(normalized)) return "diff_check";
+  if (/\b(typecheck|tsc|mypy)\b/.test(normalized)) return "typecheck";
+  if (/\b(lint|eslint|ruff|cspell)\b/.test(normalized)) return "lint";
+  if (/\b(test|vitest|pytest|jest|cargo\s+test|go\s+test|dotnet\s+test)\b/.test(normalized)) return "test";
+  if (/\b(build|compile)\b/.test(normalized)) return "build";
+  if (/\b(get-content|select-string|read|view|fetch)\b/.test(normalized)) return "read_back";
+  if (/\b(get-childitem|test-path|git\s+status|\bls\b|\bdir\b)\b/.test(normalized)) return "filesystem_check";
+  return "unknown";
+}
+
+function taskWindows(session: DreamSession): DreamTaskWindow[] {
+  if (session.tasks?.length) return session.tasks;
+  const edits = metricNumber(session, "editCalls");
+  const segmentationConfidence: DreamConfidence = metricNumber(session, "taskStarts") > 1 ? "low" : "medium";
+  const evidenceRefs = session.evidenceRefs.length
+    ? session.evidenceRefs
+    : [packetRef(session, "editCalls", `editCalls=${edits}`)];
+  const changes: DreamChangeClassification[] = edits > 0
+    ? [{
+        changeId: `${session.sessionId}:legacy-change`,
+        actionIndex: 0,
+        changeType: "unknown",
+        stateChanging: true,
+        verificationRequired: null,
+        acceptableVerificationTypes: [],
+        repositoryTestsRelevant: false,
+        confidence: "low",
+        evidence: ["Legacy Dream packet reports edit calls but does not preserve classified task targets."],
+        evidenceRefs
+      }]
+    : [{
+        changeId: `${session.sessionId}:read-only`,
+        actionIndex: 0,
+        changeType: "read_only",
+        stateChanging: false,
+        verificationRequired: false,
+        acceptableVerificationTypes: [],
+        repositoryTestsRelevant: false,
+        confidence: "medium",
+        evidence: ["Legacy Dream packet contains no successful edit calls."],
+        evidenceRefs
+      }];
+  return [{
+    taskId: `${session.sessionId}:task-1`,
+    label: session.userIntent ? compactText(session.userIntent, 80) : `${repoLabel(session)} task`,
+    intent: session.userIntent,
+    startedAt: session.startedAt,
+    endedAt: session.endedAt,
+    segmentationConfidence,
+    turnIds: [],
+    changes,
+    verificationChecks: session.verificationChecks.map((check, index) => ({
+      ...check,
+      actionIndex: check.actionIndex ?? index + 1,
+      verificationType: check.verificationType ?? legacyVerificationType(check.command)
+    })),
+    finalAnswer: session.finalAnswer,
+    finalClaims: session.finalClaims,
+    evidenceRefs
+  }];
+}
+
+function normalizedTarget(target?: string): string | undefined {
+  return target?.replace(/\\/g, "/").replace(/["']/g, "").replace(/\/$/, "").toLowerCase();
+}
+
+function targetMatches(change: DreamChangeClassification, check: DreamTaskWindow["verificationChecks"][number]): boolean {
+  if (!change.target || !check.target) return true;
+  const changeTarget = normalizedTarget(change.target);
+  const checkTarget = normalizedTarget(check.target);
+  if (!changeTarget || !checkTarget) return true;
+  return changeTarget === checkTarget || changeTarget.endsWith(checkTarget) || checkTarget.endsWith(changeTarget);
+}
+
+function changeGroupKey(change: DreamChangeClassification): string {
+  if (["product_code", "tests", "documentation", "repository_metadata"].includes(change.changeType)) return change.changeType;
+  return `${change.changeType}:${normalizedTarget(change.target) ?? "unknown-target"}`;
+}
+
+function assessTaskVerification(task: DreamTaskWindow): TaskVerificationAssessment[] {
+  const stateChanges = task.changes.filter((change) => change.stateChanging);
+  if (!stateChanges.length) return [{ status: "not_required", changes: task.changes, matchingChecks: [] }];
+  const grouped = new Map<string, DreamChangeClassification[]>();
+  for (const change of stateChanges) {
+    const key = changeGroupKey(change);
+    grouped.set(key, [...(grouped.get(key) ?? []), change]);
+  }
+  return [...grouped.values()].map((changes) => {
+    if (task.segmentationConfidence === "low" || changes.some((change) => change.confidence === "low" || change.verificationRequired === null)) {
+      return { status: "insufficient_evidence", changes, matchingChecks: [] };
+    }
+    if (changes.every((change) => change.verificationRequired === false)) {
+      return { status: "not_required", changes, matchingChecks: [] };
+    }
+    const lastChange = Math.max(...changes.map((change) => change.actionIndex));
+    const accepted = new Set(changes.flatMap((change) => change.acceptableVerificationTypes));
+    const checks = task.verificationChecks
+      .filter((check) => (check.actionIndex ?? Number.MAX_SAFE_INTEGER) > lastChange && check.fresh !== false)
+      .filter((check) => accepted.has(check.verificationType ?? legacyVerificationType(check.command)))
+      .filter((check) => changes.some((change) => targetMatches(change, check)))
+      .sort((left, right) => (left.actionIndex ?? 0) - (right.actionIndex ?? 0));
+    if (!checks.length) return { status: "missing", changes, matchingChecks: [] };
+    const latest = checks.at(-1);
+    if (latest?.status === "passed") return { status: "verified", changes, matchingChecks: checks };
+    if (latest?.status === "failed") return { status: "failed", changes, matchingChecks: checks };
+    return { status: "missing", changes, matchingChecks: checks };
+  });
+}
+
+function changeLabel(changes: DreamChangeClassification[]): string {
+  const type = changes[0]?.changeType ?? "unknown";
+  const targets = [...new Set(changes.map((change) => change.target).filter(Boolean))];
+  return `${type}${targets.length ? ` (${targets.slice(0, 3).join(", ")})` : ""}`;
+}
+
+function changeApplyTarget(session: DreamSession, change: DreamChangeClassification): string {
+  if (change.changeType === "unknown") return "Dream analyzer change classification";
+  if (["automation_memory", "external_system", "generated_asset", "local_file_organization"].includes(change.changeType)) {
+    return `the ${change.changeType} workflow`;
+  }
+  return `${repoLabel(session)} repository verification guidance`;
+}
+
 function verificationFindings(session: DreamSession, findings: DreamFinding[]): void {
-  const editCalls = metricNumber(session, "editCalls");
-  const verificationEvents = metricNumber(session, "verificationEvents");
-  const verificationFailed = metricNumber(session, "verificationFailed");
-  if (editCalls > 0 && verificationEvents === 0) {
-    addFinding(findings, {
-      severity: "high",
-      category: "Verification quality",
-      title: "Changes were made without frozen verification evidence",
-      explanation: `${session.sessionId} has ${editCalls} edit call(s), but the frozen evidence has no verification event.`,
-      evidenceRefs: [
-        packetRef(session, "editCalls", `editCalls=${editCalls}`),
-        packetRef(session, "verificationEvents", `verificationEvents=${verificationEvents}`)
-      ],
-      suggestedImprovement: "Run and capture the relevant validation command before claiming completion."
-    });
+  let reliableGap = false;
+  let observedVerifiedChange = false;
+  let verifiedTask: DreamTaskWindow | undefined;
+  let verifiedEvidenceRefs: DreamEvidenceRef[] = [];
+  for (const task of taskWindows(session)) {
+    for (const assessment of assessTaskVerification(task)) {
+      const evidenceRefs = assessment.changes.flatMap((change) => change.evidenceRefs);
+      const primary = assessment.changes[0];
+      if (!primary) continue;
+      if (assessment.status === "verified") {
+        const requiresVerification = assessment.changes.some((change) => change.verificationRequired === true);
+        observedVerifiedChange = observedVerifiedChange || requiresVerification;
+        if (requiresVerification && !verifiedTask) {
+          verifiedTask = task;
+          verifiedEvidenceRefs = [
+            ...evidenceRefs,
+            ...assessment.matchingChecks.flatMap((check) => check.evidenceRefs ?? [])
+          ];
+        }
+        const failedBeforePass = assessment.matchingChecks.slice(0, -1).filter((check) => check.status === "failed");
+        if (failedBeforePass.length) {
+          addFinding(findings, {
+            severity: "low",
+            category: "Verification quality",
+            title: "Verification had failed attempts that were later recovered",
+            patternKey: `verification-recovered:${primary.changeType}`,
+            sessionId: session.sessionId,
+            taskId: task.taskId,
+            explanation: `${task.label} had ${failedBeforePass.length} failed matching verification attempt(s) before a later pass.`,
+            observation: `The packet records ${failedBeforePass.length} failed check(s) and a later passing check for ${changeLabel(assessment.changes)}.`,
+            interpretation: "The task reached verification closure after recovery; this is not evidence of a current application defect.",
+            alternativeExplanation: "A failed command may have exercised a different optional lane; task-local target matching limits that risk.",
+            evidenceRefs: [...evidenceRefs, ...assessment.matchingChecks.flatMap((check) => check.evidenceRefs ?? [])],
+            recommendedAction: "Record the failed first attempt and final passing check in the task summary.",
+            applyTarget: changeApplyTarget(session, primary),
+            suggestedImprovement: "Record the failed first attempt and final passing check in the task summary."
+          });
+        }
+        continue;
+      }
+      if (assessment.status === "not_required") continue;
+      if (assessment.status === "insufficient_evidence") {
+        addFinding(findings, {
+          severity: "medium",
+          category: "Verification quality",
+          title: "Verification requirement has insufficient evidence",
+          patternKey: `verification-insufficient:${primary.changeType}`,
+          sessionId: session.sessionId,
+          taskId: task.taskId,
+          disposition: "insufficient_evidence",
+          confidence: "low",
+          explanation: `${task.label} contains an ambiguous ${changeLabel(assessment.changes)} action or a low-confidence task boundary.`,
+          observation: `${assessment.changes.length} state-changing action(s) were captured, but change type or task association is below medium confidence.`,
+          interpretation: "The packet cannot reliably decide whether verification was required for this task.",
+          alternativeExplanation: "The edit-like call may be a failed attempt, a non-durable action, or a change outside the repository.",
+          evidenceRefs: evidenceRefs.length ? evidenceRefs : task.evidenceRefs,
+          recommendedAction: "Improve target and task-window capture before treating this as a verification failure.",
+          applyTarget: "Dream analyzer change classification and task segmentation",
+          suggestedImprovement: "Improve target and task-window capture before treating this as a verification failure."
+        });
+        continue;
+      }
+      reliableGap = true;
+      const failed = assessment.status === "failed";
+      addFinding(findings, {
+        severity: "high",
+        category: "Verification quality",
+        title: failed ? "Relevant verification ended with a failure" : "Required verification is missing after the final relevant change",
+        patternKey: `${failed ? "verification-failed" : "missing-verification"}:${primary.changeType}`,
+        sessionId: session.sessionId,
+        taskId: task.taskId,
+        explanation: `${task.label}: ${changeLabel(assessment.changes)} requires one of ${primary.acceptableVerificationTypes.join(", ")}, but ${
+          failed ? "the latest matching check failed" : "no matching fresh check was captured"
+        }.`,
+        observation: `${assessment.changes.length} relevant state change(s) occurred in the task; ${assessment.matchingChecks.length} matching post-change check(s) were captured.`,
+        interpretation: failed
+          ? "The task does not have successful verification closure for the classified change."
+          : "The task lacks fresh verification of a change type that requires it.",
+        alternativeExplanation: "The frozen packet may have omitted an external or repository-specific check, but classification and task evidence are at least medium confidence.",
+        evidenceRefs: [...evidenceRefs, ...assessment.matchingChecks.flatMap((check) => check.evidenceRefs ?? [])],
+        recommendedAction: failed
+          ? "Rerun the named matching check or report the task as blocked/unverified."
+          : `Run a fresh ${primary.acceptableVerificationTypes.join(" or ")} check after the final relevant change.`,
+        applyTarget: changeApplyTarget(session, primary),
+        suggestedImprovement: failed
+          ? "Rerun the named matching check or report the task as blocked/unverified."
+          : `Run a fresh ${primary.acceptableVerificationTypes.join(" or ")} check after the final relevant change.`
+      });
+    }
   }
 
-  const unrecoveredChecks = unresolvedVerificationChecks(session);
-  const recoveredChecks = recoveredVerificationChecks(session);
-
-  if (unrecoveredChecks.length > 0) {
-    addFinding(findings, {
-      severity: "high",
-      category: "Verification quality",
-      title: "Verification ended with unresolved failure evidence",
-      explanation: `${session.sessionId} has ${unrecoveredChecks.length} failed verification check(s) with no later matching pass in the frozen evidence. Failed check(s): ${verificationCheckSummary(
-        unrecoveredChecks
-      )}.`,
-      evidenceRefs: unrecoveredChecks.flatMap((check) => check.evidenceRefs ?? []).length
-        ? unrecoveredChecks.flatMap((check) => check.evidenceRefs ?? [])
-        : [packetRef(session, "verificationFailed", `verificationFailed=${verificationFailed}`)],
-      suggestedImprovement:
-        "Treat this as a verification-closure action, not automatic application-code work: rerun the named command, replace the final claim with blocked/unverified if it still fails, or update the repo guidance if that command is obsolete."
-    });
-  }
-
-  if (recoveredChecks.length > 0) {
-    addFinding(findings, {
-      severity: "low",
-      category: "Verification quality",
-      title: "Verification had failed attempts that were later recovered",
-      explanation: `${session.sessionId} has ${recoveredChecks.length} failed verification attempt(s), but each had a later matching pass in the frozen evidence. Recovered check(s): ${verificationCheckSummary(
-        recoveredChecks
-      )}.`,
-      evidenceRefs: recoveredChecks.flatMap((check) => check.evidenceRefs ?? []).length
-        ? recoveredChecks.flatMap((check) => check.evidenceRefs ?? [])
-        : [packetRef(session, "verificationFailed", `verificationFailed=${verificationFailed}`)],
-      suggestedImprovement:
-        "No application-code action is implied by this finding alone. Improve the final answer by saying the first run failed, the agent retried, and the final named command passed."
-    });
-  } else if (unrecoveredChecks.length === 0 && verificationFailed > 0) {
+  if (session.reasonCodes.includes("MISSING_VERIFICATION") && !reliableGap && observedVerifiedChange) {
     addFinding(findings, {
       severity: "medium",
       category: "Verification quality",
-      title: "Verification failure count lacks command detail",
-      explanation: `${session.sessionId} has ${verificationFailed} failed verification event(s), but the frozen evidence lacks per-command verification checks.`,
-      evidenceRefs: [packetRef(session, "verificationFailed", `verificationFailed=${verificationFailed}`)],
-      suggestedImprovement: "Improve scan capture so dream can show the failed command, then treat unresolved final failures as blockers."
+      title: "Session-level verification flag is a likely false positive",
+      patternKey: "legacy-session-verification-measurement",
+      sessionId: session.sessionId,
+      taskId: verifiedTask?.taskId,
+      disposition: "possible_false_positive",
+      explanation: `${session.sessionId} carries the legacy MISSING_VERIFICATION reason, while task-local classified changes have matching closure.`,
+      observation: "The session-level scorer flagged missing verification, but the task model found a classified durable change followed by an acceptable matching read-back or check.",
+      interpretation: "The legacy score compared edit-like calls with repository-style verification without considering change type.",
+      alternativeExplanation: "A separate durable change could be absent from the frozen packet; no such task-local evidence was captured.",
+      evidenceRefs: [packetRef(session, "reasonCodes", "MISSING_VERIFICATION"), ...verifiedEvidenceRefs],
+      confidence: "high",
+      recommendedAction: "Use task-local change classification as authoritative in Dream and treat the legacy reason only as a sampling hint.",
+      applyTarget: "Dream analyzer",
+      suggestedImprovement: "Use task-local change classification as authoritative in Dream and treat the legacy reason only as a sampling hint."
     });
   }
 }
@@ -165,14 +404,17 @@ function verificationFindings(session: DreamSession, findings: DreamFinding[]): 
 function efficiencyFindings(session: DreamSession, findings: DreamFinding[]): void {
   const repeatedFileViews = metricNumber(session, "repeatedFileViews");
   const failedCommands = metricNumber(session, "failedCommands");
+  const repeatedFailures = metricNumber(session, "repeatedFailedCommandAttempts");
+  const duplicateToolCalls = metricNumber(session, "duplicateToolCalls");
+  const redundantToolCallRate = metricNumber(session, "redundantToolCallRate");
   const globCalls = metricNumber(session, "globCalls");
-  if (session.reasonCodes.includes("FAILED_COMMAND_LOOP") || failedCommands >= 3) {
+  if (session.reasonCodes.includes("FAILED_COMMAND_LOOP") || repeatedFailures >= 2) {
     addFinding(findings, {
       severity: "medium",
       category: "Efficiency",
       title: "Repeated failed commands",
-      explanation: `${session.sessionId} has ${failedCommands} failed command(s), suggesting command-loop waste.`,
-      evidenceRefs: [packetRef(session, "failedCommands", `failedCommands=${failedCommands}`)],
+      explanation: `${session.sessionId} repeated the same failing command ${repeatedFailures} time(s) across ${failedCommands} failed command(s).`,
+      evidenceRefs: [packetRef(session, "repeatedFailedCommandAttempts", `repeatedFailedCommandAttempts=${repeatedFailures}`)],
       suggestedImprovement: "Stop after repeated command failures, inspect the first actionable error, and change strategy."
     });
   }
@@ -196,16 +438,40 @@ function efficiencyFindings(session: DreamSession, findings: DreamFinding[]): vo
       suggestedImprovement: "Narrow discovery after the first pass and reuse already-found paths."
     });
   }
+  if (session.reasonCodes.includes("REDUNDANT_TOOL_CALLS") || (duplicateToolCalls >= 5 && redundantToolCallRate >= 0.2)) {
+    addFinding(findings, {
+      severity: "medium",
+      category: "Efficiency",
+      title: "State-equivalent tool calls were repeated",
+      explanation: `${session.sessionId} has ${duplicateToolCalls} exact repeated read/search/command call(s) without an intervening edit (${(
+        redundantToolCallRate * 100
+      ).toFixed(1)}%).`,
+      evidenceRefs: [packetRef(session, "duplicateToolCalls", `duplicateToolCalls=${duplicateToolCalls}`)],
+      suggestedImprovement: "Reuse the earlier result unless state changed, the first call failed, or a fresh rerun is explicitly required."
+    });
+  }
 }
 
 function inferredInstructionStatus(instruction: InstructionCheck, session: DreamSession): InstructionCheck {
-  if (instruction.status) return instruction;
+  if (instruction.status && instruction.status !== "unknown") return instruction;
   const text = instruction.text.toLowerCase();
   const commands = session.commands.join("\n").toLowerCase();
-  if (/do not|don't|forbidden|must not/.test(text) && /run tests|run test|test/.test(text) && /\b(test|vitest|jest|pytest|npm test)\b/.test(commands)) {
+  const ranTests = /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test\b|\b(?:vitest|jest|pytest|dotnet\s+test|cargo\s+test|go\s+test)\b/.test(commands);
+  const prohibitsTests = /\b(?:do not|don't|must not|never)\s+(?:run|execute)\s+(?:the\s+)?(?:tests?|test suite|vitest|jest|pytest|npm test)\b/.test(text);
+  if (prohibitsTests && ranTests) {
     return {
       ...instruction,
       status: "violated",
+      evidenceRefs: instruction.evidenceRefs?.length
+        ? instruction.evidenceRefs
+        : [packetRef(session, "commands", `commands=${session.commands.join("; ")}`)]
+    };
+  }
+  const requiresTests = /\b(?:must|should|required to|verify with|validate with)\b[^.\n]{0,100}\b(?:run|execute|tests?|test suite|vitest|jest|pytest|npm test)\b/.test(text);
+  if (requiresTests && ranTests) {
+    return {
+      ...instruction,
+      status: "followed",
       evidenceRefs: instruction.evidenceRefs?.length
         ? instruction.evidenceRefs
         : [packetRef(session, "commands", `commands=${session.commands.join("; ")}`)]
@@ -270,93 +536,123 @@ function scoreIntent(sessions: DreamSession[]): DreamScore {
   if (!checks.length) {
     return {
       category: "Intent adherence",
-      score: 3,
+      score: null,
       confidence: "low",
       rationale: "The frozen evidence lacks explicit intent checks, so validation can only use declared intents and metrics."
     };
   }
-  const bad = checks.filter((check) => check?.status === "partial" || check?.status === "missing" || check?.status === "contradicted").length;
+  const evaluated = checks.filter((check) => check?.status && check.status !== "unknown");
+  if (evaluated.length / checks.length < 0.5) {
+    return {
+      category: "Intent adherence",
+      score: null,
+      confidence: "low",
+      rationale: `${evaluated.length} of ${checks.length} intent check(s) could be evaluated; the remainder are unknown.`
+    };
+  }
+  const points = evaluated.reduce((sum, check) => sum + (check?.status === "matched" ? 1 : check?.status === "partial" ? 0.5 : 0), 0);
   return {
     category: "Intent adherence",
-    score: Math.max(0, 5 - bad * 2),
+    score: Math.round((points / evaluated.length) * 5),
     confidence: "medium",
-    rationale: `${bad} intent check(s) show partial, missing, or contradicted work.`
+    rationale: `${evaluated.length} intent check(s) were evaluated with matched outcomes weighted above partial, missing, or contradicted outcomes.`
   };
 }
 
 function scoreInstructions(checks: InstructionCheck[], sessions: DreamSession[]): DreamScore {
-  if (!sessions.some((session) => session.instructionChecks.length)) {
+  if (!checks.length) {
     return {
       category: "Instruction adherence",
-      score: 3,
+      score: null,
       confidence: "low",
       rationale: "The frozen evidence does not include explicit instruction evidence."
     };
   }
   const violated = checks.filter((check) => check.status === "violated").length;
   const partial = checks.filter((check) => check.status === "partially_followed").length;
+  const followed = checks.filter((check) => check.status === "followed").length;
+  const unknown = checks.filter((check) => !check.status || check.status === "unknown").length;
+  const evaluated = followed + violated + partial;
+  const coverage = evaluated / checks.length;
+  if (evaluated === 0 || coverage < 0.5) {
+    return {
+      category: "Instruction adherence",
+      score: null,
+      confidence: "low",
+      rationale: `${evaluated} of ${checks.length} captured instruction(s) could be evaluated; ${unknown} remain unknown, so missing evidence is not treated as compliance.`
+    };
+  }
   return {
     category: "Instruction adherence",
-    score: Math.max(0, 5 - violated * 2 - partial),
-    confidence: "medium",
-    rationale: `${violated} violated and ${partial} partially followed instruction(s).`
+    score: Math.round(((followed + partial * 0.5) / evaluated) * 5),
+    confidence: unknown ? "low" : "medium",
+    rationale: `${followed} followed, ${violated} violated, ${partial} partially followed, and ${unknown} unknown instruction(s).`
   };
 }
 
 function scoreGrounding(unsupported: ClaimCheck[], sessions: DreamSession[]): DreamScore {
-  if (!sessions.some((session) => session.finalClaims.length)) {
+  const claims = sessions.flatMap((session) => session.finalClaims);
+  if (!claims.length) {
     return {
       category: "Evidence grounding",
-      score: 3,
+      score: null,
       confidence: "low",
       rationale: "The frozen evidence lacks final-answer claim text, so unsupported claims cannot be fully audited."
     };
   }
-  const needsReview = sessions.reduce((sum, session) => sum + session.finalClaims.filter((claim) => claim.supported === undefined).length, 0);
+  const supported = claims.filter((claim) => claim.supported === true).length;
+  const needsReview = claims.filter((claim) => claim.supported === undefined).length;
   return {
     category: "Evidence grounding",
-    score: Math.max(0, 5 - unsupported.length * 2 - Math.ceil(needsReview / 8)),
+    score: Math.round((supported / claims.length) * 5),
     confidence: "medium",
-    rationale: `${unsupported.length} final-answer claim(s) lack frozen evidence; ${needsReview} claim(s) need evidence review.`
+    rationale: `${supported} of ${claims.length} final-answer claim(s) have matching frozen support; ${unsupported.length} lack support and ${needsReview} need evidence review.`
   };
 }
 
 function scoreVerification(sessions: DreamSession[]): DreamScore {
-  const editSessions = sessions.filter((session) => metricNumber(session, "editCalls") > 0);
-  const missing = editSessions.filter((session) => metricNumber(session, "verificationEvents") === 0).length;
-  const unresolvedFailed = sessions.reduce((sum, session) => {
-    const failedChecks = failedVerificationChecks(session);
-    if (!failedChecks.length && metricNumber(session, "verificationFailed") > 0) return sum + metricNumber(session, "verificationFailed");
-    return sum + failedChecks.filter((check) => !hasLaterPassingCheck(session, check)).length;
-  }, 0);
-  const recoveredFailed = sessions.reduce((sum, session) => {
-    const failedChecks = failedVerificationChecks(session);
-    return sum + failedChecks.filter((check) => hasLaterPassingCheck(session, check)).length;
-  }, 0);
-  const passed = sessions.reduce((sum, session) => sum + metricNumber(session, "verificationPassed"), 0);
-  let score = 3;
-  if (editSessions.length && missing === 0 && unresolvedFailed === 0 && passed > 0) score = recoveredFailed > 0 ? 4 : 5;
-  if (missing > 0) score = Math.max(1, score - missing * 2);
-  if (unresolvedFailed > 0) score = Math.max(1, score - 2);
+  const assessments = sessions.flatMap((session) => taskWindows(session).flatMap(assessTaskVerification));
+  const relevant = assessments.filter((assessment) => assessment.status !== "not_required");
+  if (!relevant.length) {
+    return {
+      category: "Verification quality",
+      score: null,
+      confidence: "medium",
+      rationale: "No selected task contained a classified state change that required verification."
+    };
+  }
+  const evaluated = relevant.filter((assessment) => assessment.status !== "insufficient_evidence");
+  const insufficient = relevant.length - evaluated.length;
+  if (!evaluated.length) {
+    return {
+      category: "Verification quality",
+      score: null,
+      confidence: "low",
+      rationale: `${insufficient} task/change assessment(s) lacked enough classification or segmentation evidence.`
+    };
+  }
+  const missing = evaluated.filter((assessment) => assessment.status === "missing").length;
+  const failed = evaluated.filter((assessment) => assessment.status === "failed").length;
+  const passed = evaluated.filter((assessment) => assessment.status === "verified").length;
   return {
     category: "Verification quality",
-    score,
-    confidence: "high",
-    rationale: `${missing} edited session(s) have no verification evidence; ${unresolvedFailed} unresolved failed verification check(s); ${recoveredFailed} failed attempt(s) were later recovered.`
+    score: Math.round((passed / evaluated.length) * 5),
+    confidence: insufficient ? "low" : "medium",
+    rationale: `${passed} classified task/change group(s) are verified, ${missing} miss fresh matching verification, ${failed} end in failure, and ${insufficient} have insufficient evidence.`
   };
 }
 
 function scoreEfficiency(sessions: DreamSession[]): DreamScore {
   if (!sessions.length) {
-    return { category: "Efficiency", score: 0, confidence: "low", rationale: "No selected sessions were available." };
+    return { category: "Efficiency", score: null, confidence: "low", rationale: "No selected sessions were available." };
   }
   const average = averageInefficiency(sessions);
   const score = average <= 15 ? 5 : average <= 35 ? 4 : average <= 55 ? 3 : average <= 75 ? 2 : 1;
   return {
     category: "Efficiency",
     score,
-    confidence: "high",
-    rationale: `Average selected-session inefficiency score is ${average.toFixed(1)} (0 is best, 100 is worst; lower is better).`
+    confidence: "low",
+    rationale: `Average task-normalized selected-session inefficiency score is ${average.toFixed(1)} (0 is best, 100 is worst; lower is better). This is a stratified selected sample, not a population estimate.`
   };
 }
 
@@ -398,7 +694,7 @@ function scoreRows(scores: DreamScore[]): string[] {
   return [
     "| Category | Score | Confidence | Rationale |",
     "| --- | ---: | --- | --- |",
-    ...scores.map((score) => `| ${score.category} | ${score.score} | ${score.confidence} | ${score.rationale.replace(/\|/g, "\\|")} |`)
+    ...scores.map((score) => `| ${score.category} | ${score.score ?? "insufficient"} | ${score.confidence} | ${score.rationale.replace(/\|/g, "\\|")} |`)
   ];
 }
 
@@ -413,23 +709,32 @@ function compactText(value: string | undefined, maxLength = 180): string {
   return `${normalized.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
 }
 
+function repoLabel(session: DreamSession): string {
+  const root = session.repoRoot?.replace(/[\\/]+$/, "");
+  return root?.split(/[\\/]/).at(-1) ?? "unknown";
+}
+
 function inspectedSessionRows(sessions: DreamSession[]): string[] {
   if (!sessions.length) return ["No sessions were inspected."];
   return [
-    "| Session | Role | Class | Inefficiency (0 best, 100 worst) | Outcome | Turns | Tools | Edits | Verification | Failed commands | Reasons |",
-    "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | --- |",
+    "| Session | Repository | Agent | Status | Ended | Role | Class | Inefficiency | Outcome | Tasks | Tools/task | Edits | Verification closure | Repeated failures | Reasons |",
+    "| --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | --- |",
     ...sessions.map((session) =>
       `| ${[
         tableEscape(session.sessionId),
+        tableEscape(repoLabel(session)),
+        tableEscape(session.agentPath ?? "root"),
+        tableEscape(session.lifecycleStatus ?? "unknown"),
+        tableEscape(session.endedAt?.slice(0, 10) ?? "unknown"),
         tableEscape(session.role ?? "selected"),
         tableEscape(session.classification ?? "unknown"),
         session.inefficiencyScore ?? 0,
         session.outcomeScore ?? 0,
-        metricNumber(session, "turns"),
-        metricNumber(session, "toolRequests"),
+        metricNumber(session, "taskStarts") || metricNumber(session, "turns"),
+        metricNumber(session, "toolRequestsPerTask").toFixed(1),
         metricNumber(session, "editCalls"),
-        `${metricNumber(session, "verificationPassed")} passed / ${metricNumber(session, "verificationFailed")} failed`,
-        metricNumber(session, "failedCommands"),
+        tableEscape(verificationClosure(session)),
+        metricNumber(session, "repeatedFailedCommandAttempts"),
         tableEscape(session.reasonCodes.join(", ") || "-")
       ].join(" | ")} |`
     )
@@ -465,29 +770,48 @@ function intentOutcomeRows(sessions: DreamSession[]): string[] {
 }
 
 function compareSessions(sessions: DreamSession[]): string[] {
-  const efficient = sessions.filter((session) => session.role === "efficient_success" || session.classification === "efficient");
-  const inefficient = sessions.filter((session) => session.role === "inefficient_success" || session.classification === "inefficient" || session.classification === "suspicious");
-  if (!efficient.length || !inefficient.length) {
-    return ["- Missing comparison set: the frozen scan evidence needs at least one efficient and one inefficient selected session."];
-  }
+  const efficient = sessions.filter(
+    (session) =>
+      session.classification === "efficient" &&
+      (metricNumber(session, "editCalls") === 0 || verificationClosure(session) === "passed")
+  );
+  const inefficient = sessions.filter((session) => session.classification === "inefficient" || session.classification === "suspicious");
   const avg = (items: DreamSession[], key: string) =>
     (items.reduce((sum, session) => sum + metricNumber(session, key), 0) / Math.max(1, items.length)).toFixed(1);
+  const repositories = [...new Set(efficient.map(repoLabel))].filter((repo) => inefficient.some((session) => repoLabel(session) === repo));
+  if (!repositories.length) {
+    return ["- Missing same-repository comparison set: cross-repository effort is not treated as a reliable efficiency comparison."];
+  }
   return [
-    `- Efficient sessions averaged ${avg(efficient, "toolRequests")} tool request(s), ${avg(efficient, "turns")} turn(s), and ${avg(
-      efficient,
-      "verificationEvents"
-    )} verification event(s).`,
-    `- Inefficient sessions averaged ${avg(inefficient, "toolRequests")} tool request(s), ${avg(inefficient, "turns")} turn(s), and ${avg(
-      inefficient,
-      "verificationEvents"
-    )} verification event(s).`,
-    "- Treat differences as evidence-backed only where the frozen evidence includes matching metrics and evidence references."
+    ...repositories.map((repo) => {
+      const good = efficient.filter((session) => repoLabel(session) === repo);
+      const bad = inefficient.filter((session) => repoLabel(session) === repo);
+      return `- ${repo}: ${good.length} efficient session(s) averaged ${avg(good, "toolRequestsPerTask")} tools/task, ${avg(
+        good,
+        "redundantToolCallRate"
+      )} redundant-call rate, and ${avg(good, "repeatedFailedCommandAttempts")} repeated failures; ${bad.length} risky/inefficient session(s) averaged ${avg(
+        bad,
+        "toolRequestsPerTask"
+      )} tools/task, ${avg(bad, "redundantToolCallRate")} redundant-call rate, and ${avg(bad, "repeatedFailedCommandAttempts")} repeated failures.`;
+    }),
+    "- These are task-normalized, same-repository comparisons; task difficulty can still differ."
   ];
 }
 
 function selectedSessionIds(sessions: DreamSession[], predicate: (session: DreamSession) => boolean): string {
   const ids = sessions.filter(predicate).map((session) => session.sessionId);
-  return ids.length ? ids.join(", ") : "none";
+  if (!ids.length) return "none";
+  const shown = ids.slice(0, 5).join(", ");
+  return ids.length > 5 ? `${shown} (+${ids.length - 5} more)` : shown;
+}
+
+function guidanceTarget(sessions: DreamSession[]): string {
+  const repos = [...new Set(sessions.map(repoLabel).filter((repo) => repo !== "unknown"))];
+  if (!repos.length) return "the applicable agent guidance";
+  if (repos.length === 1) return `${repos[0]}'s AGENTS.md or runbook`;
+  const shown = repos.slice(0, 5).join(", ");
+  const remainder = repos.length > 5 ? ` (+${repos.length - 5} more evidenced repositories)` : "";
+  return `shared or per-repository guidance for ${shown}${remainder}`;
 }
 
 function totalMetric(sessions: DreamSession[], key: string): number {
@@ -496,8 +820,9 @@ function totalMetric(sessions: DreamSession[], key: string): number {
 
 function unresolvedVerificationCount(sessions: DreamSession[]): number {
   return sessions.reduce((sum, session) => {
-    if (!failedVerificationChecks(session).length && metricNumber(session, "verificationFailed") > 0) return sum + metricNumber(session, "verificationFailed");
-    return sum + unresolvedVerificationChecks(session).length;
+    const unresolved = unresolvedVerificationChecks(session);
+    if (unresolved.length) return sum + unresolved.length;
+    return verificationClosure(session) === "failed" ? sum + 1 : sum;
   }, 0);
 }
 
@@ -505,53 +830,57 @@ function recoveredVerificationCount(sessions: DreamSession[]): number {
   return sessions.reduce((sum, session) => sum + recoveredVerificationChecks(session).length, 0);
 }
 
-function commandList(sessions: DreamSession[]): string[] {
-  return sessions.flatMap((session) => session.commands);
-}
-
-function commandsContain(sessions: DreamSession[], pattern: RegExp): boolean {
-  return commandList(sessions).some((command) => pattern.test(command));
+function isGodotVerificationCommand(command: string): boolean {
+  return /\btools[\\/]godot\.ps1\b[^\r\n;|]*\b(?:parse|boot|test|export|check-android-env)\b/i.test(command) ||
+    /\bgodot(?:\.exe)?\b[^\r\n;|]*\b--headless\b/i.test(command);
 }
 
 function actionableRecommendations(sessions: DreamSession[], missingEvidence: string[]): string[] {
   const recommendations: string[] = [];
   const failedVerification = unresolvedVerificationCount(sessions);
   const recoveredVerification = recoveredVerificationCount(sessions);
-  const failedCommands = totalMetric(sessions, "failedCommands");
+  const repeatedFailures = totalMetric(sessions, "repeatedFailedCommandAttempts");
   const reviewClaimCount = sessions.reduce((sum, session) => sum + session.finalClaims.filter((claim) => claim.supported === undefined).length, 0);
   const editedWithoutVerification = sessions.filter(
-    (session) => metricNumber(session, "editCalls") > 0 && metricNumber(session, "verificationEvents") === 0
+    (session) => metricNumber(session, "editCalls") > 0 && verificationClosure(session) === "missing"
+  );
+  const verificationSessions = sessions.filter(
+    (session) => failedVerificationChecks(session).length > 0 || recoveredVerificationChecks(session).length > 0 || editedWithoutVerification.includes(session)
   );
   const highChurnSessions = sessions.filter(
-    (session) => session.reasonCodes.includes("HIGH_TOOL_CHURN") || metricNumber(session, "toolRequests") >= 40
+    (session) => session.reasonCodes.includes("HIGH_TOOL_CHURN") || metricNumber(session, "toolRequestsPerTask") >= 30
   );
   const failedLoopSessions = sessions.filter(
-    (session) => session.reasonCodes.includes("FAILED_COMMAND_LOOP") || metricNumber(session, "failedCommands") >= 3
+    (session) => session.reasonCodes.includes("FAILED_COMMAND_LOOP") || metricNumber(session, "repeatedFailedCommandAttempts") >= 2
   );
   const missingIntentOrClaims = missingEvidence.filter(
     (item) => /original user intent|explicit user\/developer instruction|final assistant answer/.test(item)
   );
-  const hasGodotCommands = commandsContain(sessions, /\btools[\\/]+godot\.ps1\b|godot/i);
+  const godotSessions = sessions.filter((session) =>
+    [...failedVerificationChecks(session), ...recoveredVerificationChecks(session)].some((check) =>
+      isGodotVerificationCommand(check.command ?? "")
+    )
+  );
 
   if (failedVerification > 0 || recoveredVerification > 0 || editedWithoutVerification.length) {
     recommendations.push(
       [
-        "- **AGENTS.md verification rule:** Add a required final-answer block for Satori work: `Validation run`, `Result`, `Failed commands`, `Remaining blocker`, and `Evidence file/line or command output`. ",
+        `- **Verification closure rule:** In ${guidanceTarget(verificationSessions)}, require final answers to state \`Validation run\`, \`Result\`, \`Unresolved checks\`, \`Remaining blocker\`, and the supporting command/evidence. `,
         `Evidence: selected sessions contain ${failedVerification} unresolved failed verification check(s), ${recoveredVerification} recovered failed attempt(s), and ${editedWithoutVerification.length} edited session(s) without verification evidence, especially ${selectedSessionIds(
           sessions,
           (session) => failedVerificationChecks(session).length > 0 || editedWithoutVerification.includes(session)
         )}.`,
-        " Dream apply target: update Satori's agent guidance, not application code."
+        ` Dream apply target: ${guidanceTarget(verificationSessions)}, not application code.`
       ].join("")
     );
   }
 
-  if (failedCommands > 0 || failedLoopSessions.length) {
+  if (repeatedFailures > 0 || failedLoopSessions.length) {
     recommendations.push(
       [
         "- **AGENTS.md retry discipline:** Add: after two failed commands in the same validation/debug lane, stop retrying, summarize the first actionable failure, change strategy once, then mark the task blocked if it still fails. ",
         `Evidence: failed-command-loop sessions: ${selectedSessionIds(sessions, (session) => failedLoopSessions.includes(session))}.`,
-        " Dream apply target: AGENTS.md or a repo runbook section called `Failed validation loops`."
+        ` Dream apply target: ${guidanceTarget(failedLoopSessions)} in a section called \`Failed validation loops\`.`
       ].join("")
     );
   }
@@ -561,19 +890,19 @@ function actionableRecommendations(sessions: DreamSession[], missingEvidence: st
       [
         "- **Final-answer claim discipline:** Add guidance that every final claim about tests, commits, pushed work, generated assets, or fixed behavior must include the exact command/result or say `not verified`. ",
         `Evidence: ${reviewClaimCount} final-answer claim(s) needed evidence review because the frozen scan could capture the claim source but not enough matching support. `,
-        "Dream apply target: AGENTS.md final-answer format or the Satori verification skill."
+        `Dream apply target: ${guidanceTarget(sessions)} or the applicable verification skill.`
       ].join("")
     );
   }
 
-  if (hasGodotCommands || failedVerification > 0) {
+  if (godotSessions.length) {
     recommendations.push(
       [
-        "- **Satori validation skill:** Add or update `skills/satori-godot-verify/SKILL.md` so agents use one validation ladder and record each step's result. ",
+        `- **Godot validation guidance:** Add or update the Godot verification runbook for ${guidanceTarget(godotSessions)} so agents use one validation ladder and record each step's result. `,
         "Suggested ladder text: `parse -> boot smoke -> focused test for touched system -> broader GUT/full suite only when scope demands it`. ",
         "Also require agents to preserve failed output instead of replacing it with reassuring prose. ",
         `Evidence: unresolved or recovered validation failures appear in ${selectedSessionIds(
-          sessions,
+          godotSessions,
           (session) => failedVerificationChecks(session).length > 0
         )}.`
       ].join("")
@@ -581,11 +910,16 @@ function actionableRecommendations(sessions: DreamSession[], missingEvidence: st
   }
 
   if (highChurnSessions.length) {
+    const examples = highChurnSessions
+      .slice(0, 5)
+      .map((session) => `${session.sessionId} (${metricNumber(session, "toolRequestsPerTask").toFixed(1)} tools/task)`)
+      .join(", ");
+    const remainder = highChurnSessions.length > 5 ? ` (+${highChurnSessions.length - 5} more)` : "";
     recommendations.push(
       [
         "- **Tool-call budget note:** Add guidance that high-churn sessions must checkpoint after discovery and before broad edits: list known files, chosen validation command, and next single action. ",
-        `Evidence: high-tool-churn sessions: ${highChurnSessions.map((session) => `${session.sessionId} (${metricNumber(session, "toolRequests")} tools)`).join(", ")}.`,
-        " Dream apply target: AGENTS.md or the Satori-specific skill."
+        `Evidence: high-tool-churn sessions: ${examples}${remainder}.`,
+        ` Dream apply target: ${guidanceTarget(highChurnSessions)}.`
       ].join("")
     );
   }
@@ -610,30 +944,38 @@ function dreamApplyBacklog(sessions: DreamSession[], missingEvidence: string[]):
   const backlog: string[] = [];
   const failedVerification = unresolvedVerificationCount(sessions);
   const recoveredVerification = recoveredVerificationCount(sessions);
-  const failedCommands = totalMetric(sessions, "failedCommands");
+  const repeatedFailures = totalMetric(sessions, "repeatedFailedCommandAttempts");
   const reviewClaimCount = sessions.reduce((sum, session) => sum + session.finalClaims.filter((claim) => claim.supported === undefined).length, 0);
   const editedWithoutVerification = sessions.filter(
-    (session) => metricNumber(session, "editCalls") > 0 && metricNumber(session, "verificationEvents") === 0
+    (session) => metricNumber(session, "editCalls") > 0 && verificationClosure(session) === "missing"
+  );
+  const verificationSessions = sessions.filter(
+    (session) => failedVerificationChecks(session).length > 0 || recoveredVerificationChecks(session).length > 0 || editedWithoutVerification.includes(session)
   );
   const highChurnSessions = sessions.filter(
-    (session) => session.reasonCodes.includes("HIGH_TOOL_CHURN") || metricNumber(session, "toolRequests") >= 40
+    (session) => session.reasonCodes.includes("HIGH_TOOL_CHURN") || metricNumber(session, "toolRequestsPerTask") >= 30
   );
   const missingIntentOrClaims = missingEvidence.filter(
     (item) => /original user intent|explicit user\/developer instruction|final assistant answer/.test(item)
   );
-  const hasGodotCommands = commandsContain(sessions, /\btools[\\/]+godot\.ps1\b|godot/i);
+  const godotSessions = sessions.filter((session) =>
+    [...failedVerificationChecks(session), ...recoveredVerificationChecks(session)].some((check) =>
+      isGodotVerificationCommand(check.command ?? "")
+    )
+  );
+  const repeatedFailureSessions = sessions.filter((session) => metricNumber(session, "repeatedFailedCommandAttempts") > 0);
 
   if (failedVerification > 0 || recoveredVerification > 0 || editedWithoutVerification.length) {
-    backlog.push("- Update the target repo's `AGENTS.md` with a required final-answer validation block.");
+    backlog.push(`- Update ${guidanceTarget(verificationSessions)} with a required final-answer validation block.`);
   }
-  if (failedCommands > 0) {
-    backlog.push("- Add retry discipline to `AGENTS.md` or a runbook: after two repeated failed commands, stop, summarize the first actionable error, and change strategy.");
+  if (repeatedFailures > 0) {
+    backlog.push(`- Add retry discipline to ${guidanceTarget(repeatedFailureSessions)}: after two same-lane failures, stop, summarize the first actionable error, and change strategy.`);
   }
   if (reviewClaimCount > 0) {
     backlog.push("- Add a final-answer claim rule: claims about tests, commits, generated assets, or fixed behavior need exact captured evidence or `not verified` wording.");
   }
-  if (hasGodotCommands || failedVerification > 0) {
-    backlog.push("- Add or update a Satori verification skill/runbook with the parse, boot smoke, focused-test validation ladder.");
+  if (godotSessions.length) {
+    backlog.push(`- Add or update Godot verification guidance for ${guidanceTarget(godotSessions)} with the parse, boot smoke, focused-test validation ladder.`);
   }
   if (highChurnSessions.length) {
     backlog.push("- Add a tool-call checkpoint rule for high-churn sessions before broad edits continue.");
@@ -649,7 +991,7 @@ function lessonsFromEfficientSessions(sessions: DreamSession[]): string[] {
   const efficient = sessions.filter((session) => session.role === "efficient_success" || session.classification === "efficient");
   if (!efficient.length) return ["- Missing evidence: no efficient comparison session was selected."];
   const hasVerification = efficient.some((session) => metricNumber(session, "verificationEvents") > 0);
-  const lowChurn = efficient.some((session) => metricNumber(session, "toolRequests") <= 15);
+  const lowChurn = efficient.some((session) => metricNumber(session, "toolRequestsPerTask") <= 15);
   return [
     ...(hasVerification ? ["- Efficient sessions captured verification evidence before final reporting."] : []),
     ...(lowChurn ? ["- Efficient sessions kept discovery narrow and avoided broad repeated tool use."] : []),
@@ -741,23 +1083,26 @@ function sessionCards(sessions: DreamSession[]): string {
   if (!sessions.length) return `<p class="empty">No sessions were inspected.</p>`;
   return sessions
     .map((session) => {
-      const failed = metricNumber(session, "verificationFailed");
-      const tone = failed > 0 || session.reasonCodes.includes("FAILED_COMMAND_LOOP") ? "bad" : "good";
+      const tone = verificationClosure(session) === "failed" || session.reasonCodes.includes("FAILED_COMMAND_LOOP") ? "bad" : "good";
       return `<article class="session-card ${tone}">
         <div class="session-head">
           <div>
             <h3>${escapeHtml(session.sessionId)}</h3>
-            <p>${escapeHtml(session.role ?? "selected")} · ${escapeHtml(session.classification ?? "unknown")}</p>
+            <p>${escapeHtml(repoLabel(session))} · ${escapeHtml(session.agentPath ?? "root")} · ${escapeHtml(
+              session.lifecycleStatus ?? "unknown"
+            )} · ${escapeHtml(session.endedAt?.slice(0, 10) ?? "date unknown")} · ${escapeHtml(session.role ?? "selected")} · ${escapeHtml(
+              session.classification ?? "unknown"
+            )}</p>
           </div>
           <span class="score-pill">Inefficiency ${escapeHtml(session.inefficiencyScore ?? 0)}</span>
         </div>
         <dl class="stat-grid">
           <div><dt>Outcome</dt><dd>${escapeHtml(session.outcomeScore ?? 0)}</dd></div>
-          <div><dt>Turns</dt><dd>${metricNumber(session, "turns")}</dd></div>
-          <div><dt>Tools</dt><dd>${metricNumber(session, "toolRequests")}</dd></div>
+          <div><dt>Tasks</dt><dd>${metricNumber(session, "taskStarts") || metricNumber(session, "turns")}</dd></div>
+          <div><dt>Tools/task</dt><dd>${metricNumber(session, "toolRequestsPerTask").toFixed(1)}</dd></div>
           <div><dt>Edits</dt><dd>${metricNumber(session, "editCalls")}</dd></div>
-          <div><dt>Verification</dt><dd>${metricNumber(session, "verificationPassed")} passed / ${failed} failed</dd></div>
-          <div><dt>Failed commands</dt><dd>${metricNumber(session, "failedCommands")}</dd></div>
+          <div><dt>Verification closure</dt><dd>${escapeHtml(verificationClosure(session))}</dd></div>
+          <div><dt>Repeated failures</dt><dd>${metricNumber(session, "repeatedFailedCommandAttempts")}</dd></div>
         </dl>
         <div class="text-grid">
           <section><h4>User request</h4><p>${escapeHtml(compactText(session.userIntent, 520))}</p></section>
@@ -783,10 +1128,13 @@ function findingCards(findings: DreamFinding[]): string {
     .map(
       (finding) => `<article class="finding ${severityClass(finding.severity)}">
         <div><span>${escapeHtml(finding.severity.toUpperCase())} · ${escapeHtml(finding.category)}</span><h3>${escapeHtml(finding.title)}</h3></div>
-        <p>${escapeHtml(finding.explanation)}</p>
-        <p><strong>What this means:</strong> ${escapeHtml(findingMeaning(finding))}</p>
-        <p><strong>What to do:</strong> ${escapeHtml(findingAction(finding))}</p>
-        <p><strong>Recommendation:</strong> ${escapeHtml(finding.suggestedImprovement)}</p>
+        <p><strong>Observation:</strong> ${escapeHtml(finding.observation)}</p>
+        <p><strong>Interpretation:</strong> ${escapeHtml(finding.interpretation)}</p>
+        <p><strong>Alternative explanation:</strong> ${escapeHtml(finding.alternativeExplanation)}</p>
+        <p><strong>Recommended action:</strong> ${escapeHtml(finding.recommendedAction)}</p>
+        <p><strong>Apply target:</strong> ${escapeHtml(finding.applyTarget)}</p>
+        <p><strong>Evidence:</strong> ${escapeHtml(formatEvidence(finding.evidenceRefs))}</p>
+        <p><strong>Confidence:</strong> ${escapeHtml(finding.confidence)}</p>
       </article>`
     )
     .join("");
@@ -831,7 +1179,11 @@ function scoreTable(scores: DreamScore[]): string {
       .map(
         (score) => `<tr>
           <td>${escapeHtml(score.category)}</td>
-          <td><span class="score-cell ${scoreStatus(score.score)}">${score.score}/5</span></td>
+          <td>${
+            score.score === null
+              ? `<span class="score-cell warn">insufficient</span>`
+              : `<span class="score-cell ${scoreStatus(score.score)}">${score.score}/5</span>`
+          }</td>
           <td>${escapeHtml(score.confidence)}</td>
           <td>${escapeHtml(score.rationale)}</td>
         </tr>`
@@ -854,11 +1206,18 @@ function generateDreamHtmlReport(packet: DreamPacket, report: Omit<DreamReport, 
   const sessions = packet.selectedSessions;
   const critical = report.findings.filter((finding) => finding.severity === "high" || finding.severity === "critical");
   const nonCritical = report.findings.filter((finding) => finding.severity !== "high" && finding.severity !== "critical");
-  const failedVerification = unresolvedVerificationCount(sessions);
-  const recoveredVerification = recoveredVerificationCount(sessions);
+  const failedVerification = report.findings.filter(
+    (finding) => finding.category === "Verification quality" && finding.disposition === "reliable" && finding.severity === "high"
+  ).length;
+  const recoveredVerification = report.findings.filter((finding) => /later recovered/i.test(finding.title)).length;
   const reviewClaims = sessions.reduce((sum, session) => sum + session.finalClaims.filter((claim) => claim.supported === undefined).length, 0);
-  const recommendations = actionableRecommendations(sessions, report.missingEvidence);
-  const backlog = dreamApplyBacklog(sessions, report.missingEvidence);
+  const actionablePlan = report.applyPlan.findings.filter((finding) => finding.actionClass !== "no_action");
+  const recommendations = actionablePlan.length
+    ? [...new Set(actionablePlan.map((finding) => `- **${finding.actionClass}:** ${finding.recommendedAction} Target: ${finding.recommendedTarget}.`))]
+    : ["- No action is justified by the selected frozen evidence."];
+  const backlog = actionablePlan.length
+    ? [...new Set(actionablePlan.map((finding) => `- ${finding.recommendedAction} Target: ${finding.recommendedTarget}.`))]
+    : ["- No apply backlog item is justified by the selected frozen evidence."];
   const css = `
     :root {
       color-scheme: light;
@@ -1005,7 +1364,7 @@ function generateDreamHtmlReport(packet: DreamPacket, report: Omit<DreamReport, 
       </aside>
     </header>
 
-    <p class="note">Score note: session <strong>inefficiency</strong> runs from 0 to 100, where 0 is best and 100 is worst. Category scores run from 0 to 5, where higher is better. This report evaluates only frozen scan evidence.</p>
+    <p class="note">Score note: session <strong>inefficiency</strong> runs from 0 to 100, where 0 is best and 100 is worst. Category scores run from 0 to 5, where higher is better, or show insufficient when evidence cannot support a score. This report evaluates only frozen scan evidence.</p>
 
     <section class="metric-grid" aria-label="Dream summary">
       ${metricCard("Selected sessions", sessions.length, "Only these sessions were inspected")}
@@ -1070,6 +1429,7 @@ function generateDreamHtmlReport(packet: DreamPacket, report: Omit<DreamReport, 
 
 export function validateDreamPacket(packet: DreamPacket): DreamReport {
   const findings: DreamFinding[] = [];
+  const evaluatedInstructions: InstructionCheck[] = [];
   const ignoredInstructions: InstructionCheck[] = [];
   const unsupportedClaims: ClaimCheck[] = [];
 
@@ -1077,15 +1437,18 @@ export function validateDreamPacket(packet: DreamPacket): DreamReport {
     verificationFindings(session, findings);
     efficiencyFindings(session, findings);
     intentFindings(session, findings);
-    ignoredInstructions.push(
-      ...instructionFindings(session, findings).filter((instruction) => instruction.status === "violated" || instruction.status === "partially_followed")
-    );
+    const sessionInstructions = instructionFindings(session, findings);
+    evaluatedInstructions.push(...sessionInstructions);
+    ignoredInstructions.push(...sessionInstructions.filter((instruction) => instruction.status === "violated" || instruction.status === "partially_followed"));
     unsupportedClaims.push(...unsupportedClaimFindings(session, findings));
   }
 
+  const severityRank: Record<DreamSeverity, number> = { critical: 5, high: 4, medium: 3, low: 2, info: 1 };
+  findings.sort((left, right) => severityRank[right.severity] - severityRank[left.severity] || left.category.localeCompare(right.category));
+
   const scores = [
     scoreIntent(packet.selectedSessions),
-    scoreInstructions(ignoredInstructions, packet.selectedSessions),
+    scoreInstructions(evaluatedInstructions, packet.selectedSessions),
     scoreGrounding(unsupportedClaims, packet.selectedSessions),
     scoreVerification(packet.selectedSessions),
     scoreEfficiency(packet.selectedSessions)
@@ -1101,10 +1464,10 @@ export function validateDreamPacket(packet: DreamPacket): DreamReport {
     "",
     `- Overall outcome: ${critical.length ? "risky or incomplete agent behavior needs attention" : "no high-severity frozen-evidence issue was found"}.`,
     `- Strongest finding: ${findings[0]?.title ?? "none"}.`,
-    `- Biggest risk: ${critical[0]?.explanation ?? "missing evidence limits confidence"}.`,
+    `- Biggest risk: ${critical[0]?.explanation ?? "missing evidence limits confidence"}`,
     `- Best lesson: ${lessonsFromEfficientSessions(packet.selectedSessions)[0]?.replace(/^- /, "") ?? "missing efficient comparison evidence"}`,
     `- Selected sessions: ${packet.selectedSessions.length}. This report evaluates only frozen scan evidence, not the live repository.`,
-    "- Score note: session inefficiency is 0 best / 100 worst; category scores are 0-5 with higher better.",
+    "- Score note: session inefficiency is 0 best / 100 worst; category scores are 0-5 with higher better, or `insufficient` when evidence cannot support a score.",
     "",
     "## What Was Inspected",
     "",
@@ -1175,7 +1538,25 @@ export function validateDreamPacket(packet: DreamPacket): DreamReport {
     ""
   ].join("\n");
 
-  const reportWithoutHtml = { scores, findings, ignoredInstructions, unsupportedClaims, missingEvidence, markdown };
+  const decision = buildDreamDecisionReport({
+    packet,
+    scores,
+    findings,
+    ignoredInstructions,
+    unsupportedClaims,
+    missingEvidence
+  });
+  const reportWithoutHtml = {
+    scores,
+    findings,
+    ignoredInstructions,
+    unsupportedClaims,
+    missingEvidence,
+    markdown: decision.markdown,
+    detailsMarkdown: decision.detailsMarkdown,
+    overallConfidence: decision.overallConfidence,
+    applyPlan: decision.applyPlan
+  };
   return { ...reportWithoutHtml, html: generateDreamHtmlReport(packet, reportWithoutHtml) };
 }
 
@@ -1199,6 +1580,14 @@ function htmlReportPath(markdownPath: string): string {
   return markdownPath.replace(/\.md$/i, ".html");
 }
 
+function detailsReportPath(markdownPath: string): string {
+  return path.join(path.dirname(markdownPath), "details.md");
+}
+
+function applyPlanPath(markdownPath: string): string {
+  return path.join(path.dirname(markdownPath), "apply-plan.json");
+}
+
 export function writeDreamValidationReport(input: string, out?: string): string {
   const packet = readDreamPacket(input);
   const report = validateDreamPacket(packet);
@@ -1206,9 +1595,20 @@ export function writeDreamValidationReport(input: string, out?: string): string 
   fs.mkdirSync(path.dirname(reportPath), { recursive: true });
   fs.writeFileSync(reportPath, report.markdown, "utf8");
   fs.writeFileSync(htmlReportPath(reportPath), report.html, "utf8");
+  fs.writeFileSync(detailsReportPath(reportPath), report.detailsMarkdown, "utf8");
+  fs.writeFileSync(applyPlanPath(reportPath), `${JSON.stringify(report.applyPlan, null, 2)}\n`, "utf8");
   return reportPath;
 }
 
 export function resolveDreamHtmlReportPath(input: string, out?: string): string {
   return htmlReportPath(resolveDreamReportPath(input, out));
+}
+
+
+export function resolveDreamDetailsReportPath(input: string, out?: string): string {
+  return detailsReportPath(resolveDreamReportPath(input, out));
+}
+
+export function resolveDreamApplyPlanPath(input: string, out?: string): string {
+  return applyPlanPath(resolveDreamReportPath(input, out));
 }

@@ -6,9 +6,10 @@ import { validateDreamPacket, writeDreamValidationReport } from "../src/dream/va
 import type { DreamPacket, DreamSession } from "../src/dream/types.js";
 
 function session(overrides: Partial<DreamSession>): DreamSession {
-  return {
+  const result: DreamSession = {
     sessionId: "session-1",
     source: "codex",
+    repoRoot: "C:\\Repo\\Example",
     repoMatch: "matched",
     sourceFiles: [],
     role: "failed_or_risky",
@@ -44,6 +45,43 @@ function session(overrides: Partial<DreamSession>): DreamSession {
     missingEvidence: [],
     ...overrides
   };
+  if (!overrides.tasks) {
+    const verificationChecks = result.verificationChecks.map((check, index) => ({
+      ...check,
+      actionIndex: check.actionIndex ?? index + 2,
+      fresh: check.fresh ?? true
+    }));
+    result.tasks = [
+      {
+        taskId: `${result.sessionId}:task:1`,
+        label: "Example product-code task",
+        intent: result.userIntent ?? "Update the application.",
+        segmentationConfidence: "high",
+        turnIds: ["turn-1"],
+        changes: [
+          {
+            changeId: `${result.sessionId}:task:1:change:1`,
+            actionIndex: 1,
+            changeType: "product_code",
+            target: "src/app.ts",
+            stateChanging: true,
+            verificationRequired: true,
+            acceptableVerificationTypes: ["test", "build", "lint", "typecheck", "diff_check"],
+            repositoryTestsRelevant: true,
+            confidence: "high",
+            evidence: ["explicit product-code test target"],
+            evidenceRefs: result.evidenceRefs
+          }
+        ],
+        verificationChecks,
+        finalAnswer: result.finalAnswer,
+        finalClaims: result.finalClaims,
+        evidenceRefs: result.evidenceRefs
+      }
+    ];
+    result.verificationChecks = verificationChecks;
+  }
+  return result;
 }
 
 function packet(selectedSessions: DreamSession[]): DreamPacket {
@@ -69,20 +107,20 @@ describe("dream validation", () => {
       ])
     );
 
-    expect(report.markdown).toContain("## Ignored or weakened instructions");
-    expect(report.markdown).toContain("violated: Do not run tests.");
-    expect(report.markdown).toContain("## Unsupported claims");
+    expect(report.markdown).toContain("# LunaObs Dream Decision Report");
+    expect(report.markdown).toContain("Explicit instruction was violated");
+    expect(report.markdown).toContain("Do not run tests.");
     expect(report.markdown).toContain("All tests passed.");
-    expect(report.markdown).toContain("Changes were made without frozen verification evidence");
-    expect(report.markdown).toContain("## What Was Inspected");
-    expect(report.markdown).toContain("Inefficiency (0 best, 100 worst)");
-    expect(report.markdown).toContain("session inefficiency is 0 best / 100 worst");
-    expect(report.markdown).toContain("| session-1 |");
+    expect(report.markdown).toContain("Required verification is missing after the final relevant change");
+    expect(report.markdown).toContain("Reliable findings: **3**");
+    expect(report.detailsMarkdown).toContain("## Inspected sessions");
+    expect(report.detailsMarkdown).toContain("## Atomic findings");
+    expect(report.detailsMarkdown).toContain("session-1");
     expect(report.html).toContain("<!doctype html>");
     expect(report.html).toContain("0 is best and 100 is worst");
     expect(report.html).toContain("Dream Apply Backlog");
-    expect(report.markdown).toContain("## Dream Apply Backlog");
-    expect(report.markdown).toContain("AGENTS.md");
+    expect(report.markdown).toContain("## Finding patterns");
+    expect(report.applyPlan.findings.some((finding) => finding.recommendedTarget.includes("Example"))).toBe(true);
   });
 
   it("does not depend on live repository files to support claims", () => {
@@ -110,11 +148,20 @@ describe("dream validation", () => {
     const reportPath = writeDreamValidationReport(dreamDir, path.join(dreamDir, "report.md"));
     const report = fs.readFileSync(reportPath, "utf8");
     const html = fs.readFileSync(path.join(dreamDir, "report.html"), "utf8");
+    const details = fs.readFileSync(path.join(dreamDir, "details.md"), "utf8");
+    const applyPlan = JSON.parse(fs.readFileSync(path.join(dreamDir, "apply-plan.json"), "utf8")) as {
+      schemaVersion: number;
+      findings: Array<{ findingId: string; actionClass: string; evidenceRefs: unknown[] }>;
+    };
 
     expect(report).toContain("Final-answer claim lacks frozen evidence");
     expect(report).toContain("final answer evidence was not captured");
     expect(html).toContain("Frozen Evidence Review");
     expect(html).toContain("All tests passed and the feature is complete.");
+    expect(details).toContain("## Evidence reference catalog");
+    expect(details).toContain("All tests passed and the feature is complete.");
+    expect(applyPlan.schemaVersion).toBe(1);
+    expect(applyPlan.findings.every((finding) => finding.findingId && finding.actionClass && Array.isArray(finding.evidenceRefs))).toBe(true);
   });
 
   it("distinguishes recovered verification failures from unresolved failures", () => {
@@ -141,40 +188,104 @@ describe("dream validation", () => {
     );
 
     expect(report.markdown).toContain("Verification had failed attempts that were later recovered");
-    expect(report.markdown).toContain("This is not automatically a code bug");
-    expect(report.markdown).not.toContain("Verification ended with unresolved failure evidence");
+    expect(report.markdown).toContain("not evidence of a current application defect");
+    expect(report.markdown).not.toContain("Relevant verification ended with a failure");
     expect(report.html).toContain("Recovered attempts");
   });
 
-  it("reports unresolved and recovered verification lanes separately", () => {
+  it("reports an unresolved matching failure separately from a recovered task", () => {
     const report = validateDreamPacket(
       packet([
         session({
+          sessionId: "failed-session",
           metrics: {
-            turns: 2,
-            toolRequests: 4,
+            turns: 1,
+            toolRequests: 2,
             editCalls: 1,
-            verificationEvents: 4,
-            verificationPassed: 1,
-            verificationFailed: 2,
-            failedCommands: 2,
+            verificationEvents: 1,
+            verificationPassed: 0,
+            verificationFailed: 1,
+            failedCommands: 1,
             repeatedFileViews: 0,
             globCalls: 0
           },
+          verificationChecks: [{ command: "npm test", verificationType: "test", status: "failed" }]
+        }),
+        session({
+          sessionId: "recovered-session",
           verificationChecks: [
-            { command: "pwsh ./check-errors.ps1", status: "failed" },
-            { command: "npm test", status: "failed" },
-            { command: "npm test", status: "passed" }
+            { command: "npm test", verificationType: "test", status: "failed" },
+            { command: "npm test", verificationType: "test", status: "passed" }
           ]
         })
       ])
     );
 
-    expect(report.markdown).toContain("Verification ended with unresolved failure evidence");
-    expect(report.markdown).toContain("pwsh ./check-errors.ps1");
+    expect(report.markdown).toContain("Relevant verification ended with a failure");
     expect(report.markdown).toContain("Verification had failed attempts that were later recovered");
-    expect(report.markdown).toContain("What to do:");
-    expect(report.markdown).toContain("Recovered failed attempts: npm test");
-    expect(report.html).toContain("What to do:");
+    expect(report.detailsMarkdown).toContain("failed-session");
+    expect(report.detailsMarkdown).toContain("recovered-session");
+    expect(report.html).toContain("Recommended action:");
+  });
+
+  it("keeps unknown instruction evidence unscored and avoids double-negation false positives", () => {
+    const report = validateDreamPacket(
+      packet([
+        session({
+          instructionChecks: [{ text: "Do not stop without running tests.", status: "unknown" }],
+          commands: ["npm test"]
+        })
+      ])
+    );
+    const instructionScore = report.scores.find((score) => score.category === "Instruction adherence");
+    expect(instructionScore?.score).toBeNull();
+    expect(report.markdown).not.toContain("violated: Do not stop without running tests.");
+  });
+
+  it("infers a captured positive test requirement only when matching evidence exists", () => {
+    const report = validateDreamPacket(
+      packet([
+        session({
+          instructionChecks: [{ text: "You must run tests before completion.", status: "unknown" }],
+          commands: ["npm test"]
+        })
+      ])
+    );
+    const instructionScore = report.scores.find((score) => score.category === "Instruction adherence");
+    expect(instructionScore?.score).toBe(5);
+  });
+
+  it("targets recommendations to the evidenced repository without hardcoded project guidance", () => {
+    const report = validateDreamPacket(packet([session({ repoRoot: "C:\\Repo\\Acme", verificationClosure: "missing" })]));
+    expect(report.markdown).toContain("Acme repository verification guidance");
+    expect(report.applyPlan.findings.some((finding) => finding.actionClass === "repository_specific_investigation")).toBe(true);
+    expect(report.markdown).not.toContain("Satori");
+  });
+
+  it("keeps a single Godot failure repository-specific instead of generalizing guidance", () => {
+    const passingOnly = validateDreamPacket(
+      packet([
+        session({
+          repoRoot: "C:\\Repo\\Satori",
+          commands: [".\\tools\\godot.ps1 -Command parse"],
+          verificationChecks: [{ command: ".\\tools\\godot.ps1 -Command parse", verificationType: "test", status: "passed" }]
+        })
+      ])
+    );
+    expect(passingOnly.markdown).not.toContain("Godot validation guidance");
+
+    const failed = validateDreamPacket(
+      packet([
+        session({
+          repoRoot: "C:\\Repo\\Satori",
+          commands: [".\\tools\\godot.ps1 -Command parse"],
+          verificationChecks: [{ command: ".\\tools\\godot.ps1 -Command parse", verificationType: "test", status: "failed" }]
+        })
+      ])
+    );
+    expect(failed.markdown).toContain("Relevant verification ended with a failure");
+    expect(failed.markdown).toContain("Satori repository verification guidance");
+    expect(failed.markdown).not.toContain("Godot validation guidance");
+    expect(failed.applyPlan.findings.some((finding) => finding.actionClass === "repository_specific_investigation")).toBe(true);
   });
 });

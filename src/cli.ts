@@ -6,7 +6,7 @@ import { defaultConfig } from "./config.js";
 import { discoverSources } from "./fs/discovery.js";
 import { readJsonlObjects, writeJsonl } from "./fs/jsonl.js";
 import { detectRepoRoot, ensureLunaObsDirs, getLunaObsPaths } from "./fs/paths.js";
-import { applyRepoFilter } from "./normalize/repoFilter.js";
+import { applyRepoFilter, canonicalizeObservedRepoRoots } from "./normalize/repoFilter.js";
 import { parseSessionFile } from "./normalize/parser.js";
 import type { NormalizedSession } from "./normalize/types.js";
 import { generateScanHtmlReport } from "./reports/html.js";
@@ -15,7 +15,12 @@ import { generateScanReport } from "./reports/markdown.js";
 import type { ScanSummary } from "./reports/scanModel.js";
 import { scanTerminalSummary } from "./reports/terminal.js";
 import { prepareDreamPacket, writePreparedDreamPacket } from "./dream/prepare.js";
-import { resolveDreamHtmlReportPath, writeDreamValidationReport } from "./dream/validate.js";
+import {
+  resolveDreamApplyPlanPath,
+  resolveDreamDetailsReportPath,
+  resolveDreamHtmlReportPath,
+  writeDreamValidationReport
+} from "./dream/validate.js";
 import { scoreSession, type InefficiencyScore } from "./scoring/score.js";
 import { installDreamSkill, type SkillAgent } from "./skills/install.js";
 import type { RequestedSource } from "./sources/types.js";
@@ -92,6 +97,11 @@ function scan(options: {
       repoFilter.push(decision);
       sessions.push(parsed.session);
     }
+  }
+
+  canonicalizeObservedRepoRoots(sessions);
+  for (const decision of repoFilter) {
+    decision.repoRoot = sessions.find((session) => session.sessionId === decision.sessionId)?.repoRoot;
   }
 
   const scores = sessions
@@ -193,6 +203,8 @@ function validateDream(input: string, out?: string): void {
   const reportPath = writeDreamValidationReport(input, out);
   console.log(`Dream report: ${reportPath}`);
   console.log(`Dream HTML report: ${resolveDreamHtmlReportPath(input, out)}`);
+  console.log(`Dream details: ${resolveDreamDetailsReportPath(input, out)}`);
+  console.log(`Dream apply plan: ${resolveDreamApplyPlanPath(input, out)}`);
 }
 
 const program = new Command();

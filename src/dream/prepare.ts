@@ -2,7 +2,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { readJsonlObjects } from "../fs/jsonl.js";
 import type { EvidenceRef, NormalizedSession, NormalizedTextEvidence, NormalizedToolCall } from "../normalize/types.js";
+import { expandToolCalls, isEditTool, looksLikeVerificationTool, toolCommand, verificationLaneKey } from "../normalize/toolSemantics.js";
 import { scoreSession, type InefficiencyScore } from "../scoring/score.js";
+import { analyzeDreamTasks } from "./analyze.js";
 import type { ClaimCheck, DreamEvidenceRef, DreamPacket, DreamSelectionRole, DreamSession, InstructionCheck, VerificationCheck } from "./types.js";
 
 type LoadedScan = {
@@ -34,7 +36,10 @@ export function loadScanPacket(scanPath: string): LoadedScan {
   const scorePath = path.join(indexDir, "inefficiency-scores.jsonl");
   const existingScores = readJsonlObjects<InefficiencyScore>(scorePath);
   const scoreById = new Map(existingScores.map((score) => [score.sessionId, score]));
-  const scores = sessions.map((session) => scoreById.get(session.sessionId) ?? scoreSession(session));
+  const scores = sessions.map((session) => {
+    const existing = scoreById.get(session.sessionId);
+    return existing?.scoringVersion === 3 ? existing : scoreSession({ ...session, lifecycleStatus: session.lifecycleStatus ?? "unknown" });
+  });
   return {
     sourceScanPath: path.dirname(indexDir),
     sessions,
@@ -96,6 +101,9 @@ function collectEvidence(session: NormalizedSession): DreamEvidenceRef[] {
     for (const ref of claim.evidence ?? []) refs.push(fromEvidenceRef(session.sessionId, ref, index++));
   }
   for (const turn of session.turns) {
+    for (const message of turn.userMessages ?? []) {
+      for (const ref of message.evidence ?? []) refs.push(fromEvidenceRef(session.sessionId, ref, index++));
+    }
     for (const message of turn.assistantMessages) {
       for (const ref of message.evidence ?? []) refs.push(fromEvidenceRef(session.sessionId, ref, index++));
     }
@@ -118,45 +126,25 @@ function collectEvidence(session: NormalizedSession): DreamEvidenceRef[] {
   return refs;
 }
 
-function toolCommand(tool: NormalizedToolCall): string | undefined {
-  if (!/command|shell|terminal|exec|run/i.test(tool.name)) return undefined;
-  const args = tool.arguments;
-  if (typeof args === "string") return args;
-  if (!args || typeof args !== "object") return tool.name;
-  const command = (args as Record<string, unknown>).command;
-  if (typeof command === "string") return command;
-  return JSON.stringify(args);
-}
-
-function textOf(value: unknown): string {
-  if (value === undefined) return "";
-  if (typeof value === "string") return value;
-  return JSON.stringify(value);
-}
-
-function looksLikeVerificationTool(tool: NormalizedToolCall): boolean {
-  if (tool.name === "report_intent") return false;
-  const command = toolCommand(tool) ?? textOf(tool.arguments);
-  const haystack = `${tool.name} ${command}`.toLowerCase();
-  if (/\b(test|vitest|pytest|jest|cargo test|go test|npm run build|tsc|lint|validate|check)\b/.test(haystack)) return true;
-  if (/\baddons[\\/]+gut\b|\bgut_cmdln\.gd\b|\bgodot\b.*\b--headless\b|\btools[\\/]+godot\.ps1\b/i.test(command)) return true;
-  return false;
-}
-
 function collectCommands(session: NormalizedSession): string[] {
-  return session.turns.flatMap((turn) => turn.toolCalls.map(toolCommand).filter((command): command is string => Boolean(command)));
+  return expandToolCalls(session.turns.flatMap((turn) => turn.toolCalls))
+    .map(toolCommand)
+    .filter((command): command is string => Boolean(command));
 }
 
 function verificationChecksFor(session: NormalizedSession): VerificationCheck[] {
-  return session.turns.flatMap((turn) =>
-    turn.toolCalls
-      .filter(looksLikeVerificationTool)
-      .map((tool) => ({
-        command: toolCommand(tool) ?? tool.name,
-        status: tool.status === "failed" ? "failed" : tool.status === "completed" ? "passed" : "unknown",
-        evidenceRefs: fromEvidenceList(session.sessionId, tool.evidence)
-      }))
-  );
+  const tools = expandToolCalls(session.turns.flatMap((turn) => turn.toolCalls));
+  const lastEdit = tools.reduce((last, tool, index) => (isEditTool(tool) && tool.status === "completed" ? index : last), -1);
+  return tools
+    .map((tool, index) => ({ tool, index }))
+    .filter(({ tool }) => looksLikeVerificationTool(tool))
+    .map(({ tool, index }) => ({
+      command: toolCommand(tool) ?? tool.name,
+      lane: verificationLaneKey(tool),
+      fresh: lastEdit < 0 || index > lastEdit,
+      status: tool.status === "failed" ? "failed" : tool.status === "completed" ? "passed" : "unknown",
+      evidenceRefs: fromEvidenceList(session.sessionId, tool.evidence)
+    }));
 }
 
 function missingEvidenceFor(session: NormalizedSession): string[] {
@@ -166,7 +154,10 @@ function missingEvidenceFor(session: NormalizedSession): string[] {
   }
   if (!session.finalAnswer?.text) missing.push("final assistant answer text was not captured in the frozen scan evidence");
   if (!session.instructions?.length) missing.push("explicit user/developer instruction text was not captured in the frozen scan evidence");
-  if (!session.metrics.verificationEvents) missing.push("verification evidence is absent or incomplete");
+  if (session.metrics.taskStarts > 1 && !session.turns.some((turn) => turn.userMessages?.length)) {
+    missing.push("session contains multiple tasks but per-task user messages were not captured");
+  }
+  if (session.lifecycleStatus === "in_progress") missing.push("session was still in progress when scan evidence was frozen");
   return missing;
 }
 
@@ -178,24 +169,54 @@ function instructionChecksFor(session: NormalizedSession): InstructionCheck[] {
   }));
 }
 
+function cleanRepositoryStatusEvidence(session: NormalizedSession): NormalizedToolCall[] {
+  return expandToolCalls(session.turns.flatMap((turn) => turn.toolCalls)).filter((tool) => {
+    const command = toolCommand(tool) ?? "";
+    if (tool.status !== "completed" || !/\bgit\s+status\b/i.test(command)) return false;
+    const output = tool.outputText ?? "";
+    if (/\b(?:modified|deleted|renamed|untracked files|changes not staged|changes to be committed)\b/i.test(output)) return false;
+    const shortLines = output
+      .split(/\r?\n/)
+      .map((line) => line.trimEnd())
+      .filter((line) => /^(?:[ MADRCU?!]{2}|\?\?)\s+/.test(line));
+    return shortLines.length === 0;
+  });
+}
+
 function inferClaimSupport(session: NormalizedSession, claim: NormalizedTextEvidence): boolean | undefined {
   const text = claim.text.toLowerCase();
-  const verificationEvents = metricNumber(session, "verificationEvents");
-  const verificationFailed = metricNumber(session, "verificationFailed");
-  const verificationPassed = metricNumber(session, "verificationPassed");
   const editCalls = metricNumber(session, "editCalls");
+  if (/\bno (?:repo|repository) files? (?:were )?changed\b/.test(text)) {
+    return cleanRepositoryStatusEvidence(session).length ? true : undefined;
+  }
+  if (/\bno (?:repo )?validation was run\b|\b(?:tests?|build) (?:were |was )?not run\b/.test(text)) {
+    return metricNumber(session, "verificationEvents") === 0 ? true : undefined;
+  }
   const verificationClaim = /\b(test|tests|build|lint|validated|verified|verification|passed)\b/.test(text);
   if (verificationClaim) {
+    const checks = verificationChecksFor(session).filter((check) => check.fresh !== false);
+    const latestByLane = new Map<string, VerificationCheck>();
+    for (const check of checks) latestByLane.set(check.lane ?? check.command ?? "unknown", check);
+    const finalChecks = [...latestByLane.values()];
     const universalPassClaim = /\b(all tests passed|all checks passed|full .*passed|0 failed|no failures|no errors?)\b/.test(text);
-    if (verificationEvents === 0) return false;
-    if (verificationFailed === 0 && verificationPassed > 0) return true;
-    if (universalPassClaim && verificationFailed > 0) return false;
-    if (verificationFailed > 0 && verificationPassed === 0) return false;
+    if (!finalChecks.length) return false;
+    if (universalPassClaim) {
+      if (finalChecks.some((check) => check.status === "failed")) return false;
+      return finalChecks.every((check) => check.status === "passed") ? true : undefined;
+    }
+    const lanePattern = text.includes("build")
+      ? /\bbuild\b/
+      : text.includes("lint")
+        ? /\blint\b|eslint|ruff/
+        : /\btest\b|vitest|pytest|jest|gut/;
+    const matching = finalChecks.filter((check) => lanePattern.test(`${check.lane ?? ""} ${check.command ?? ""}`.toLowerCase()));
+    if (matching.some((check) => check.status === "failed")) return false;
+    if (matching.some((check) => check.status === "passed")) return true;
     return undefined;
   }
 
   const changeClaim = /\b(added|captured|changed|completed|created|documented|fixed|implemented|removed|updated|wired)\b/.test(text);
-  if (changeClaim && editCalls === 0) return false;
+  if (changeClaim && editCalls === 0 && metricNumber(session, "toolRequests") === 0) return false;
   return undefined;
 }
 
@@ -205,6 +226,10 @@ function claimEvidenceRefs(session: NormalizedSession, claim: NormalizedTextEvid
   if (/\b(test|tests|build|lint|validated|verified|verification|passed)\b/.test(text)) {
     refs.push(metricEvidence(session.sessionId, "verificationEvents", session.metrics.verificationEvents));
     refs.push(metricEvidence(session.sessionId, "verificationFailed", session.metrics.verificationFailed));
+    refs.push(...verificationChecksFor(session).flatMap((check) => check.evidenceRefs ?? []));
+  }
+  if (/\bno (?:repo|repository) files? (?:were )?changed\b/.test(text)) {
+    refs.push(...cleanRepositoryStatusEvidence(session).flatMap((tool) => fromEvidenceList(session.sessionId, tool.evidence)));
   }
   if (supported === false && /\b(added|captured|changed|completed|created|documented|fixed|implemented|removed|updated|wired)\b/.test(text)) {
     refs.push(metricEvidence(session.sessionId, "editCalls", session.metrics.editCalls));
@@ -235,10 +260,18 @@ function normalizeDreamSession(
 ): DreamSession {
   const existing = session as NormalizedSession & Partial<Pick<DreamSession, "intentCheck" | "instructionChecks" | "verificationChecks">>;
   const legacyDreamFields = session as unknown as Partial<Pick<DreamSession, "userIntent" | "finalAnswer">>;
+  const tasks = analyzeDreamTasks(session);
   return {
     sessionId: session.sessionId,
+    parentSessionId: session.parentSessionId,
+    agentPath: session.agentPath,
     source: session.source,
+    repoRoot: session.repoRoot,
     repoMatch: session.repoMatch,
+    startedAt: session.startedAt,
+    endedAt: session.endedAt,
+    lifecycleStatus: session.lifecycleStatus,
+    verificationClosure: session.metrics.verificationClosure,
     sourceFiles: session.sourceFiles,
     role,
     selectionReason,
@@ -253,52 +286,103 @@ function normalizeDreamSession(
     instructionChecks: existing.instructionChecks ?? instructionChecksFor(session),
     finalAnswer: stringField(legacyDreamFields.finalAnswer) ?? session.finalAnswer?.text,
     finalClaims: finalClaimsFor(session),
-    verificationChecks: existing.verificationChecks ?? verificationChecksFor(session),
+    verificationChecks: existing.verificationChecks ?? tasks.flatMap((task) => task.verificationChecks),
     commands: collectCommands(session),
     evidenceRefs: collectEvidence(session),
-    missingEvidence: missingEvidenceFor(session)
+    missingEvidence: missingEvidenceFor(session),
+    tasks
   };
+}
+
+function recentFirst(left: InefficiencyScore, right: InefficiencyScore): number {
+  return (right.endedAt ?? "").localeCompare(left.endedAt ?? "");
+}
+
+function diverseTake<T extends { score: InefficiencyScore }>(items: T[], limit: number, familyFor: (score: InefficiencyScore) => string): T[] {
+  const selected: T[] = [];
+  const repos = new Set<string>();
+  const families = new Set<string>();
+  for (const item of items) {
+    const repo = item.score.repoRoot?.replace(/[\\/]+$/, "").split(/[\\/]/).at(-1)?.toLowerCase() ?? "unknown";
+    const family = familyFor(item.score);
+    if (repos.has(repo) || families.has(family)) continue;
+    selected.push(item);
+    repos.add(repo);
+    families.add(family);
+    if (selected.length >= limit) return selected;
+  }
+  for (const item of items) {
+    const family = familyFor(item.score);
+    if (selected.includes(item) || families.has(family)) continue;
+    selected.push(item);
+    families.add(family);
+    if (selected.length >= limit) break;
+  }
+  return selected;
 }
 
 function roleSelections(scores: InefficiencyScore[], perGroupLimit: number): Array<{ score: InefficiencyScore; role: DreamSelectionRole; reason: string }> {
   const selected: Array<{ score: InefficiencyScore; role: DreamSelectionRole; reason: string }> = [];
+  const scoreById = new Map(scores.map((score) => [score.sessionId, score]));
+  const familyFor = (score: InefficiencyScore): string => {
+    let current = score;
+    const visited = new Set<string>();
+    while (current.parentSessionId && !visited.has(current.sessionId)) {
+      visited.add(current.sessionId);
+      const parent = scoreById.get(current.parentSessionId);
+      if (!parent) return current.parentSessionId;
+      current = parent;
+    }
+    return current.sessionId;
+  };
+  const activeFamilies = new Set(scores.filter((score) => score.lifecycleStatus === "in_progress").map(familyFor));
+  const completedScores = scores.filter(
+    (score) => score.lifecycleStatus !== "in_progress" && !activeFamilies.has(familyFor(score))
+  );
 
-  const efficient = [...scores]
-    .filter((score) => ["efficient", "expensive_but_justified"].includes(score.classification) && score.outcomeScore >= 70)
-    .sort((a, b) => b.outcomeScore - a.outcomeScore || a.inefficiencyScore - b.inefficiencyScore)
-    .slice(0, perGroupLimit);
+  const efficientCandidates = [...completedScores]
+    .filter((score) => score.classification === "efficient" && score.outcomeScore >= 70)
+    .sort((a, b) => recentFirst(a, b) || b.outcomeScore - a.outcomeScore || a.inefficiencyScore - b.inefficiencyScore)
+    .map((score) => ({ score, role: "efficient_success" as const, reason: "recent successful representative from a diverse repository set" }));
+  const efficient = diverseTake(efficientCandidates, perGroupLimit, familyFor);
 
-  const inefficientSuccess = [...scores]
-    .filter((score) => ["suspicious", "inefficient"].includes(score.classification) && score.outcomeScore >= 60)
-    .sort((a, b) => b.inefficiencyScore - a.inefficiencyScore)
-    .slice(0, perGroupLimit);
+  const inefficientCandidates = [...completedScores]
+    .filter((score) => ["expensive_but_justified", "suspicious", "inefficient"].includes(score.classification) && score.outcomeScore >= 60)
+    .sort((a, b) => recentFirst(a, b) || b.inefficiencyScore - a.inefficiencyScore)
+    .map((score) => ({ score, role: "inefficient_success" as const, reason: "recent high-effort outcome representative" }));
+  const inefficientSuccess = diverseTake(inefficientCandidates, perGroupLimit, familyFor);
 
-  const failedOrRisky = [...scores]
+  const failedCandidates = [...completedScores]
     .filter(
       (score) =>
         score.outcomeScore < 60 ||
+        score.lifecycleStatus === "aborted" ||
+        score.metrics.verificationClosure === "failed" ||
+        (score.metrics.editCalls > 0 && score.metrics.verificationClosure === "missing") ||
         score.reasonCodes.some((reason) => ["FAILED_COMMAND_LOOP", "MISSING_VERIFICATION", "HOOK_FAILURES"].includes(reason)) ||
-        score.metrics.verificationFailed > 0
+        score.reasonCodes.includes("UNRESOLVED_VERIFICATION")
     )
-    .sort((a, b) => b.inefficiencyScore - a.inefficiencyScore || a.outcomeScore - b.outcomeScore)
-    .slice(0, perGroupLimit);
+    .sort((a, b) => recentFirst(a, b) || a.outcomeScore - b.outcomeScore || b.inefficiencyScore - a.inefficiencyScore)
+    .map((score) => ({ score, role: "failed_or_risky" as const, reason: "recent incomplete or risky representative" }));
+  const failedOrRisky = diverseTake(failedCandidates, perGroupLimit, familyFor);
 
-  for (const score of efficient) selected.push({ score, role: "efficient_success", reason: "efficient successful representative" });
-  for (const score of inefficientSuccess) selected.push({ score, role: "inefficient_success", reason: "inefficient successful representative" });
-  for (const score of failedOrRisky) selected.push({ score, role: "failed_or_risky", reason: "failed or risky representative" });
+  selected.push(...efficient, ...inefficientSuccess, ...failedOrRisky);
 
   if (!selected.length) {
     selected.push(
-      ...[...scores]
-        .sort((a, b) => b.inefficiencyScore - a.inefficiencyScore)
+      ...[...completedScores]
+        .sort((a, b) => recentFirst(a, b) || b.inefficiencyScore - a.inefficiencyScore)
         .slice(0, perGroupLimit)
         .map((score) => ({ score, role: "failed_or_risky" as const, reason: "fallback representative" }))
     );
   }
 
+  const rolePriority: Record<DreamSelectionRole, number> = { efficient_success: 1, inefficient_success: 2, failed_or_risky: 3 };
   const deduped = new Map<string, { score: InefficiencyScore; role: DreamSelectionRole; reason: string }>();
   for (const item of selected) {
-    if (!deduped.has(item.score.sessionId)) deduped.set(item.score.sessionId, item);
+    const family = familyFor(item.score);
+    const existing = deduped.get(family);
+    if (!existing || rolePriority[item.role] > rolePriority[existing.role]) deduped.set(family, item);
   }
   return [...deduped.values()];
 }
@@ -316,7 +400,7 @@ export function prepareDreamPacket(scanInputs: string | string[], top = 5): Drea
   const selectedIds = new Set(selections.map((selection) => selection.score.sessionId));
 
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     generatedAt: new Date().toISOString(),
     sourceScanPaths: loaded.map((scan) => scan.sourceScanPath),
     evidenceBoundary:

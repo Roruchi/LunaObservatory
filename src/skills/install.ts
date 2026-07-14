@@ -5,7 +5,7 @@ export type SkillAgent = "codex" | "copilot" | "claude" | "all" | "canonical";
 
 export const dreamSkillMarkdown = `---
 name: lunaobs-dream
-description: Run LunaObs dream mode as an offline frozen-evidence evaluation workflow for scanned coding-agent sessions.
+description: Run LunaObs dream mode as an offline frozen-evidence evaluation workflow for scanned coding-agent sessions. Use when evaluating intent or instruction adherence, unsupported final claims, verification closure, recovery behavior, redundant work, or lessons from efficient and risky agent runs.
 ---
 
 # LunaObs Dream Mode Skill
@@ -15,18 +15,6 @@ Use this skill when the user asks to evaluate, review, judge, compare, or learn 
 Dream mode is an offline evaluation workflow. Humans usually trigger dream mode, but an AI coding or review agent executes this skill safely and consistently.
 
 Scan gathers evidence. Dream evaluates frozen scan evidence. Dream mode does not gather new evidence.
-
-## Use this skill when
-
-Use this skill when asked about:
-
-- intent adherence
-- ignored or weakened instructions
-- unsupported final-answer claims
-- verification quality
-- efficiency or wasted effort
-- comparison between efficient and inefficient sessions
-- lessons for future coding-agent runs
 
 ## Inputs
 
@@ -53,8 +41,8 @@ lunaobs dream prepare --input <scan-path> --out <dream-dir>
 lunaobs dream validate --input <dream-dir> --out <dream-dir>/report.md
 \`\`\`
 
-4. Read the generated Markdown report.
-5. Summarize the dream result for the user, including which sessions were inspected and what concrete repo/process changes should be made.
+4. Read \`report.md\` first. Use \`details.md\` when a decision needs session/task traceability, and use \`apply-plan.json\` for follow-up work.
+5. Summarize the decision, the strongest repeated patterns, and only the concrete changes justified by the evidence.
 
 ## Strict rules
 
@@ -66,6 +54,8 @@ lunaobs dream validate --input <dream-dir> --out <dream-dir>/report.md
 - Do not hide missing evidence.
 - Do not treat low-confidence findings as certain.
 - Do not turn the report into generic coaching. Every finding must be grounded in packet evidence.
+- Do not treat every edit-shaped tool call as a repository code change. Use the task-local change classification and effective outcome in the packet.
+- Do not report missing verification unless the task had an eligible successful state change and lacked a fresh matching check after its final relevant change.
 - Do not modify application source code or apply fixes as part of dream mode.
 - Do not call network services to fill evidence gaps.
 
@@ -85,7 +75,11 @@ Missing packet evidence lowers confidence or becomes a missing-evidence note. It
 - If explicit instructions are missing, say ignored-instruction review is limited.
 - If final-answer text or claim extraction is missing, do not invent unsupported claims.
 - If test or build output is missing, say verification was not proven by the packet.
+- If task segmentation or change classification is low confidence, route the observation to human review instead of asserting a high-confidence gap.
+- Treat read-only work as not requiring change verification. Match documentation, external-state, generated-artifact, and automation-memory work to proportionate checks such as document build, external confirmation, artifact inspection, persistence check, or read-back.
 - If efficient comparison sessions are missing, do not force an efficiency comparison.
+- If an instruction status is unknown, report it as unknown or \`insufficient\`; never count missing evidence as compliance.
+- Compare task-normalized effort only directionally when task difficulty or repository context differs.
 
 ## Avoiding unsupported claims
 
@@ -95,7 +89,7 @@ Missing packet evidence lowers confidence or becomes a missing-evidence note. It
 
 ## Output style
 
-When reporting back to the user, use this structure:
+Use the generated decision report as the default human-facing structure. Keep the summary compact and follow its labels:
 
 ## Dream result
 
@@ -103,11 +97,11 @@ Brief overall judgment.
 
 ## Main findings
 
-List the most important findings with severity.
+List the most important grouped patterns with severity and one of: reliable finding, possible false positive, guidance, or human review.
 
 ## Inspected sessions
 
-List every inspected session ID with role, classification, tool count, edits, verification passed/failed, failed commands, and reason codes. Do not make the user open raw JSON to know what was evaluated.
+Link or point to \`details.md\` for the full inspected-session and task table. Keep the main result readable; retain session IDs and evidence references in the appendix for auditability.
 
 ## Ignored instructions
 
@@ -127,11 +121,11 @@ Compare efficient and inefficient sessions when comparison data exists.
 
 ## Recommendations
 
-Give practical improvements for future agent runs. Recommendations must name a target such as \`AGENTS.md\`, a skill file, a runbook, scan capture fields, or validation tooling. They should be specific enough for a follow-up apply agent to implement without guessing the intent.
+Give proportional improvements for future agent runs. A single low-confidence observation should usually produce no durable rule, a repeated repository-local pattern may justify repository guidance, and only a repeated cross-repository pattern should propose shared guidance.
 
 ## Dream apply backlog
 
-List exact follow-up edits an apply agent should make, such as adding an AGENTS.md verification rule, adding retry discipline after repeated failed commands, updating a Satori verification skill, or improving LunaObs scan capture.
+Summarize the action classes in \`apply-plan.json\`: \`safe_guidance_update\`, \`analyzer_improvement\`, \`repository_specific_investigation\`, \`no_action\`, or \`human_review_required\`. Do not apply the backlog during Dream evaluation.
 
 ## Missing evidence
 
@@ -140,7 +134,12 @@ Mention anything that could not be evaluated because the scan packet lacked evid
 
 const outputContractMarkdown = `# LunaObs Dream Output Contract
 
-Dream validation writes a Markdown report from a prepared \`dream-pack.json\`.
+Dream validation writes four decision artifacts from a prepared \`dream-pack.json\`:
+
+- \`report.md\`: compact grouped human decision report
+- \`report.html\`: readable HTML equivalent
+- \`details.md\`: session/task traceability appendix
+- \`apply-plan.json\`: machine-readable follow-up plan
 
 Default flow:
 
@@ -149,11 +148,13 @@ lunaobs dream prepare --input <scan-path> --out <dream-dir>
 lunaobs dream validate --input <dream-dir> --out <dream-dir>/report.md
 \`\`\`
 
-Every finding needs severity, category, explanation, evidence references, confidence, and a suggested improvement.
+Every finding needs a stable finding ID and pattern key, severity, category, disposition, task identity, observation, interpretation, alternative explanation, recommended action, apply target, confidence, and evidence references. Observed facts and inferred interpretation must remain separate.
 
-The generated report must clearly separate evidence-backed findings, low-confidence observations, missing evidence, and recommendations.
+The generated report must clearly label reliable findings, possible false positives, guidance, and human-review items. Repeated findings should be grouped by pattern, with the full per-session evidence retained in \`details.md\`.
 
-The report must list inspected sessions and include concrete follow-up targets such as \`AGENTS.md\`, a skill file, a runbook, scan capture fields, or validation tooling. A follow-up apply agent should be able to act from the recommendations without guessing.
+Missing-verification findings are eligible only for task-local successful state changes that require verification and have no fresh matching check after the final relevant change. Read-only work is ineligible. Unknown or low-confidence classification must not become a high-confidence gap.
+
+The apply plan must choose one proportional action class: \`safe_guidance_update\`, \`analyzer_improvement\`, \`repository_specific_investigation\`, \`no_action\`, or \`human_review_required\`. It must name exact targets and evidence so a follow-up agent can act without guessing, while avoiding durable policy from isolated low-confidence observations.
 `;
 
 const investigationRulesMarkdown = `# LunaObs Dream Investigation Rules

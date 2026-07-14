@@ -55,6 +55,7 @@ function sessionArticle(row: RankedSessionRow): string {
               <h3>${escapeHtml(row.sessionId)}</h3>
               <span class="pill ${row.classification}">${escapeHtml(label(row.classification))}</span>
             </div>
+            <p>${escapeHtml(row.repository)} · ${escapeHtml(row.lifecycleStatus)}</p>
             <div class="score-line">
               <strong>${row.score}</strong>
               <div class="score-track" aria-label="Inefficiency score ${row.score} of 100">
@@ -63,12 +64,12 @@ function sessionArticle(row: RankedSessionRow): string {
               <span>Outcome ${row.outcomeScore}</span>
             </div>
             <dl class="session-stats">
-              <div><dt>Models</dt><dd>${escapeHtml(row.models)}</dd></div>
-              <div><dt>Turns</dt><dd>${row.turns}</dd></div>
+              <div><dt>Tasks</dt><dd>${row.turns}</dd></div>
               <div><dt>Output tokens</dt><dd>${escapeHtml(row.outputTokens)}</dd></div>
-              <div><dt>Tool calls</dt><dd>${row.toolCalls}</dd></div>
-              <div><dt>Repeated views</dt><dd>${row.repeatedFileViews}</dd></div>
-              <div><dt>Verification</dt><dd>${row.verificationEvents}</dd></div>
+              <div><dt>Tools/task</dt><dd>${row.toolCallsPerTask.toFixed(1)}</dd></div>
+              <div><dt>Verification closure</dt><dd>${escapeHtml(row.verificationClosure)}</dd></div>
+              <div><dt>Repeated failures</dt><dd>${row.repeatedFailedAttempts}</dd></div>
+              <div><dt>Redundant calls</dt><dd>${(row.redundantToolCallRate * 100).toFixed(1)}%</dd></div>
             </dl>
             <div class="reasons">${reasons}</div>
           </div>
@@ -299,7 +300,7 @@ export function generateScanHtmlReport(
       <div>
         <p class="eyebrow">LunaObs Scan</p>
         <h1>Session Inefficiency Report</h1>
-        <p class="subtitle">A local summary of scanned agent sessions, suspicious patterns, repository spread, and telemetry coverage.</p>
+        <p class="subtitle">A local summary of scanned agent sessions, outcome evidence, task-normalized effort, repository spread, and telemetry coverage.</p>
       </div>
       <aside class="generated">
         <span>Generated at</span>
@@ -388,7 +389,7 @@ export function generateScanHtmlReport(
         </div>
 
         <div class="panel">
-          <h2>Telemetry Coverage</h2>
+          <h2>Evidence and Telemetry Coverage</h2>
           <div class="table-scroll">
             <table>
               <thead>

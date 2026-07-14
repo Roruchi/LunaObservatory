@@ -33,12 +33,18 @@ export type RankedSessionRow = {
   score: number;
   outcomeScore: number;
   classification: SessionClassification;
+  repository: string;
+  lifecycleStatus: string;
   models: string;
   turns: number;
   outputTokens: string;
   toolCalls: number;
+  toolCallsPerTask: number;
   repeatedFileViews: number;
   verificationEvents: number;
+  verificationClosure: string;
+  repeatedFailedAttempts: number;
+  redundantToolCallRate: number;
   reasons: string[];
 };
 
@@ -115,6 +121,7 @@ function mostLikelyRepository(paths: string[]): string | undefined {
 }
 
 function repoPath(session: NormalizedSession): string {
+  if (session.repoRoot) return repositoryCandidate(session.repoRoot) ?? session.repoRoot;
   const toolPaths: string[] = [];
   for (const turn of session.turns) {
     for (const hook of turn.hooks) {
@@ -176,7 +183,22 @@ function telemetryCoverageRows(sessions: NormalizedSession[]): TelemetryCoverage
   return [
     { metric: "Input tokens", reported: sessions.length - unavailable.inputTokens, unavailable: unavailable.inputTokens },
     { metric: "Output tokens", reported: sessions.length - unavailable.outputTokens, unavailable: unavailable.outputTokens },
-    { metric: "Cached tokens", reported: sessions.length - unavailable.cachedTokens, unavailable: unavailable.cachedTokens }
+    { metric: "Cached tokens", reported: sessions.length - unavailable.cachedTokens, unavailable: unavailable.cachedTokens },
+    {
+      metric: "Task completion marker",
+      reported: sessions.filter((session) => session.lifecycleStatus !== "unknown").length,
+      unavailable: sessions.filter((session) => session.lifecycleStatus === "unknown").length
+    },
+    {
+      metric: "User intent",
+      reported: sessions.filter((session) => Boolean(session.userIntent?.text)).length,
+      unavailable: sessions.filter((session) => !session.userIntent?.text).length
+    },
+    {
+      metric: "Final answer",
+      reported: sessions.filter((session) => Boolean(session.finalAnswer?.text)).length,
+      unavailable: sessions.filter((session) => !session.finalAnswer?.text).length
+    }
   ];
 }
 
@@ -208,12 +230,18 @@ export function buildScanReportModel(
       score: score.inefficiencyScore,
       outcomeScore: score.outcomeScore,
       classification: score.classification,
+      repository: repoName(repoPath(sessions.find((session) => session.sessionId === score.sessionId) ?? ({ repoRoot: score.repoRoot } as NormalizedSession))),
+      lifecycleStatus: score.lifecycleStatus,
       models: modelSummary(score.metrics.models),
-      turns: score.metrics.turns,
+      turns: score.metrics.taskStarts || score.metrics.turns,
       outputTokens: metricValue(score.metrics.outputTokens),
       toolCalls: score.metrics.toolRequests,
+      toolCallsPerTask: score.metrics.toolRequestsPerTask,
       repeatedFileViews: score.metrics.repeatedFileViews,
       verificationEvents: score.metrics.verificationEvents,
+      verificationClosure: score.metrics.verificationClosure,
+      repeatedFailedAttempts: score.metrics.repeatedFailedCommandAttempts,
+      redundantToolCallRate: score.metrics.redundantToolCallRate,
       reasons: score.reasonCodes
     }));
 

@@ -26,6 +26,8 @@ describe("dream preparation", () => {
     expect(typeof selected.finalAnswer).toBe("string");
     expect(selected.finalAnswer).toContain("Implemented scan capture");
     expect(selected.instructionChecks.some((instruction) => instruction.text.includes("Do not inspect the live repository"))).toBe(true);
-    expect(selected.finalClaims.some((claim) => claim.text.includes("npm test passed") && claim.supported === true)).toBe(true);
+    expect(selected.verificationClosure).toBe("missing");
+    expect(selected.verificationChecks.some((check) => check.command?.includes("npm test") && check.fresh === false)).toBe(true);
+    expect(selected.finalClaims.some((claim) => claim.text.includes("npm test passed") && claim.supported === false)).toBe(true);
   });
 });
