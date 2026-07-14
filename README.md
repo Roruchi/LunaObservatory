@@ -10,8 +10,8 @@ LunaObs is a local-first CLI tool for observing coding-agent session traces.
 
 ## Modules
 
-- Scan: deterministic local analyzer that discovers native session logs, filters them to the current repo, parses metrics, scores suspicious sessions, and writes reports.
-- Dream: agent skill scaffold for investigating the most suspicious Scan results and producing evidence-backed lessons and environment suggestions.
+- Scan: deterministic local analyzer that discovers native session logs, filters them to the current repo, parses metrics, scores suspicious sessions, and writes Markdown plus HTML reports.
+- Dream: offline evaluator for frozen Scan evidence. Humans usually trigger dream mode; agents execute the reusable LunaObs Dream skill to prepare packets, validate them, inspect the generated report, and summarize evidence-backed lessons.
 
 LunaObs reads native agent session files directly. It does not depend on TokenTelemetry exports.
 
@@ -37,12 +37,24 @@ lunaobs init
 lunaobs scan
 lunaobs scan --source copilot --logs tests/fixtures --repo .
 lunaobs report
-lunaobs dream prepare --top 5
-lunaobs dream validate
+lunaobs dream prepare --input .lunaobs --out .lunaobs/dream --top 5
+lunaobs dream validate --input .lunaobs/dream --out .lunaobs/dream/report.md
 lunaobs skill install --agent codex
 lunaobs skill install --agent copilot
 lunaobs skill install --agent claude
 ```
+
+## Dream Mode
+
+Dream mode has a strict evidence boundary:
+
+- `scan` gathers evidence from native agent session traces.
+- `dream prepare` freezes selected scan evidence into `dream-pack.json`.
+- `dream validate` evaluates only that prepared packet and writes a Markdown report.
+
+Dream validation must not inspect the live repository, run git, run tests, call external tools, or infer facts from files outside the prepared packet. Missing packet fields become low-confidence observations or missing-evidence notes.
+
+Agent-facing instructions live in `src/skills/lunaobs-dream/SKILL.md` and can be installed with `lunaobs skill install --agent codex|copilot|claude|all`. The skill tells agents how to run `lunaobs dream prepare`, run `lunaobs dream validate`, read the report, and summarize strongest findings, ignored instructions, unsupported claims, verification gaps, efficiency lessons, recommendations, and missing evidence.
 
 ## Default Source Discovery
 
@@ -71,10 +83,12 @@ Sessions are included when hook `cwd` is inside the repo or when tool path argum
     inefficiency-scores.jsonl
   reports/
     inefficiency-report.md
+    inefficiency-report.html
   dream/
     dream-pack.json
     dream-pack.md
     DREAM_TASK.md
+    report.md
     output/
   skills/
     lunaobs-dream/
