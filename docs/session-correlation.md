@@ -24,6 +24,4 @@ Claude uses retained native metadata. Codex also reads session metadata (`git.br
 
 The command writes only the requested JSON file and prints counts. Keep real task exports and correlation artifacts outside public repositories. Its synthetic tests cover accepted, ambiguous, unmatched, duplicate-streaming, missing-usage and multiple-session cases. Reproduce checks with `npm run build` and `npm test`; this repository currently defines no lint script or CI workflow.
 
-Claude correlation entries include `coverage` for history, usage, inherited-event counts, unresolved inherited events and allocation notes. Correlation and Scan share command-scoped sets of already counted requests, events and tool IDs over the complete discovered corpus; a child supplied alone has explicitly partial lineage coverage.
-
-Assistant requests count once across all supplied transcripts by message ID plus request ID, falling back to event UUID. Native transcript ID and source path give a deterministic processing order without reconstructing ancestry. Inherited history makes coverage partial; output notes document possible undercounts from reused IDs or a later copy with fuller usage or tool outcomes.
+Claude correlation entries include `coverage` for history, usage, inherited-event counts, unresolved inherited events and allocation notes. See the [Claude adapter](claude-adapter.md) for the shared Scan/correlation deduplication rule, coverage semantics and accepted undercounts.

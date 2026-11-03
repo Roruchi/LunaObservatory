@@ -21,4 +21,4 @@ The simple rule accepts these rare undercounts, also called out in output `notes
 
 Distinct pairs remain distinct, even when only one component matches. Without a complete pair or a shared UUID, the adapter cannot deduplicate split requests across transcripts; explicit unknowns keep that uncertainty visible. Session completion stays unknown because a final assistant message alone does not establish task completion.
 
-All checked-in fixtures are handmade and fictional. Normalized Scan output includes text and tool arguments: keep real traces and generated artifacts private. The correlation command emits identity linkage, evidence kinds and digests rather than prompt or tool content.
+All checked-in fixtures are handmade and fictional. See [Privacy](../README.md#privacy) for handling traces and Scan output, and the [correlation guide](session-correlation.md) for that command's output contract.

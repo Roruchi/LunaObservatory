@@ -10,7 +10,7 @@ LunaObs is a local-first CLI tool for observing coding-agent session traces.
 
 ## Modules
 
-- Scan: deterministic local analyzer that discovers native Codex and Copilot session logs, filters them to the current repo, normalizes trace evidence, scores suspicious sessions, and writes Markdown plus HTML reports.
+- Scan: deterministic local analyzer that discovers native Codex, Copilot and Claude Code session logs, filters them to the current repo, normalizes trace evidence, scores suspicious sessions, and writes Markdown plus HTML reports.
 - Dream: offline evaluator for frozen Scan evidence. Humans usually trigger dream mode; agents execute the reusable LunaObs Dream skill to prepare packets, validate them, inspect the generated report, and summarize evidence-backed lessons.
 - Workpackage evaluation: a [slice 1 prototype](docs/workpackage-evaluation.md) with a typed evidence contract, pure deterministic rubric and synthetic regression corpus. This scores evidence, not people. It adds no data collection or Scan/Dream integration.
 
@@ -82,7 +82,7 @@ These are trace-derived indicators. They help locate sessions worth inspecting; 
 - Codex: `CODEX_HOME` or `~/.codex`, using `sessions/**/*.jsonl` and `archived_sessions/**/*.jsonl`. The normalizer handles native Codex session metadata, turn context, lifecycle events, response items, tool calls, and cumulative token samples.
 - Claude: `~/.claude`, including native `projects/**/*.jsonl` transcripts. See [Claude adapter](docs/claude-adapter.md) for streaming deduplication, usage semantics and unknowns.
 
-Codex and Copilot traces are supported natively. Unknown or incomplete event fields remain explicit rather than being guessed.
+Unknown or incomplete event fields remain explicit rather than being guessed.
 
 ## Repo Filtering
 
@@ -123,7 +123,7 @@ Sessions are included when hook `cwd` is inside the repo or when tool path argum
 
 ## Privacy
 
-LunaObs does not copy raw `encryptedContent` or `reasoningOpaque` into reports. The scaffold records only boolean flags such as `hasEncryptedContent` and `hasOpaqueReasoning`, plus metrics and source references. It does not capture full chat transcripts.
+LunaObs does not copy raw `encryptedContent` or `reasoningOpaque` into reports. For those fields, it records boolean flags such as `hasEncryptedContent` and `hasOpaqueReasoning`, plus metrics and source references. Normalized Scan output retains plaintext messages and tool arguments from traces; keep real traces and generated artifacts private.
 
 ## Limitations
 
