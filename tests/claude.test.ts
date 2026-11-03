@@ -90,9 +90,90 @@ describe("Claude Code native transcripts (fully synthetic)", () => {
   it("joins failures to the original call across turns and recognizes reported exit codes", () => {
     const { session } = parseRows([
       native("assistant", { id: "synthetic-request", content: [{ type: "tool_use", id: "synthetic-tool", name: "Bash", input: { command: "npm test" } }] }),
-      native("user", { content: [{ type: "tool_result", tool_use_id: "synthetic-tool", content: "Exit code: 2", is_error: true }] })
+      native("user", { content: [{ type: "tool_result", tool_use_id: "synthetic-tool", content: "Exit code: 2", is_error: true }] }, { toolUseResult: { exitCode: 2 } })
     ]);
     expect(session.metrics.verificationFailed).toBe(1);
     expect(session.turns[0].toolCalls[0].exitCode).toBe(2);
   });
+  it.each([false, true])("excludes parent history by stable ids when copied session ids are rewritten: %s", rewritten => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "lunaobs-synthetic-lineage-"));
+    const parent = [
+      native("user", { content: "Fictional parent instruction." }, { uuid: "parent-user", cwd: "/fictional/parent" }),
+      native("assistant", { id: "parent-message", model: "fictional-model", usage: { input_tokens: 10, output_tokens: 10 }, content: [
+        { type: "text", text: "Fictional parent answer." },
+        { type: "tool_use", id: "parent-tool", name: "Read", input: { file_path: "/fictional/parent.txt" } }
+      ] }, { uuid: "parent-event", requestId: "parent-request" }),
+      native("user", { content: [{ type: "tool_result", tool_use_id: "parent-tool", content: "Fictional parent data.", is_error: false }] }, { uuid: "parent-result" })
+    ];
+    try {
+      const parentFile = path.join(directory, "parent.jsonl");
+      const childFile = path.join(directory, "renamed-child.jsonl");
+      const own = [
+        native("user", { content: "Fictional child instruction." }, { uuid: "child-user", parentUuid: "parent-result", cwd: "/fictional/child" }),
+        native("assistant", { id: "child-message", model: "fictional-model", usage: { input_tokens: 2, output_tokens: 2 }, content: [{ type: "text", text: "Fictional child answer." }] }, { uuid: "child-event", parentUuid: "child-user" })
+      ].map(row => ({ ...row, sessionId: "renamed-session", isSidechain: true, agentId: "fictional-agent" }));
+      fs.writeFileSync(parentFile, parent.map(row => JSON.stringify(row)).join("\n"));
+      const copied = parent.map(row => rewritten ? { ...row, sessionId: "renamed-session", isSidechain: true, agentId: "fictional-agent" } : row);
+      fs.writeFileSync(childFile, [...copied, ...own].map(row => JSON.stringify(row)).join("\n"));
+      const child = parseSessionFile(childFile, "claude").session;
+      const original = parseSessionFile(parentFile, "claude").session;
+      expect(child.parentSessionId).toBe("synthetic-session");
+      expect(child.metrics.inputTokens.value).toBe(2);
+      expect(child.metrics.outputTokens.value! + original.metrics.outputTokens.value!).toBe(12);
+      expect(child.metrics.toolRequests).toBe(0);
+      expect(child.turns).toHaveLength(1);
+      expect(child.userIntent?.text).toBe("Fictional child instruction.");
+      expect(child.attribution?.worktreePaths).toEqual(["/fictional/child"]);
+      expect(child.attribution?.historyCoverage).toBe("complete");
+    } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+  });
+  it("recognizes inherited message/request ids without event UUIDs", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "lunaobs-synthetic-message-lineage-"));
+    try {
+      const inherited = native("assistant", { id: "fictional-parent-message", usage: { output_tokens: 10 }, content: [] }, { requestId: "fictional-parent-request" });
+      const own = native("assistant", { id: "fictional-own-message", usage: { output_tokens: 2 }, content: [] }, { sessionId: "fictional-child", isSidechain: true, agentId: "fictional-agent" });
+      fs.writeFileSync(path.join(directory, "parent.jsonl"), JSON.stringify(inherited));
+      const file = path.join(directory, "child.jsonl");
+      fs.writeFileSync(file, [ { ...inherited, sessionId: "fictional-child", isSidechain: true, agentId: "fictional-agent" }, own ].map(row => JSON.stringify(row)).join("\n"));
+      expect(parseSessionFile(file, "claude").session.metrics.outputTokens.value).toBe(2);
+    } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+  });
+  it.each([true, false])("deduplicates repeated users and tool events with UUIDs: %s", uuid => {
+    const rows = [
+      native("user", { id: "fictional-user", content: "Fictional instruction." }, uuid ? { uuid: "user-event" } : {}),
+      native("assistant", { id: "fictional-request", content: [{ type: "tool_use", id: "fictional-tool", name: "Read", input: {} }] }, uuid ? { uuid: "tool-event" } : {}),
+      native("user", { id: "fictional-result", content: [{ type: "tool_result", tool_use_id: "fictional-tool", content: "Fictional data.", is_error: false }] }, uuid ? { uuid: "result-event" } : {})
+    ];
+    const { session } = parseRows(rows.flatMap(row => [row, row]));
+    expect(session.turns).toHaveLength(1);
+    expect(session.metrics.toolRequests).toBe(1);
+    expect(session.turns[0].toolCalls[0].evidence).toHaveLength(2);
+  });
+  it("marks ambiguous lineage as partial rather than claiming complete history or usage", () => {
+    const { session } = parseRows([
+      native("assistant", { id: "fictional-child", usage: { input_tokens: 2, output_tokens: 2 }, content: [] },
+        { uuid: "child-event", parentUuid: "unavailable-parent-event", isSidechain: true, agentId: "fictional-agent" })
+    ]);
+    expect(session.attribution?.historyCoverage).toBe("partial");
+    expect(session.attribution?.usageCoverage).toBe("partial");
+    expect(session.attribution?.unknowns).toContain("history_lineage_unknown");
+  });
+  it.each(["Exit code: 1", "Process exited with code 1"])("treats Read content as data: %s", content => {
+    const { session } = parseRows([
+      native("assistant", { id: "fictional-read", content: [{ type: "tool_use", id: "fictional-tool", name: "Read", input: {} }] }),
+      native("user", { content: [{ type: "tool_result", tool_use_id: "fictional-tool", content, is_error: false }] })
+    ]);
+    expect(session.turns[0].toolCalls[0].status).toBe("completed");
+    expect(session.turns[0].toolCalls[0].exitCode).toBeUndefined();
+  });
+  it.each(["Exit code: 0", "Process exited with code 0"])("does not accept Bash stdout as execution metadata: %s", content => {
+    const { session } = parseRows([
+      native("assistant", { id: "fictional-bash", content: [{ type: "tool_use", id: "fictional-tool", name: "Bash", input: { command: "npm test" } }] }),
+      native("user", { content: [{ type: "tool_result", tool_use_id: "fictional-tool", content }] })
+    ]);
+    expect(session.turns[0].toolCalls[0].status).toBe("unknown");
+    expect(session.turns[0].toolCalls[0].exitCode).toBeUndefined();
+    expect(session.metrics.verificationPassed).toBe(0);
+  });
+
 });

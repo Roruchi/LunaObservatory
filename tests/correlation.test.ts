@@ -48,6 +48,18 @@ describe("verifiable Firstmate correlation", () => {
     expect(correlateSession(session(), records().map(record => ({ ...record, endedAt: null }))).status).toBe("ambiguous");
     expect(correlateSession({ ...session(), startedAt: undefined }, records()).status).toBe("ambiguous");
   });
+  it("rejects each known separating bound even with incomplete windows", () => {
+    const item = session();
+    const task = records()[0];
+    const future = { ...task, attemptId: "fictional-future", startedAt: "2026-01-01T11:00:00Z", endedAt: null };
+    expect(correlateSession(item, [task, future]).status).toBe("matched");
+    expect(correlateSession({ ...item, startedAt: undefined }, [future]).status).toBe("unmatched");
+    const past = { ...task, endedAt: "2026-01-01T09:59:00Z" };
+    expect(correlateSession({ ...item, endedAt: undefined }, [past]).status).toBe("unmatched");
+    const possible = correlateSession(item, [{ ...task, endedAt: null }]);
+    expect(possible.status).toBe("ambiguous");
+    expect(possible.reasons).toContain("time_window_incomplete");
+  });
   it("uses explicit first-instruction task/inbox anchors with exact token boundaries", () => {
     expect(correlateSession(session(), records(), observed({ firstInstruction: "Task id: fictional-nebula" })).status).toBe("matched");
     expect(correlateSession(session(), records(), observed({ firstInstruction: "Inbox: '/fictional/state/fictional-nebula.inbox'" })).status).toBe("matched");

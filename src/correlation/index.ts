@@ -72,9 +72,10 @@ export function correlateSession(session: NormalizedSession, records: TaskRecord
     const start = Date.parse(session.startedAt ?? "");
     const end = Date.parse(session.endedAt ?? "");
     const completeTime = Number.isFinite(start) && Number.isFinite(end) && end >= start && record.endedAt !== null;
-    if (completeTime && (end < Date.parse(record.startedAt) || start > Date.parse(record.endedAt!))) return;
+    if (Number.isFinite(end) && end < Date.parse(record.startedAt)) return;
+    if (Number.isFinite(start) && record.endedAt !== null && start > Date.parse(record.endedAt)) return;
     const evidence = [branch && "branch", path && "worktree_path", inbox && "first_instruction_inbox", task && "first_instruction_task", completeTime && "time_overlap"].filter((value): value is string => Boolean(value));
-    const unknowns = [...(session.attribution?.unknowns.filter(reason => ["sidechain_agent_identity_missing", "mixed_sidechain_markers", "timestamp_missing_or_invalid"].includes(reason)) ?? []), !completeTime && "time_window_incomplete", !record.attemptId && "attempt_identity_unknown", !(branch || inbox || task) && "task_identity_unverified"].filter((value): value is string => Boolean(value));
+    const unknowns = [...(session.attribution?.unknowns.filter(reason => ["sidechain_agent_identity_missing", "mixed_sidechain_markers", "timestamp_missing_or_invalid", "history_lineage_unknown"].includes(reason)) ?? []), !completeTime && "time_window_incomplete", !record.attemptId && "attempt_identity_unknown", !(branch || inbox || task) && "task_identity_unverified"].filter((value): value is string => Boolean(value));
     // Exact repeated caller records are one observation; contradictory metadata remains ambiguous.
     const duplicate = candidates.find(candidate => candidate.taskId === record.taskId && candidate.attemptId === record.attemptId &&
       candidate.project === record.project && candidate.spawnGeneration === record.spawnGeneration &&

@@ -44,6 +44,8 @@ export type NormalizedSession = {
     firstInstruction?: NormalizedTextEvidence;
     isSidechain?: boolean;
     agentId?: string;
+    historyCoverage?: "complete" | "partial";
+    usageCoverage?: "complete" | "partial";
     unknowns: string[];
   };
   sessionId: string;
