@@ -44,6 +44,7 @@ export type NormalizedSession = {
     firstInstruction?: NormalizedTextEvidence;
     isSidechain?: boolean;
     agentId?: string;
+    notes?: string[];
     inheritedEvents?: number;
     unresolvedInheritedEvents?: number | null;
     historyCoverage?: "complete" | "partial";

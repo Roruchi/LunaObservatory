@@ -144,7 +144,7 @@ export function correlateTraceDirectory(logs: string, taskFile: string, source: 
   const correlations = [...sessions.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([key, { session, observations, digest }]) => {
     const result = { ...correlateSession(session, records, observations), traceDigest: digest,
       ...(session.source === "claude" ? { coverage: { history: session.attribution?.historyCoverage, usage: session.attribution?.usageCoverage,
-        inheritedEvents: session.attribution?.inheritedEvents, unresolvedInheritedEvents: session.attribution?.unresolvedInheritedEvents } } : {}) };
+        inheritedEvents: session.attribution?.inheritedEvents, unresolvedInheritedEvents: session.attribution?.unresolvedInheritedEvents, notes: session.attribution?.notes } } : {}) };
     if (conflicts.has(key)) return { ...result, status: "ambiguous" as const, confidence: "low" as const, taskId: null, attemptId: null, reasons: ["conflicting_session_copies"] };
     return result;
   });

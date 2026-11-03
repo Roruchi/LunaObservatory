@@ -130,17 +130,17 @@ describe("verifiable Firstmate correlation", () => {
       const childFile = path.join(logs, "parent", "subagents", "child.jsonl");
       fs.mkdirSync(path.dirname(childFile), { recursive: true });
       fs.copyFileSync(trace, path.join(logs, "parent.jsonl"));
-      const inherited = fs.readFileSync(trace, "utf8").trim().split("\n").map(line => ({ ...JSON.parse(line), sessionId: "fictional-child", isSidechain: true, agentId: "fictional-agent" }));
+      const inherited = fs.readFileSync(trace, "utf8").trim().split("\n").map(line => ({ ...JSON.parse(line), sessionId: "z-fictional-child", isSidechain: true, agentId: "fictional-agent" }));
       const own = [
         { type: "user", uuid: "fictional-own-user", parentUuid: "fictional-event-7", message: { content: "Task id: fictional-nebula" } },
         { type: "assistant", uuid: "fictional-own-answer", parentUuid: "fictional-own-user", message: { id: "fictional-own-message", model: "fictional-model", content: [], usage: { input_tokens: 2, output_tokens: 2 } } }
-      ].map(row => ({ ...row, sessionId: "fictional-child", isSidechain: true, agentId: "fictional-agent", timestamp: "2026-01-01T10:00:08Z", cwd: "/fictional/worktrees/nebula", gitBranch: "fm/fictional-nebula" }));
+      ].map(row => ({ ...row, sessionId: "z-fictional-child", isSidechain: true, agentId: "fictional-agent", timestamp: "2026-01-01T10:00:08Z", cwd: "/fictional/worktrees/nebula", gitBranch: "fm/fictional-nebula" }));
       fs.writeFileSync(childFile, [...inherited, ...own].map(row => JSON.stringify(row)).join("\n"));
       execFileSync(process.execPath, [path.join(dist, "cli.js"), "correlate", "--logs", logs, "--tasks", taskFile, "--out", out]);
       const corpus = JSON.parse(fs.readFileSync(out, "utf8"));
-      const child = corpus.correlations.find((item: { sessionId: string }) => item.sessionId.startsWith("fictional-child"));
+      const child = corpus.correlations.find((item: { sessionId: string }) => item.sessionId.startsWith("z-fictional-child"));
       expect(child.status).toBe("matched");
-      expect(child.coverage).toEqual({ history: "complete", usage: "complete", inheritedEvents: 8, unresolvedInheritedEvents: 0 });
+      expect(child.coverage).toMatchObject({ history: "partial", usage: "partial", inheritedEvents: 8, unresolvedInheritedEvents: 0, notes: [expect.any(String)] });
       execFileSync(process.execPath, [path.join(dist, "cli.js"), "correlate", "--logs", childFile, "--tasks", taskFile, "--out", out]);
       expect(JSON.parse(fs.readFileSync(out, "utf8")).correlations[0].coverage.history).toBe("partial");
       const scanOut = path.join(directory, "scan");

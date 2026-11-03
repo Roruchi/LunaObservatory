@@ -24,4 +24,6 @@ Claude uses retained native metadata. Codex also reads session metadata (`git.br
 
 The command writes only the requested JSON file and prints counts. Keep real task exports and correlation artifacts outside public repositories. Its synthetic tests cover accepted, ambiguous, unmatched, duplicate-streaming, missing-usage and multiple-session cases. Reproduce checks with `npm run build` and `npm test`; this repository currently defines no lint script or CI workflow.
 
-Claude correlation entries include `coverage` for history, usage, inherited-event counts and unresolved inherited events. Correlation and Scan share a command-scoped event ownership registry over the complete discovered corpus; a child supplied alone has explicitly partial lineage coverage.
+Claude correlation entries include `coverage` for history, usage, inherited-event counts, unresolved inherited events and allocation notes. Correlation and Scan share a command-scoped event ownership registry over the complete discovered corpus; a child supplied alone has explicitly partial lineage coverage.
+
+Ownership ties use first-event time and lexical transcript ID, without reconstructing ancestry. Shared history can be allocated differently from native parent/child lineage, especially when the parent continues after a fork; inherited events make coverage partial while measured aggregate usage is retained.

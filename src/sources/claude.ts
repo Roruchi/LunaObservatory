@@ -54,48 +54,16 @@ function transcriptScope(file: string, input: NativeRow[]) {
   const child = scope.filter(({ data }) => typeof data.isSidechain === "boolean").at(-1)?.data.isSidechain === true;
   const childAgentId = str(scope.filter(({ data }) => data.isSidechain === child && str(data.agentId)).at(-1)?.data.agentId);
   const sessionId = child && childAgentId ? `${nativeSessionId}:agent:${childAgentId}` : nativeSessionId;
-  const inScope = (row: RecordValue) => (!str(row.sessionId) || row.sessionId === nativeSessionId) &&
-    (typeof row.isSidechain !== "boolean" || row.isSidechain === child) &&
-    (!str(row.agentId) || row.agentId === childAgentId);
-  return { nativeSessionId, childAgentId, child, sessionId, inScope, sessionIdMissing: !str(last?.sessionId) };
+  return { nativeSessionId, childAgentId, child, sessionId, sessionIdMissing: !str(last?.sessionId) };
 }
 
 export function createClaudeCorpus(inputs: Map<string, Transcript>) {
   const scopes = new Map([...inputs].map(([file, input]) => [file, transcriptScope(file, input.rows)]));
   const firstTimes = new Map([...inputs].map(([file, input]) => [file, input.rows.reduce((first, { data }) => Math.min(first, eventTime(data)), Infinity)]));
-  const tails = new Map<string, string[]>();
-  const sessions = new Map<string, string[]>();
-  const terminalKeys = new Map<string, string>();
-  for (const [file, input] of inputs) {
-    const scope = scopes.get(file)!;
-    sessions.set(scope.sessionId, [...(sessions.get(scope.sessionId) ?? []), file]);
-    const tail = input.rows.filter(({ data }) => scope.inScope(data) && eventKey(data)).at(-1)?.data;
-    const key = tail && eventKey(tail);
-    if (key) { tails.set(key, [...(tails.get(key) ?? []), file]); terminalKeys.set(file, key); }
-  }
-  const ancestors = new Map<string, Set<string>>();
-  for (const [file, input] of inputs) {
-    const parents = new Set<string>();
-    for (const { data } of input.rows) {
-      for (const parent of tails.get(`event:${data.parentUuid}`) ?? []) {
-        if (parent !== file && terminalKeys.get(parent) !== terminalKeys.get(file)) parents.add(parent);
-      }
-      const parentId = str(data.parentSessionId);
-      const parentAgent = str(data.parentAgentId);
-      const key = parentAgent ? `${parentId ?? scopes.get(file)!.nativeSessionId}:agent:${parentAgent}` : parentId;
-      if (key) for (const parent of sessions.get(key) ?? []) if (parent !== file) parents.add(parent);
-    }
-    ancestors.set(file, parents);
-  }
-  const isAncestor = (parent: string, file: string, seen = new Set<string>()): boolean => {
-    if (seen.has(file)) return false;
-    seen.add(file);
-    return [...(ancestors.get(file) ?? [])].some(candidate => candidate === parent || isAncestor(parent, candidate, seen));
-  };
   const occurrences = new Map<string, Map<string, number>>();
   for (const [file, input] of inputs) for (const { data } of input.rows) {
     const key = eventKey(data);
-    if (!key || !scopes.get(file)!.inScope(data)) continue;
+    if (!key) continue;
     let files = occurrences.get(key);
     if (!files) { files = new Map(); occurrences.set(key, files); }
     files.set(file, Math.min(files.get(file) ?? Infinity, eventTime(data)));
@@ -103,76 +71,51 @@ export function createClaudeCorpus(inputs: Map<string, Transcript>) {
   const compare = (a: string, b: string, files: Map<string, number>): number => {
     const timeA = files.get(a)!; const timeB = files.get(b)!;
     if (timeA !== timeB) return timeA < timeB ? -1 : 1;
-    const aParent = isAncestor(a, b); const bParent = isAncestor(b, a);
-    if (aParent !== bParent) return aParent ? -1 : 1;
     const firstA = firstTimes.get(a)!; const firstB = firstTimes.get(b)!;
     if (firstA !== firstB) return firstA < firstB ? -1 : 1;
-    return scopes.get(a)!.sessionId === scopes.get(b)!.sessionId ? (a < b ? -1 : a > b ? 1 : 0) : 0;
+    const idA = scopes.get(a)!.sessionId; const idB = scopes.get(b)!.sessionId;
+    if (idA !== idB) return idA < idB ? -1 : 1;
+    return a < b ? -1 : a > b ? 1 : 0;
   };
-  const owners = new Map<string, string | undefined>();
+  const owners = new Map<string, string>();
   for (const [key, files] of occurrences) {
     const ordered = [...files.keys()].sort((a, b) => compare(a, b, files));
-    owners.set(key, ordered.length > 1 && compare(ordered[0], ordered[1], files) === 0 ? undefined : ordered[0]);
+    owners.set(key, ordered[0]);
   }
   const corpus = new Map<string, { input: Transcript; history: ReturnType<typeof normalizeHistory> }>();
   for (const [file, input] of inputs) {
-    corpus.set(file, { input, history: normalizeHistory(file, input.rows, scopes, owners) });
+    corpus.set(file, { input, history: normalizeHistory(file, input.rows, scopes.get(file)!, owners) });
   }
   return corpus;
 }
 
-function normalizeHistory(file: string, input: NativeRow[], scopes: Map<string, ReturnType<typeof transcriptScope>>, owners: Map<string, string | undefined>) {
-  const scope = scopes.get(file)!;
+function normalizeHistory(file: string, input: NativeRow[], scope: ReturnType<typeof transcriptScope>, owners: Map<string, string>) {
   const unknowns = new Set<string>();
   if (scope.sessionIdMissing) unknowns.add("session_id_missing");
-  const parentSessionIds = new Set<string>();
-  const linkedParents = new Set<string>();
   const inherited = new Set<string>();
-  const unresolved = new Set<string>();
   const seen = new Set<string>();
-  const rows = input.filter(({ data, line }) => {
+  const rows = input.filter(({ data }) => {
     const key = eventKey(data);
     const identity = str(data.uuid) ? key : key && `${key}:${JSON.stringify(data.message)}:${JSON.stringify(data.toolUseResult)}`;
     if (identity && seen.has(identity)) return false;
     if (identity) seen.add(identity);
-    const owner = key && owners.get(key);
-    if (!scope.inScope(data) || key && (!owner || owner !== file)) {
-      if (owner && owner !== file) { inherited.add(key!); parentSessionIds.add(scopes.get(owner)!.sessionId); }
-      else { unresolved.add(key ?? `line:${line}`); unknowns.add("history_lineage_unknown"); }
-      return false;
-    }
-    const parentId = str(data.parentSessionId);
-    const parentAgent = str(data.parentAgentId);
-    const nativeParent = parentAgent ? `${parentId ?? scope.nativeSessionId}:agent:${parentAgent}` : parentId;
-    if (nativeParent) {
-      if ([...scopes.values()].some(candidate => candidate.sessionId === nativeParent)) linkedParents.add(nativeParent);
-      else unknowns.add("history_lineage_unknown");
-    }
+    if (key && owners.get(key) !== file) { inherited.add(key); return false; }
     if (!key) unknowns.add("history_event_identity_missing");
-    const parentKey = str(data.parentUuid) && `event:${data.parentUuid}`;
-    if (parentKey) {
-      const parent = owners.get(parentKey);
-      if (!parent) unknowns.add("history_lineage_unknown");
-      else if (parent !== file) linkedParents.add(scopes.get(parent)!.sessionId);
-    }
     return true;
   });
-  if (scope.child && !parentSessionIds.size && !linkedParents.size) unknowns.add("history_lineage_unknown");
-  if (unknowns.has("history_lineage_unknown") || unknowns.has("history_event_identity_missing")) unknowns.add("usage_missing_or_partial");
-  const parentIds = linkedParents.size ? linkedParents : parentSessionIds;
-  const candidateParent = parentIds.size === 1 ? [...parentIds][0] : scope.child ? scope.nativeSessionId : undefined;
-  const parentSessionId = candidateParent === scope.sessionId ? undefined : candidateParent;
-  return { ...scope, rows, parentSessionId, unknowns, inheritedEvents: inherited.size,
-    unresolvedInheritedEvents: unknowns.has("history_lineage_unknown") ? unresolved.size || null : 0 };
+  if (inherited.size) unknowns.add("history_inherited_events");
+  if (scope.child && !inherited.size) unknowns.add("history_lineage_unknown");
+  if (inherited.size || unknowns.has("history_lineage_unknown") || unknowns.has("history_event_identity_missing")) unknowns.add("usage_missing_or_partial");
+  return { ...scope, rows, unknowns, inheritedEvents: inherited.size,
+    unresolvedInheritedEvents: unknowns.has("history_lineage_unknown") ? null : 0 };
 }
 
 /** Reads native top-level Claude records without changing the Codex/Copilot reader. */
 export function parseClaudeSessionFile(file: string, corpus = createClaudeCorpus(new Map([[file, readClaudeTranscript(file)]]))) {
   const { input, history } = corpus.get(file)!;
   const parseErrors = input.parseErrors;
-  const { rows, nativeSessionId, childAgentId, child, parentSessionId, inheritedEvents, unresolvedInheritedEvents } = history;
+  const { rows, sessionId, childAgentId, child, inheritedEvents, unresolvedInheritedEvents } = history;
   const unknowns = new Set(history.unknowns);
-  const sessionId = child && childAgentId ? `${nativeSessionId}:agent:${childAgentId}` : nativeSessionId;
   const turns: NormalizedTurn[] = [];
   const tools = new Map<string, NormalizedToolCall>();
   const messages = new Map<string, { message: NormalizedAssistantMessage; blocks: Set<string>; usage: RecordValue }>();
@@ -316,21 +259,19 @@ export function parseClaudeSessionFile(file: string, corpus = createClaudeCorpus
   for (const { message } of messages.values()) if (!message.model) unknowns.add("model_missing");
   times.sort();
   const base: Omit<NormalizedSession, "metrics"> = {
-    sessionId, ...(parentSessionId ? { parentSessionId } : {}), ...(child && childAgentId ? { agentPath: childAgentId } : {}), source: "claude", sourceFiles: [file], repoMatch: "unknown", repoRoot: worktreePaths.size === 1 ? [...worktreePaths][0] : undefined,
+    sessionId, ...(child && childAgentId ? { agentPath: childAgentId } : {}), source: "claude", sourceFiles: [file], repoMatch: "unknown", repoRoot: worktreePaths.size === 1 ? [...worktreePaths][0] : undefined,
     startedAt: times[0], endedAt: times.at(-1), durationMs: durationMs(times[0], times.at(-1)), lifecycleStatus: "unknown", interactions: [], turns,
     userIntent: firstInstruction, finalAnswer,
     attribution: { branches: [...branches].sort(), worktreePaths: [...worktreePaths].sort(), firstInstruction,
       isSidechain: sidechains.size === 1 ? [...sidechains][0] : undefined, agentId,
       inheritedEvents, unresolvedInheritedEvents,
-      historyCoverage: unknowns.has("history_lineage_unknown") || unknowns.has("history_event_identity_missing") || parseErrors > 0 ? "partial" : "complete",
+      notes: ["Event ownership uses event timestamp, transcript first-event time, then transcript ID; allocation of shared history can differ from native lineage, including when a parent continues after a fork.",
+        ...(unresolvedInheritedEvents === null ? ["Inherited history is unresolved without another transcript owning its events; observed totals may include replayed history."] : [])],
+      historyCoverage: inheritedEvents > 0 || unknowns.has("history_lineage_unknown") || unknowns.has("history_event_identity_missing") || parseErrors > 0 ? "partial" : "complete",
       usageCoverage: unknowns.has("usage_missing_or_partial") || parseErrors > 0 ? "partial" : "complete", unknowns: [...unknowns].sort() }
   };
   const metrics = calculateMetrics(base, parseErrors);
   // The common model's input count is non-cache input; cache writes remain separate.
   metrics.modelRequests = messages.size;
-  if (unknowns.has("history_lineage_unknown")) {
-    metrics.inputTokens = unavailable(); metrics.outputTokens = unavailable(); metrics.cachedTokens = unavailable();
-    metrics.outputTokensPerTask = unavailable();
-  }
   return { session: { ...base, metrics } as NormalizedSession, eventsParsed: input.rows.length, parseErrors, traceDigest: input.digest };
 }
