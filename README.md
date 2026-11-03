@@ -80,7 +80,7 @@ These are trace-derived indicators. They help locate sessions worth inspecting; 
 
 - Copilot: `COPILOT_HOME` or `~/.copilot`, using `session-state/*/events.jsonl`.
 - Codex: `CODEX_HOME` or `~/.codex`, using `sessions/**/*.jsonl` and `archived_sessions/**/*.jsonl`. The normalizer handles native Codex session metadata, turn context, lifecycle events, response items, tool calls, and cumulative token samples.
-- Claude: `~/.claude`, using generic JSONL discovery. Claude-specific event normalization is not yet first-class.
+- Claude: `~/.claude`, including native `projects/**/*.jsonl` transcripts. See [Claude adapter](docs/claude-adapter.md) for streaming deduplication, usage semantics and unknowns.
 
 Codex and Copilot traces are supported natively. Unknown or incomplete event fields remain explicit rather than being guessed.
 
@@ -135,4 +135,8 @@ LunaObs is still a small v0 evidence analyzer, not a task benchmark or semantic 
 - Redundancy detection recognizes exact canonical tool calls within an unchanged edit state. It can miss semantically equivalent calls, and an intentional fresh read may still need human interpretation.
 - Instruction and claim checks depend on text and evidence captured in the trace. Missing or ambiguous evidence yields `insufficient` or `unknown`, not a positive score.
 - Token fields, changed-file and changed-line counts, AI credits, and estimated cost depend on what the source trace exposes. Unsupported values remain unavailable rather than being estimated.
-- Claude JSONL discovery exists, but Claude-specific normalization and validation still need implementation and real-session coverage.
+- Claude native normalization has synthetic regression coverage; real-session scoring and independent attribution adjudication remain separate work.
+
+## Session-to-attempt correlation
+
+`lunaobs correlate --logs /fictional/traces --tasks /fictional/task-records.json --out /fictional/correlation.json` joins local traces to caller-supplied typed Firstmate records. It emits matched, ambiguous or unmatched identities with evidence kinds and digests; it does not score sessions. See [correlation rules and limits](docs/session-correlation.md) and the fully fictional `tests/fixtures/correlation-tasks.json` example.

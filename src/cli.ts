@@ -24,6 +24,7 @@ import {
 import { scoreSession, type InefficiencyScore } from "./scoring/score.js";
 import { installDreamSkill, type SkillAgent } from "./skills/install.js";
 import type { RequestedSource } from "./sources/types.js";
+import { correlateTraceDirectory } from "./correlation/index.js";
 
 function numberOption(value: string): number {
   const parsed = Number(value);
@@ -210,6 +211,18 @@ function validateDream(input: string, out?: string): void {
 const program = new Command();
 
 program.name("lunaobs").description("Local-first observatory for coding-agent session traces.").version("0.1.0");
+
+program.command("correlate")
+  .description("Join local traces to caller-supplied Firstmate task records without scoring.")
+  .requiredOption("--logs <path>", "explicit trace directory or file")
+  .requiredOption("--tasks <path>", "typed task-record JSON file")
+  .requiredOption("--out <path>", "correlation JSON output file")
+  .option("--source <source>", "copilot|codex|claude|all", sourceOption, "all")
+  .action((options: { logs: string; tasks: string; out: string; source: RequestedSource }) => {
+    const result = correlateTraceDirectory(options.logs, options.tasks, options.source);
+    fs.writeFileSync(options.out, `${JSON.stringify(result, null, 2)}\n`, "utf8");
+    console.log(`Correlated ${result.correlations.length} session(s); parse errors: ${result.parseErrors}`);
+  });
 
 program
   .command("init")
