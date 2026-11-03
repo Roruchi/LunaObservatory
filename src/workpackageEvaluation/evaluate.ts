@@ -139,14 +139,14 @@ export function evaluateWorkpackage(value: unknown): WorkpackageEvaluation {
   if (reference && effort && reference.unit !== effort.unit) {
     efficiencyMissing.push("telemetry.reference.unit"); reason("COMPARISON_UNAVAILABLE", "telemetry.reference.unit");
   }
-  // Published abstention-quality idea: RigorBench, arXiv:2606.22678. No code reused
-  // (repository unlicensed). A baseline may accept a verified blocker/escalation as useful work.
-  if (["blocked", "escalated"].includes(known(input.result) ?? "") && outcome.score === 100 && compliance.score === 100) {
-    reason("AUTHORIZED_STOP", "result", input.result.availability === "known" ? input.result.refs : []);
-  }
+  const applicableCriteria = input.assessments.filter(item => item.group === "criteria" &&
+    item.disposition.availability === "known" && item.disposition.value !== "not_applicable");
+  const acceptedCriteria = applicableCriteria.filter(item => known(item.disposition) === "pass").length;
+  const failedVerification = input.assessments.some(item => item.group === "checks" && known(item.disposition) === "fail");
+  const useful = outcome.score === null ? null
+    : applicableCriteria.length > 0 && !failedVerification ? acceptedCriteria / applicableCriteria.length : 0;
   let efficiencyScore: number | null = null;
-  if (!efficiencyMissing.length && outcome.score !== null && effort && reference && steps) {
-    const useful = outcome.score / 100;
+  if (!efficiencyMissing.length && useful !== null && effort && reference && steps) {
     if (useful === 0) reason("NO_VERIFIED_USEFUL_OUTCOME", "dimensions.outcome");
     const expected = reference.effortPerUsefulUnit * useful;
     const resourceFactor = effort.execution > 0 ? Math.min(1, expected / effort.execution) : 1;
@@ -189,6 +189,12 @@ export function evaluateWorkpackage(value: unknown): WorkpackageEvaluation {
       reason("CLAIM_UNPROVEN", `claims.${claim.id}`, refs);
       if (gateDisposition !== "compliance_failure") gateDisposition = "human_review";
     }
+  }
+  // Published abstention-quality idea: RigorBench, arXiv:2606.22678. No code reused
+  // (repository unlicensed). A baseline may accept a verified blocker/escalation as useful work.
+  if (["blocked", "escalated"].includes(known(input.result) ?? "") &&
+      gateDisposition === "clear" && useful !== null && useful > 0 && outcome.score === 100 && compliance.score === 100) {
+    reason("AUTHORIZED_STOP", "result", input.result.availability === "known" ? input.result.refs : []);
   }
   const dimensions = { outcome, compliance, efficiency, handoff };
   const values = Object.values(dimensions);

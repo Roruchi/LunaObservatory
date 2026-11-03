@@ -43,6 +43,115 @@ describe("synthetic workpackage evidence scorecards", () => {
     expect(() => parseWorkpackageEvaluationInput(input)).toThrow();
   });
 
+  const evidenceStates = ["pass", "fail", "not_applicable", "absent", "unknown", "needs_review", "stale"] as const;
+  const evidenceCases = evidenceStates.flatMap(criteria =>
+    [...evidenceStates, "empty" as const].map(checks => ({ criteria, checks })));
+  it.each(evidenceCases)("derives useful credit with criteria=$criteria and checks=$checks", ({ criteria, checks }) => {
+    const input = syntheticPacket();
+    input.claims = known([]);
+    input.telemetry.effort = known({ unit: "fictional-effort-unit", execution: 0.1, orchestration: 0, unattributed: 0, allocation: "disjoint_verified" });
+    for (const [group, state] of [["criteria", criteria], ["checks", checks]] as const) {
+      const assessment = input.assessments.find(item => item.group === group)!;
+      if (state === "empty" || state === "absent") {
+        input.assessments = input.assessments.filter(item => item.group !== group);
+        if (state === "empty") input.baseline.requirements.checks = known([]);
+      } else if (state === "stale") assessment.revision = known("fictional-revision-a");
+      else if (state === "unknown" || state === "needs_review") {
+        assessment.disposition = { availability: state, reason: "Synthetic unavailable assessment" };
+      } else assessment.disposition = known(state);
+    }
+    const result = evaluateWorkpackage(input);
+    const complete = ["pass", "fail", "not_applicable", "empty"];
+    const excludedCriteria = criteria === "not_applicable";
+    const excludedChecks = checks === "not_applicable" || checks === "empty";
+    const scorable = complete.includes(criteria) && complete.includes(checks) && !(excludedCriteria && excludedChecks);
+    const expected = scorable ? criteria === "pass" && checks !== "fail" ? 100 : 0 : null;
+    expect(result.dimensions.efficiency.score).toBe(expected);
+    expect(result.reasons.some(reason => reason.code === "NO_VERIFIED_USEFUL_OUTCOME")).toBe(expected === 0);
+    if (scorable) {
+      const eligible = (excludedCriteria ? 0 : 75) + (excludedChecks ? 0 : 25);
+      const earned = (criteria === "pass" ? 75 : 0) + (checks === "pass" ? 25 : 0);
+      expect(result.dimensions.outcome.score).toBe(Math.round(100 * earned / eligible * 10000) / 10000);
+    } else {
+      expect(result.dimensions.outcome.score).toBeNull();
+      expect(result.composite.status).toBe("Unscored");
+    }
+  });
+  it("counts accepted applicable criteria without awarding check-only credit", () => {
+    const input = syntheticPacket();
+    if (input.baseline.requirements.criteria.availability !== "known") throw new Error("Synthetic fixture error");
+    for (const [id, disposition] of [["failed", "fail"], ["excluded", "not_applicable"]] as const) {
+      input.baseline.requirements.criteria.value.push({ id, description: `Synthetic ${id} criterion` });
+      input.assessments.push({ ...input.assessments[0], requirementId: id, disposition: known(disposition) });
+    }
+    input.telemetry.effort = known({ unit: "fictional-effort-unit", execution: 0.1, orchestration: 0, unattributed: 0, allocation: "disjoint_verified" });
+    const result = evaluateWorkpackage(input);
+    expect(result.dimensions.outcome.score).toBeCloseTo(66.6667, 4);
+    expect(result.dimensions.efficiency.score).toBe(50);
+  });
+  it("requires every applicable check to pass", () => {
+    const input = syntheticPacket();
+    if (input.baseline.requirements.checks.availability !== "known") throw new Error("Synthetic fixture error");
+    for (const [id, disposition] of [["failed-check", "fail"], ["excluded-check", "not_applicable"]] as const) {
+      input.baseline.requirements.checks.value.push({ id, description: `Synthetic ${id}` });
+      input.assessments.push({ ...input.assessments[1], requirementId: id, disposition: known(disposition) });
+    }
+    expect(evaluateWorkpackage(input).dimensions.efficiency.score).toBe(0);
+    input.assessments.find(item => item.requirementId === "failed-check")!.disposition = known("pass");
+    expect(evaluateWorkpackage(input).dimensions.efficiency.score).toBe(100);
+  });
+  for (const stop of ["blocked", "escalated"] as const) {
+    it(`recognizes a clear accepted ${stop} result`, () => {
+      const input = syntheticPacket(); input.result = known(stop);
+      expect(evaluateWorkpackage(input).reasons.some(reason => reason.code === "AUTHORIZED_STOP")).toBe(true);
+    });
+    it(`withholds ${stop} authorization without applicable useful criteria`, () => {
+      const input = syntheticPacket(); input.result = known(stop);
+      input.assessments[0].disposition = known("not_applicable");
+      const result = evaluateWorkpackage(input);
+      expect(result.dimensions.outcome.score).toBe(100);
+      expect(result.dimensions.efficiency.score).toBe(0);
+      expect(result.reasons.some(reason => reason.code === "AUTHORIZED_STOP")).toBe(false);
+    });
+    for (const gate of gateKinds) {
+      it.each(["proven", "suspected", "unknown", "needs_review"] as const)(`withholds ${stop} authorization for ${gate}=%s`, state => {
+        const input = syntheticPacket(); input.result = known(stop);
+        input.gates[gate] = state === "unknown" || state === "needs_review"
+          ? { availability: state, reason: "Synthetic unresolved gate" } : known(state);
+        const result = evaluateWorkpackage(input);
+        expect(result.gateDisposition).toBe(state === "proven" ? "compliance_failure" : state === "unknown" ? "unknown" : "human_review");
+        expect(result.reasons.some(reason => reason.code === "AUTHORIZED_STOP")).toBe(false);
+        expect(Object.values(result.dimensions).map(dimension => dimension.score)).toEqual([100, 100, 100, 100]);
+        expect(result.composite).toEqual({ status: "Scored", score: 100 });
+      });
+    }
+    it.each(["unknown", "needs_review"] as const)(`withholds ${stop} authorization for %s claims`, availability => {
+      const input = syntheticPacket(); input.result = known(stop);
+      input.claims = { availability, reason: "Synthetic unresolved claims" };
+      const result = evaluateWorkpackage(input);
+      expect(result.gateDisposition).toBe("human_review");
+      expect(result.reasons.some(reason => reason.code === "AUTHORIZED_STOP")).toBe(false);
+      expect(result.composite).toEqual({ status: "Scored", score: 100 });
+    });
+    for (const kind of ["completion", "verification", "other"] as const) {
+      it.each(["Contradicted", "Unproven", "unknown", "needs_review", "stale", "revision_unknown", "revision_needs_review"] as const)(`resolves ${stop} authorization after ${kind} claim %s`, state => {
+        const input = syntheticPacket(); input.result = known(stop);
+        if (input.claims.availability !== "known") throw new Error("Synthetic fixture error");
+        const claim = input.claims.value[0]; claim.kind = kind;
+        if (state === "stale") claim.revision = known("fictional-revision-a");
+        else if (state === "revision_unknown" || state === "revision_needs_review") {
+          claim.revision = { availability: state === "revision_unknown" ? "unknown" : "needs_review", reason: "Synthetic unresolved revision" };
+        } else claim.verdict = state === "unknown" || state === "needs_review"
+          ? { availability: state, reason: "Synthetic unresolved verdict" } : known(state);
+        const result = evaluateWorkpackage(input);
+        const expectedGate = state === "Contradicted" ? kind === "other" ? "clear" : "compliance_failure" : "human_review";
+        expect(result.gateDisposition).toBe(expectedGate);
+        expect(result.reasons.some(reason => reason.code === "AUTHORIZED_STOP")).toBe(expectedGate === "clear");
+        expect(result.composite).toEqual({ status: "Scored", score: 100 });
+      });
+    }
+  }
+
   it("retains raw scores for every proven hard gate", () => {
     for (const gate of gateKinds) {
       const input = syntheticPacket(); input.gates[gate] = known("proven");

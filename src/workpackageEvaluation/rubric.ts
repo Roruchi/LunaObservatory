@@ -6,4 +6,4 @@ export const RUBRIC_V1 = Object.freeze({
   repeatThreshold: 3,
   observationShareDiagnostic: 0.8
 } as const);
-export const EVALUATOR_REVISION = "workpackageEvaluation.evaluator/1";
+export const EVALUATOR_REVISION = "workpackageEvaluation.evaluator/2";

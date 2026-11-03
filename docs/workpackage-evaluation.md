@@ -75,7 +75,9 @@ and link `supersedes`. The module does not store records.
 ## Rubric v1
 
 `RUBRIC_V1` is frozen and versioned as `workpackageEvaluation.rubric/1`.
-Change the rubric/evaluator revision when changing policy or formulas.
+Evaluator revision `workpackageEvaluation.evaluator/2` corrects verified useful
+credit and authorized-stop labeling. Change the rubric/evaluator revision when
+changing policy or formulas.
 
 | Dimension | Weight | Evidence and subweights |
 | --- | ---: | --- |
@@ -100,7 +102,12 @@ non-probabilistic label sufficient only when scoring coverage is complete, core
 identities are joined and the gate is clear; otherwise it is limited. Unknown
 model or optional token telemetry does not invent a numeric uncertainty interval.
 
-Efficiency uses `u = outcome / 100` (accepted and verified useful work),
+Efficiency uses `u = accepted applicable criteria / all applicable criteria`,
+provided every applicable required check passes. Failed checks or no applicable
+criteria give `u = 0`; empty or explicitly inapplicable checks require no pass.
+Unknown, needs_review, absent or stale criterion/check evidence leaves efficiency
+Unscored, as does an entirely excluded outcome dimension. The blended raw outcome
+score is separate from this verified useful credit. Efficiency then uses
 `resourceFactor = min(1, referenceEffortPerUsefulUnit * u / executionEffort)`
 (factor 1 for zero effort), and
 `loopFactor = 1 - avoidableRepeatedExecutionSteps / max(1, executionSteps)`.
@@ -122,6 +129,8 @@ Orchestration steps and effort are excluded from execution efficiency.
 An authorized blocked/escalated result can score 100 when its approved useful
 blocker/escalation criteria, applicable checks, compliance and handoff are met.
 Changing only a result string to blocked does not earn that credit.
+`AUTHORIZED_STOP` is emitted only after all gates and claims resolve to clear;
+non-clear dispositions retain raw audit scores without this authorization label.
 
 Gates never overwrite raw dimension scores or the raw composite. Proven breaches
 and fresh, independently contradicted completion/check claims cause
