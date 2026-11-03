@@ -12,6 +12,7 @@ LunaObs is a local-first CLI tool for observing coding-agent session traces.
 
 - Scan: deterministic local analyzer that discovers native Codex and Copilot session logs, filters them to the current repo, normalizes trace evidence, scores suspicious sessions, and writes Markdown plus HTML reports.
 - Dream: offline evaluator for frozen Scan evidence. Humans usually trigger dream mode; agents execute the reusable LunaObs Dream skill to prepare packets, validate them, inspect the generated report, and summarize evidence-backed lessons.
+- Workpackage evaluation: a [slice 1 prototype](docs/workpackage-evaluation.md) with a typed evidence contract, pure deterministic rubric and synthetic regression corpus. This scores evidence, not people. It adds no data collection or Scan/Dream integration.
 
 LunaObs reads native agent session files directly. It does not depend on TokenTelemetry exports.
 
