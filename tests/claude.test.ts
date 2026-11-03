@@ -1,9 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { applyRepoFilter } from "../src/normalize/repoFilter.js";
-import { parseSessionFile } from "../src/normalize/parser.js";
+import { createSessionParser, parseSessionFile } from "../src/normalize/parser.js";
 
 const fixture = path.resolve("tests/fixtures/claude-streaming.jsonl");
 function parseRows(rows: unknown[]) {
@@ -95,7 +95,12 @@ describe("Claude Code native transcripts (fully synthetic)", () => {
     expect(session.metrics.verificationFailed).toBe(1);
     expect(session.turns[0].toolCalls[0].exitCode).toBe(2);
   });
-  it.each([false, true])("excludes parent history by stable ids when copied session ids are rewritten: %s", rewritten => {
+  it.each([
+    { nested: false, rewritten: false, sidechainParent: false },
+    { nested: false, rewritten: true, sidechainParent: false },
+    { nested: true, rewritten: true, sidechainParent: false },
+    { nested: true, rewritten: true, sidechainParent: true }
+  ])("attributes corpus history across layouts and agent markers: %j", ({ nested, rewritten, sidechainParent }) => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "lunaobs-synthetic-lineage-"));
     const parent = [
       native("user", { content: "Fictional parent instruction." }, { uuid: "parent-user", cwd: "/fictional/parent" }),
@@ -104,10 +109,11 @@ describe("Claude Code native transcripts (fully synthetic)", () => {
         { type: "tool_use", id: "parent-tool", name: "Read", input: { file_path: "/fictional/parent.txt" } }
       ] }, { uuid: "parent-event", requestId: "parent-request" }),
       native("user", { content: [{ type: "tool_result", tool_use_id: "parent-tool", content: "Fictional parent data.", is_error: false }] }, { uuid: "parent-result" })
-    ];
+    ].map(row => sidechainParent ? { ...row, isSidechain: true, agentId: "fictional-parent-agent", ...(row.uuid === "parent-user" ? { parentUuid: "root-event" } : {}) } : row);
     try {
       const parentFile = path.join(directory, "parent.jsonl");
-      const childFile = path.join(directory, "renamed-child.jsonl");
+      const childFile = path.join(directory, nested ? "parent/subagents/renamed-child.jsonl" : "renamed-child.jsonl");
+      fs.mkdirSync(path.dirname(childFile), { recursive: true });
       const own = [
         native("user", { content: "Fictional child instruction." }, { uuid: "child-user", parentUuid: "parent-result", cwd: "/fictional/child" }),
         native("assistant", { id: "child-message", model: "fictional-model", usage: { input_tokens: 2, output_tokens: 2 }, content: [{ type: "text", text: "Fictional child answer." }] }, { uuid: "child-event", parentUuid: "child-user" })
@@ -115,9 +121,23 @@ describe("Claude Code native transcripts (fully synthetic)", () => {
       fs.writeFileSync(parentFile, parent.map(row => JSON.stringify(row)).join("\n"));
       const copied = parent.map(row => rewritten ? { ...row, sessionId: "renamed-session", isSidechain: true, agentId: "fictional-agent" } : row);
       fs.writeFileSync(childFile, [...copied, ...own].map(row => JSON.stringify(row)).join("\n"));
-      const child = parseSessionFile(childFile, "claude").session;
-      const original = parseSessionFile(parentFile, "claude").session;
-      expect(child.parentSessionId).toBe("synthetic-session");
+      const files = [childFile, parentFile];
+      if (sidechainParent) {
+        const rootFile = path.join(directory, "root.jsonl");
+        fs.writeFileSync(rootFile, JSON.stringify(native("assistant", { id: "root-message", usage: { input_tokens: 0, output_tokens: 0 }, content: [] }, { uuid: "root-event", timestamp: "2026-01-01T09:59:00Z" })));
+        files.push(rootFile);
+      }
+      const read = vi.spyOn(fs, "readFileSync");
+      let parse: ReturnType<typeof createSessionParser>;
+      try {
+        parse = createSessionParser(files.map(file => ({ file, source: "unknown" })));
+        const child = parse(childFile, "unknown").session;
+        expect(child.metrics.outputTokens.value).toBe(2);
+        for (const file of files) expect(read.mock.calls.filter(args => args[0] === file)).toHaveLength(1);
+      } finally { read.mockRestore(); }
+      const child = parse!(childFile, "unknown").session;
+      const original = parse!(parentFile, "unknown").session;
+      expect(child.parentSessionId).toBe(sidechainParent ? "synthetic-session:agent:fictional-parent-agent" : "synthetic-session");
       expect(child.metrics.inputTokens.value).toBe(2);
       expect(child.metrics.outputTokens.value! + original.metrics.outputTokens.value!).toBe(12);
       expect(child.metrics.toolRequests).toBe(0);
@@ -125,17 +145,24 @@ describe("Claude Code native transcripts (fully synthetic)", () => {
       expect(child.userIntent?.text).toBe("Fictional child instruction.");
       expect(child.attribution?.worktreePaths).toEqual(["/fictional/child"]);
       expect(child.attribution?.historyCoverage).toBe("complete");
+      expect(child.attribution?.inheritedEvents).toBe(3);
+      const alone = parseSessionFile(childFile, "claude").session;
+      expect(alone.attribution?.historyCoverage).toBe("partial");
+      expect(alone.attribution?.usageCoverage).toBe("partial");
+      expect(alone.attribution?.unknowns).toContain("history_lineage_unknown");
+      if (rewritten) expect(alone.metrics.outputTokens.value).toBeNull();
     } finally { fs.rmSync(directory, { recursive: true, force: true }); }
   });
   it("recognizes inherited message/request ids without event UUIDs", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "lunaobs-synthetic-message-lineage-"));
     try {
       const inherited = native("assistant", { id: "fictional-parent-message", usage: { output_tokens: 10 }, content: [] }, { requestId: "fictional-parent-request" });
-      const own = native("assistant", { id: "fictional-own-message", usage: { output_tokens: 2 }, content: [] }, { sessionId: "fictional-child", isSidechain: true, agentId: "fictional-agent" });
+      const own = native("assistant", { id: "fictional-own-message", usage: { output_tokens: 2 }, content: [] }, { sessionId: "fictional-child", isSidechain: true, agentId: "fictional-agent", parentSessionId: "synthetic-session" });
       fs.writeFileSync(path.join(directory, "parent.jsonl"), JSON.stringify(inherited));
       const file = path.join(directory, "child.jsonl");
       fs.writeFileSync(file, [ { ...inherited, sessionId: "fictional-child", isSidechain: true, agentId: "fictional-agent" }, own ].map(row => JSON.stringify(row)).join("\n"));
-      expect(parseSessionFile(file, "claude").session.metrics.outputTokens.value).toBe(2);
+      const parse = createSessionParser([file, path.join(directory, "parent.jsonl")].map(file => ({ file, source: "claude" })));
+      expect(parse(file, "claude").session.metrics.outputTokens.value).toBe(2);
     } finally { fs.rmSync(directory, { recursive: true, force: true }); }
   });
   it.each([true, false])("deduplicates repeated users and tool events with UUIDs: %s", uuid => {
@@ -148,6 +175,39 @@ describe("Claude Code native transcripts (fully synthetic)", () => {
     expect(session.turns).toHaveLength(1);
     expect(session.metrics.toolRequests).toBe(1);
     expect(session.turns[0].toolCalls[0].evidence).toHaveLength(2);
+  });
+  it("retains unidentified events separately with partial history and usage coverage", () => {
+    const event = native("user", { content: "Fictional repeated instruction." });
+    const { session } = parseRows([event, event]);
+    expect(session.turns).toHaveLength(2);
+    expect(session.attribution?.historyCoverage).toBe("partial");
+    expect(session.attribution?.usageCoverage).toBe("partial");
+    expect(session.attribution?.unknowns).toContain("history_event_identity_missing");
+  });
+  it.each(["timestamp", "first-event", "ambiguous"])("resolves ownership by %s without guessing ties", rule => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "lunaobs-synthetic-ownership-"));
+    try {
+      const files = [path.join(directory, "z-original.jsonl"), path.join(directory, "a-copy.jsonl")];
+      files.forEach((file, index) => {
+        const rows = [native("assistant", { id: "fictional-shared", usage: { output_tokens: 10 }, content: [] }, {
+          sessionId: `fictional-session-${index}`, uuid: "shared-event", timestamp: index && rule === "timestamp" ? "2026-01-01T10:01:00Z" : "2026-01-01T10:00:00Z"
+        })];
+        if (!index && rule === "first-event") rows.unshift(native("user", { content: "Fictional earlier instruction." }, { sessionId: "fictional-session-0", uuid: "earlier-event", timestamp: "2026-01-01T09:59:00Z" }));
+        fs.writeFileSync(file, rows.map(row => JSON.stringify(row)).join("\n"));
+      });
+      const parse = createSessionParser(files.map(file => ({ file, source: "claude" })));
+      const original = parse(files[0], "claude").session;
+      const copied = parse(files[1], "claude").session;
+      if (rule === "ambiguous") {
+        expect(original.attribution?.historyCoverage).toBe("partial");
+        expect(copied.attribution?.historyCoverage).toBe("partial");
+        expect(original.metrics.outputTokens.value).toBeNull();
+      } else {
+        expect(original.metrics.outputTokens.value).toBe(10);
+        expect(copied.metrics.outputTokens.value).toBeNull();
+        expect(copied.attribution?.inheritedEvents).toBe(1);
+      }
+    } finally { fs.rmSync(directory, { recursive: true, force: true }); }
   });
   it("marks ambiguous lineage as partial rather than claiming complete history or usage", () => {
     const { session } = parseRows([

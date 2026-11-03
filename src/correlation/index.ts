@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import { discoverSources } from "../fs/discovery.js";
 import { readJsonl } from "../fs/jsonl.js";
-import { parseSessionFile } from "../normalize/parser.js";
+import { createSessionParser } from "../normalize/parser.js";
 import type { NormalizedSession } from "../normalize/types.js";
 import type { RequestedSource } from "../sources/types.js";
 import type { Field, WorkpackageEvaluationInput } from "../workpackageEvaluation/contract.js";
@@ -125,8 +125,10 @@ export function correlateTraceDirectory(logs: string, taskFile: string, source: 
   const sessions = new Map<string, { session: NormalizedSession; observations: SessionObservations; digest: string }>();
   const conflicts = new Set<string>();
   let parseErrors = 0;
-  for (const discovered of discoverSources(source, logs)) for (const file of discovered.files) {
-    const parsed = parseSessionFile(file, discovered.source);
+  const discoveredSources = discoverSources(source, logs);
+  const parseSession = createSessionParser(discoveredSources.flatMap(source => source.files.map(file => ({ file, source: source.source }))));
+  for (const discovered of discoveredSources) for (const file of discovered.files) {
+    const parsed = parseSession(file, discovered.source);
     parseErrors += parsed.parseErrors;
     const session = parsed.session;
     if (session.source === "unknown") {
@@ -134,13 +136,15 @@ export function correlateTraceDirectory(logs: string, taskFile: string, source: 
       session.source = events.some(event => event.type === "session_meta") ? "codex" : events.some(event => event.type.startsWith("assistant.")) ? "copilot" : "unknown";
     }
     const key = `${session.source}:${session.sessionId}`;
-    const digest = createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+    const digest = parsed.traceDigest ?? createHash("sha256").update(fs.readFileSync(file)).digest("hex");
     const previous = sessions.get(key);
     if (previous && previous.digest !== digest) conflicts.add(key);
     else if (!previous) sessions.set(key, { session, observations: nativeObservations(file, session), digest });
   }
   const correlations = [...sessions.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([key, { session, observations, digest }]) => {
-    const result = { ...correlateSession(session, records, observations), traceDigest: digest };
+    const result = { ...correlateSession(session, records, observations), traceDigest: digest,
+      ...(session.source === "claude" ? { coverage: { history: session.attribution?.historyCoverage, usage: session.attribution?.usageCoverage,
+        inheritedEvents: session.attribution?.inheritedEvents, unresolvedInheritedEvents: session.attribution?.unresolvedInheritedEvents } } : {}) };
     if (conflicts.has(key)) return { ...result, status: "ambiguous" as const, confidence: "low" as const, taskId: null, attemptId: null, reasons: ["conflicting_session_copies"] };
     return result;
   });

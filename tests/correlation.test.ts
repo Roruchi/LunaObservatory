@@ -126,6 +126,31 @@ describe("verifiable Firstmate correlation", () => {
       expect(stdout).toContain("Correlated 1 session(s)");
       expect(fs.readFileSync(out, "utf8")).not.toContain("Build a fictional star map");
       expect(result.taskRecordsDigest).toMatch(/^[a-f0-9]{64}$/);
+      const logs = path.join(directory, "logs");
+      const childFile = path.join(logs, "parent", "subagents", "child.jsonl");
+      fs.mkdirSync(path.dirname(childFile), { recursive: true });
+      fs.copyFileSync(trace, path.join(logs, "parent.jsonl"));
+      const inherited = fs.readFileSync(trace, "utf8").trim().split("\n").map(line => ({ ...JSON.parse(line), sessionId: "fictional-child", isSidechain: true, agentId: "fictional-agent" }));
+      const own = [
+        { type: "user", uuid: "fictional-own-user", parentUuid: "fictional-event-7", message: { content: "Task id: fictional-nebula" } },
+        { type: "assistant", uuid: "fictional-own-answer", parentUuid: "fictional-own-user", message: { id: "fictional-own-message", model: "fictional-model", content: [], usage: { input_tokens: 2, output_tokens: 2 } } }
+      ].map(row => ({ ...row, sessionId: "fictional-child", isSidechain: true, agentId: "fictional-agent", timestamp: "2026-01-01T10:00:08Z", cwd: "/fictional/worktrees/nebula", gitBranch: "fm/fictional-nebula" }));
+      fs.writeFileSync(childFile, [...inherited, ...own].map(row => JSON.stringify(row)).join("\n"));
+      execFileSync(process.execPath, [path.join(dist, "cli.js"), "correlate", "--logs", logs, "--tasks", taskFile, "--out", out]);
+      const corpus = JSON.parse(fs.readFileSync(out, "utf8"));
+      const child = corpus.correlations.find((item: { sessionId: string }) => item.sessionId.startsWith("fictional-child"));
+      expect(child.status).toBe("matched");
+      expect(child.coverage).toEqual({ history: "complete", usage: "complete", inheritedEvents: 8, unresolvedInheritedEvents: 0 });
+      execFileSync(process.execPath, [path.join(dist, "cli.js"), "correlate", "--logs", childFile, "--tasks", taskFile, "--out", out]);
+      expect(JSON.parse(fs.readFileSync(out, "utf8")).correlations[0].coverage.history).toBe("partial");
+      const scanOut = path.join(directory, "scan");
+      execFileSync(process.execPath, [path.join(dist, "cli.js"), "scan", "--source", "all", "--logs", logs, "--all-repos", "--out", scanOut], {
+        cwd: directory, env: { ...process.env, GIT_CEILING_DIRECTORIES: directory }
+      });
+      const scanned = fs.readFileSync(path.join(scanOut, "index", "sessions.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      expect(scanned.map(item => item.metrics.inputTokens.value).sort((a, b) => a - b)).toEqual([2, 10]);
+      expect(scanned.reduce((sum, item) => sum + item.metrics.inputTokens.value, 0)).toBe(12);
+
     } finally { fs.rmSync(directory, { recursive: true, force: true }); }
   });
 });

@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import path from "node:path";
+import { createHash } from "node:crypto";
 import { calculateMetrics, reported, unavailable } from "../normalize/metrics.js";
 import type { EvidenceRef, NormalizedAssistantMessage, NormalizedSession, NormalizedToolCall, NormalizedTurn, RawLogEvent } from "../normalize/types.js";
 import { stableId } from "../utils/stableId.js";
@@ -22,16 +22,18 @@ export function isClaudeEventsFile(events: RawLogEvent[]): boolean {
 }
 
 type NativeRow = { data: RecordValue; line: number };
-const eventKeys = (row: RecordValue): string[] => {
+const eventKey = (row: RecordValue): string | undefined => {
+  if (str(row.uuid)) return `event:${row.uuid}`;
   const message = obj(row.message);
-  return [str(row.uuid) && `event:${row.uuid}`, str(message.id) && `message:${row.type}:${message.id}:${str(row.requestId) ?? ""}`]
-    .filter((key): key is string => Boolean(key));
+  return str(message.id) ? `message:${row.type}:${message.id}:${str(row.requestId) ?? ""}` : undefined;
 };
 
-function readRows(file: string) {
+export function readClaudeTranscript(file: string) {
+  const bytes = fs.readFileSync(file);
+  const raw = bytes.toString("utf8");
   let parseErrors = 0;
   const rows: NativeRow[] = [];
-  fs.readFileSync(file, "utf8").split(/\r?\n/).forEach((line, index) => {
+  raw.split(/\r?\n/).forEach((line, index) => {
     if (!line.trim()) return;
     try {
       const row = obj(JSON.parse(line));
@@ -39,69 +41,137 @@ function readRows(file: string) {
       rows.push({ data: row, line: index + 1 });
     } catch { parseErrors += 1; }
   });
-  return { rows, parseErrors };
+  return { rows, parseErrors, digest: createHash("sha256").update(bytes).digest("hex") };
 }
 
-function normalizeHistory(file: string, input: NativeRow[]) {
-  const unknowns = new Set<string>();
+type Transcript = ReturnType<typeof readClaudeTranscript>;
+const eventTime = (row: RecordValue) => Number.isFinite(Date.parse(str(row.timestamp) ?? "")) ? Date.parse(String(row.timestamp)) : Infinity;
+
+function transcriptScope(file: string, input: NativeRow[]) {
   const last = input.filter(({ data }) => data.type === "user" || data.type === "assistant").at(-1)?.data;
   const nativeSessionId = str(last?.sessionId) ?? stableId(file);
   const scope = input.filter(({ data }) => data.sessionId === nativeSessionId);
-  const childAgentId = str(scope.filter(({ data }) => str(data.agentId)).at(-1)?.data.agentId);
   const child = scope.filter(({ data }) => typeof data.isSidechain === "boolean").at(-1)?.data.isSidechain === true;
-  if (!str(last?.sessionId)) unknowns.add("session_id_missing");
-  const parents = new Map<string, string>();
-  const parentSessionIds = new Set<string>();
-  for (const { data } of input) {
-    if (str(data.sessionId) && (data.sessionId !== nativeSessionId || child && data.isSidechain === false)) {
-      for (const key of eventKeys(data)) parents.set(key, str(data.sessionId)!);
-    }
+  const childAgentId = str(scope.filter(({ data }) => data.isSidechain === child && str(data.agentId)).at(-1)?.data.agentId);
+  const sessionId = child && childAgentId ? `${nativeSessionId}:agent:${childAgentId}` : nativeSessionId;
+  const inScope = (row: RecordValue) => (!str(row.sessionId) || row.sessionId === nativeSessionId) &&
+    (typeof row.isSidechain !== "boolean" || row.isSidechain === child) &&
+    (!str(row.agentId) || row.agentId === childAgentId);
+  return { nativeSessionId, childAgentId, child, sessionId, inScope, sessionIdMissing: !str(last?.sessionId) };
+}
+
+export function createClaudeCorpus(inputs: Map<string, Transcript>) {
+  const scopes = new Map([...inputs].map(([file, input]) => [file, transcriptScope(file, input.rows)]));
+  const firstTimes = new Map([...inputs].map(([file, input]) => [file, input.rows.reduce((first, { data }) => Math.min(first, eventTime(data)), Infinity)]));
+  const tails = new Map<string, string[]>();
+  const sessions = new Map<string, string[]>();
+  const terminalKeys = new Map<string, string>();
+  for (const [file, input] of inputs) {
+    const scope = scopes.get(file)!;
+    sessions.set(scope.sessionId, [...(sessions.get(scope.sessionId) ?? []), file]);
+    const tail = input.rows.filter(({ data }) => scope.inScope(data) && eventKey(data)).at(-1)?.data;
+    const key = tail && eventKey(tail);
+    if (key) { tails.set(key, [...(tails.get(key) ?? []), file]); terminalKeys.set(file, key); }
   }
-  const contested = new Set<string>();
-  const directories = [path.dirname(file)];
-  if (path.basename(directories[0]) === "subagents") directories.push(path.dirname(directories[0]));
-  for (const directory of directories) for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-    const peerFile = path.join(directory, entry.name);
-    if (!entry.isFile() || !entry.name.endsWith(".jsonl") || path.resolve(peerFile) === path.resolve(file)) continue;
-    const peer = readRows(peerFile).rows;
-    const owner = peer.filter(({ data }) => data.type === "user" || data.type === "assistant").at(-1)?.data;
-    if (!owner || owner.isSidechain === true) continue;
-    if (!child && owner.sessionId === nativeSessionId) continue;
-    for (const { data } of peer) {
-      if (data.sessionId !== owner.sessionId || data.isSidechain === true) continue;
-      for (const key of eventKeys(data)) {
-        if (child) parents.set(key, str(owner.sessionId) ?? nativeSessionId);
-        else contested.add(key);
+  const ancestors = new Map<string, Set<string>>();
+  for (const [file, input] of inputs) {
+    const parents = new Set<string>();
+    for (const { data } of input.rows) {
+      for (const parent of tails.get(`event:${data.parentUuid}`) ?? []) {
+        if (parent !== file && terminalKeys.get(parent) !== terminalKeys.get(file)) parents.add(parent);
       }
+      const parentId = str(data.parentSessionId);
+      const parentAgent = str(data.parentAgentId);
+      const key = parentAgent ? `${parentId ?? scopes.get(file)!.nativeSessionId}:agent:${parentAgent}` : parentId;
+      if (key) for (const parent of sessions.get(key) ?? []) if (parent !== file) parents.add(parent);
     }
+    ancestors.set(file, parents);
   }
+  const isAncestor = (parent: string, file: string, seen = new Set<string>()): boolean => {
+    if (seen.has(file)) return false;
+    seen.add(file);
+    return [...(ancestors.get(file) ?? [])].some(candidate => candidate === parent || isAncestor(parent, candidate, seen));
+  };
+  const occurrences = new Map<string, Map<string, number>>();
+  for (const [file, input] of inputs) for (const { data } of input.rows) {
+    const key = eventKey(data);
+    if (!key || !scopes.get(file)!.inScope(data)) continue;
+    let files = occurrences.get(key);
+    if (!files) { files = new Map(); occurrences.set(key, files); }
+    files.set(file, Math.min(files.get(file) ?? Infinity, eventTime(data)));
+  }
+  const compare = (a: string, b: string, files: Map<string, number>): number => {
+    const timeA = files.get(a)!; const timeB = files.get(b)!;
+    if (timeA !== timeB) return timeA < timeB ? -1 : 1;
+    const aParent = isAncestor(a, b); const bParent = isAncestor(b, a);
+    if (aParent !== bParent) return aParent ? -1 : 1;
+    const firstA = firstTimes.get(a)!; const firstB = firstTimes.get(b)!;
+    if (firstA !== firstB) return firstA < firstB ? -1 : 1;
+    return scopes.get(a)!.sessionId === scopes.get(b)!.sessionId ? (a < b ? -1 : a > b ? 1 : 0) : 0;
+  };
+  const owners = new Map<string, string | undefined>();
+  for (const [key, files] of occurrences) {
+    const ordered = [...files.keys()].sort((a, b) => compare(a, b, files));
+    owners.set(key, ordered.length > 1 && compare(ordered[0], ordered[1], files) === 0 ? undefined : ordered[0]);
+  }
+  const corpus = new Map<string, { input: Transcript; history: ReturnType<typeof normalizeHistory> }>();
+  for (const [file, input] of inputs) {
+    corpus.set(file, { input, history: normalizeHistory(file, input.rows, scopes, owners) });
+  }
+  return corpus;
+}
+
+function normalizeHistory(file: string, input: NativeRow[], scopes: Map<string, ReturnType<typeof transcriptScope>>, owners: Map<string, string | undefined>) {
+  const scope = scopes.get(file)!;
+  const unknowns = new Set<string>();
+  if (scope.sessionIdMissing) unknowns.add("session_id_missing");
+  const parentSessionIds = new Set<string>();
+  const linkedParents = new Set<string>();
+  const inherited = new Set<string>();
+  const unresolved = new Set<string>();
   const seen = new Set<string>();
-  const rows = input.filter(({ data }) => {
-    const keys = eventKeys(data);
-    for (const key of [...keys, `event:${data.parentUuid}`]) if (parents.has(key)) parentSessionIds.add(parents.get(key)!);
-    if (str(data.sessionId) && data.sessionId !== nativeSessionId ||
-        child && (data.isSidechain === false || str(data.agentId) && data.agentId !== childAgentId)) return false;
-    if (keys.some(key => parents.has(key))) return false;
-    if (keys.some(key => contested.has(key))) { unknowns.add("history_lineage_unknown"); return false; }
-    if ((data.type === "user" || data.type === "assistant") && !keys.length) unknowns.add("history_event_identity_missing");
-    const identity = str(data.uuid) ? `event:${data.uuid}` : keys.length ? `${keys[0]}:${JSON.stringify(data.message)}:${JSON.stringify(data.toolUseResult)}` : undefined;
+  const rows = input.filter(({ data, line }) => {
+    const key = eventKey(data);
+    const identity = str(data.uuid) ? key : key && `${key}:${JSON.stringify(data.message)}:${JSON.stringify(data.toolUseResult)}`;
     if (identity && seen.has(identity)) return false;
     if (identity) seen.add(identity);
+    const owner = key && owners.get(key);
+    if (!scope.inScope(data) || key && (!owner || owner !== file)) {
+      if (owner && owner !== file) { inherited.add(key!); parentSessionIds.add(scopes.get(owner)!.sessionId); }
+      else { unresolved.add(key ?? `line:${line}`); unknowns.add("history_lineage_unknown"); }
+      return false;
+    }
+    const parentId = str(data.parentSessionId);
+    const parentAgent = str(data.parentAgentId);
+    const nativeParent = parentAgent ? `${parentId ?? scope.nativeSessionId}:agent:${parentAgent}` : parentId;
+    if (nativeParent) {
+      if ([...scopes.values()].some(candidate => candidate.sessionId === nativeParent)) linkedParents.add(nativeParent);
+      else unknowns.add("history_lineage_unknown");
+    }
+    if (!key) unknowns.add("history_event_identity_missing");
+    const parentKey = str(data.parentUuid) && `event:${data.parentUuid}`;
+    if (parentKey) {
+      const parent = owners.get(parentKey);
+      if (!parent) unknowns.add("history_lineage_unknown");
+      else if (parent !== file) linkedParents.add(scopes.get(parent)!.sessionId);
+    }
     return true;
   });
-  if (parentSessionIds.size > 1 || child && parentSessionIds.size !== 1) unknowns.add("history_lineage_unknown");
-  const ids = new Set(rows.map(({ data }) => str(data.uuid)).filter(Boolean));
-  if (rows.some(({ data }) => str(data.parentUuid) && !ids.has(str(data.parentUuid)) && !parents.has(`event:${data.parentUuid}`))) unknowns.add("history_lineage_unknown");
+  if (scope.child && !parentSessionIds.size && !linkedParents.size) unknowns.add("history_lineage_unknown");
   if (unknowns.has("history_lineage_unknown") || unknowns.has("history_event_identity_missing")) unknowns.add("usage_missing_or_partial");
-  const parentSessionId = parentSessionIds.size === 1 ? [...parentSessionIds][0] : child ? nativeSessionId : undefined;
-  return { rows, nativeSessionId, childAgentId, child, parentSessionId, unknowns };
+  const parentIds = linkedParents.size ? linkedParents : parentSessionIds;
+  const candidateParent = parentIds.size === 1 ? [...parentIds][0] : scope.child ? scope.nativeSessionId : undefined;
+  const parentSessionId = candidateParent === scope.sessionId ? undefined : candidateParent;
+  return { ...scope, rows, parentSessionId, unknowns, inheritedEvents: inherited.size,
+    unresolvedInheritedEvents: unknowns.has("history_lineage_unknown") ? unresolved.size || null : 0 };
 }
 
 /** Reads native top-level Claude records without changing the Codex/Copilot reader. */
-export function parseClaudeSessionFile(file: string) {
-  const input = readRows(file);
+export function parseClaudeSessionFile(file: string, corpus = createClaudeCorpus(new Map([[file, readClaudeTranscript(file)]]))) {
+  const { input, history } = corpus.get(file)!;
   const parseErrors = input.parseErrors;
-  const { rows, nativeSessionId, childAgentId, child, parentSessionId, unknowns } = normalizeHistory(file, input.rows);
+  const { rows, nativeSessionId, childAgentId, child, parentSessionId, inheritedEvents, unresolvedInheritedEvents } = history;
+  const unknowns = new Set(history.unknowns);
   const sessionId = child && childAgentId ? `${nativeSessionId}:agent:${childAgentId}` : nativeSessionId;
   const turns: NormalizedTurn[] = [];
   const tools = new Map<string, NormalizedToolCall>();
@@ -251,11 +321,16 @@ export function parseClaudeSessionFile(file: string) {
     userIntent: firstInstruction, finalAnswer,
     attribution: { branches: [...branches].sort(), worktreePaths: [...worktreePaths].sort(), firstInstruction,
       isSidechain: sidechains.size === 1 ? [...sidechains][0] : undefined, agentId,
+      inheritedEvents, unresolvedInheritedEvents,
       historyCoverage: unknowns.has("history_lineage_unknown") || unknowns.has("history_event_identity_missing") || parseErrors > 0 ? "partial" : "complete",
       usageCoverage: unknowns.has("usage_missing_or_partial") || parseErrors > 0 ? "partial" : "complete", unknowns: [...unknowns].sort() }
   };
   const metrics = calculateMetrics(base, parseErrors);
   // The common model's input count is non-cache input; cache writes remain separate.
   metrics.modelRequests = messages.size;
-  return { session: { ...base, metrics } as NormalizedSession, eventsParsed: input.rows.length, parseErrors };
+  if (unknowns.has("history_lineage_unknown")) {
+    metrics.inputTokens = unavailable(); metrics.outputTokens = unavailable(); metrics.cachedTokens = unavailable();
+    metrics.outputTokensPerTask = unavailable();
+  }
+  return { session: { ...base, metrics } as NormalizedSession, eventsParsed: input.rows.length, parseErrors, traceDigest: input.digest };
 }

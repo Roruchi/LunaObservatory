@@ -7,7 +7,7 @@ import { discoverSources } from "./fs/discovery.js";
 import { readJsonlObjects, writeJsonl } from "./fs/jsonl.js";
 import { detectRepoRoot, ensureLunaObsDirs, getLunaObsPaths } from "./fs/paths.js";
 import { applyRepoFilter, canonicalizeObservedRepoRoots } from "./normalize/repoFilter.js";
-import { parseSessionFile } from "./normalize/parser.js";
+import { createSessionParser } from "./normalize/parser.js";
 import type { NormalizedSession } from "./normalize/types.js";
 import { generateScanHtmlReport } from "./reports/html.js";
 import { generateInspectReport } from "./reports/inspect.js";
@@ -82,6 +82,7 @@ function scan(options: {
   const discovered = discoverSources(options.source, options.logs);
   fs.writeFileSync(path.join(paths.index, "discovered-sources.json"), `${JSON.stringify(discovered, null, 2)}\n`, "utf8");
 
+  const parseSession = createSessionParser(discovered.flatMap(source => source.files.map(file => ({ file, source: source.source }))));
   const sessions: NormalizedSession[] = [];
   const repoFilter = [];
   let eventsParsed = 0;
@@ -90,7 +91,7 @@ function scan(options: {
 
   for (const source of discovered) {
     for (const file of source.files) {
-      const parsed = parseSessionFile(file, source.source);
+      const parsed = parseSession(file, source.source);
       filesScanned += 1;
       eventsParsed += parsed.eventsParsed;
       parseErrors += parsed.parseErrors;
