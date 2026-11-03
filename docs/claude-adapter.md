@@ -1,0 +1,13 @@
+# Claude Code transcripts
+
+`lunaobs scan --source claude --logs /fictional/traces` accepts native Claude Code JSONL, including the `projects/**/*.jsonl` layout. `--source all --logs ...` also detects native Claude records. Codex and Copilot keep their existing parser. Existing Scan and Dream report formats and scoring semantics are unchanged.
+
+The adapter retains native session identity, timestamps, first user instruction, cwd, git branch, model, text, tool calls/results and evidence line references. It groups assistant streaming records using the union of `requestId` and `message.id`, deduplicates identical content blocks, and joins results by `tool_use_id`. Usage repeated on split blocks is counted once per request, using the maximum observed value for each field as streaming usage advances. Equal text in separate native requests remains separate activity.
+
+`inputTokens` means Claude's reported non-cache input; `cachedTokens` means cache reads. Cache writes are retained separately as `cacheCreationTokens` on the normalized message. No total billed-token or price estimate is invented. Missing fields remain unavailable; partial session sums cover only reported requests, with `usage_missing_or_partial` in attribution unknowns. Request IDs missing from the transcript cannot be reconstructed; those records remain separate and are flagged.
+
+`Read`, `MultiEdit` and `NotebookEdit` map to existing semantic tools; other names are preserved, including Bash, Edit and Write. File paths normalize to the existing `path` argument. Verification uses the existing command rules. Exit codes are retained only from typed result metadata or an explicit exit-code receipt. An explicit `is_error: false` confirms a foreground tool result succeeded, while background results and command results without success evidence stay unknown. Tool completion does not prove accepted task quality. Truncated transcripts may retain requested calls or orphan results; unknowns make that visible.
+
+Sidechain and agent markers are retained. A sidechain with an agent ID gets a child session ID scoped by that agent and a parent session ID, preventing parent/child identity collisions. Missing child agent identity is flagged. Mixed native session/agent IDs in one file are rejected rather than silently combined. Session completion stays unknown because a final assistant message alone does not establish task completion.
+
+All checked-in fixtures are handmade and fictional. Normalized Scan output includes text and tool arguments: keep real traces and generated artifacts private. The correlation command emits identity linkage, evidence kinds and digests rather than prompt or tool content.
