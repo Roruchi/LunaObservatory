@@ -49,20 +49,22 @@ describe("Claude Code native transcripts (fully synthetic)", () => {
     expect(session.lifecycleStatus).toBe("unknown");
     expect(session.finalAnswer?.text).toBe("Fictional checkpoint.");
   });
-  it("deduplicates by request id even when message ids differ", () => {
-    const { session } = parseRows([1, 2].map(index => native("assistant", { id: `synthetic-${index}`, usage: { output_tokens: 4 }, content: [{ type: "text", text: "Fictional answer." }] }, { requestId: "synthetic-request" })));
-    expect(session.metrics.outputTokens.value).toBe(4);
-    expect(session.metrics.modelRequests).toBe(1);
+  it.each(["message", "request"])("keeps pairs distinct when the %s component changes", component => {
+    const { session } = parseRows([1, 2].map(index => native("assistant", { id: component === "message" ? `synthetic-${index}` : "synthetic-message", usage: { output_tokens: 4 }, content: [{ type: "text", text: "Fictional answer." }] }, { requestId: component === "request" ? `synthetic-request-${index}` : "synthetic-request" })));
+    expect(session.metrics.outputTokens.value).toBe(8);
+    expect(session.metrics.modelRequests).toBe(2);
     expect(session.turns[0].assistantMessages[0].text).toBe("Fictional answer.");
   });
-  it("unions split records when a later record bridges request and message ids", () => {
+  it("keeps incomplete request identities separate with explicit partial usage", () => {
     const { session } = parseRows([
       native("assistant", { usage: { output_tokens: 4 }, content: [] }, { requestId: "synthetic-request" }),
       native("assistant", { id: "synthetic-message", usage: { output_tokens: 4 }, content: [] }),
       native("assistant", { id: "synthetic-message", usage: { output_tokens: 4 }, content: [] }, { requestId: "synthetic-request" })
     ]);
-    expect(session.metrics.outputTokens.value).toBe(4);
-    expect(session.metrics.modelRequests).toBe(1);
+    expect(session.metrics.outputTokens.value).toBe(12);
+    expect(session.metrics.modelRequests).toBe(3);
+    expect(session.attribution?.usageCoverage).toBe("partial");
+    expect(session.attribution?.unknowns).toContain("request_identity_missing");
   });
   it("retains sidechain identity, malformed-line counts and unknown timestamps", () => {
     const { session, parseErrors } = parseRows([
@@ -187,7 +189,7 @@ describe("Claude Code native transcripts (fully synthetic)", () => {
       expect(child.attribution?.historyCoverage).toBe("partial");
     } finally { fs.rmSync(directory, { recursive: true, force: true }); }
   });
-  it("keeps shared usage when lexical ownership differs from native lineage", () => {
+  it("counts shared requests in the first transcript without inferring lineage", () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "lunaobs-synthetic-allocation-"));
     try {
       const parentFile = path.join(directory, "parent.jsonl");
@@ -205,13 +207,13 @@ describe("Claude Code native transcripts (fully synthetic)", () => {
       expect(child.metrics.outputTokens.value).toBe(12);
       expect(parent.attribution?.inheritedEvents).toBe(1);
       expect(parent.attribution?.historyCoverage).toBe("partial");
-      expect(child.attribution?.notes).toContain("Event ownership uses event timestamp, transcript first-event time, then transcript ID; allocation of shared history can differ from native lineage, including when a parent continues after a fork.");
+      expect(child.attribution?.notes).toContain("Assistant requests are counted once per scan by message ID plus request ID, falling back to event UUID. Transcripts are processed by native transcript ID, then source path; this does not reconstruct lineage. Reused identities and richer later copies can undercount usage or tool outcomes.");
     } finally { fs.rmSync(directory, { recursive: true, force: true }); }
   });
   it.each([true, false])("deduplicates repeated users and tool events with UUIDs: %s", uuid => {
     const rows = [
       native("user", { id: "fictional-user", content: "Fictional instruction." }, uuid ? { uuid: "user-event" } : {}),
-      native("assistant", { id: "fictional-request", content: [{ type: "tool_use", id: "fictional-tool", name: "Read", input: {} }] }, uuid ? { uuid: "tool-event" } : {}),
+      native("assistant", { id: "fictional-request", content: [{ type: "tool_use", id: "fictional-tool", name: "Read", input: {} }] }, { requestId: "fictional-request-id", ...(uuid ? { uuid: "tool-event" } : {}) }),
       native("user", { id: "fictional-result", content: [{ type: "tool_result", tool_use_id: "fictional-tool", content: "Fictional data.", is_error: false }] }, uuid ? { uuid: "result-event" } : {})
     ];
     const { session } = parseRows(rows.flatMap(row => [row, row]));
@@ -227,29 +229,90 @@ describe("Claude Code native transcripts (fully synthetic)", () => {
     expect(session.attribution?.usageCoverage).toBe("partial");
     expect(session.attribution?.unknowns).toContain("history_event_identity_missing");
   });
-  it.each(["timestamp", "first-event", "transcript-id", "missing-time"])("resolves ownership deterministically by %s", rule => {
-    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "lunaobs-synthetic-ownership-"));
+  it("deduplicates requests independently of transcript input order and timestamps", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "lunaobs-synthetic-requests-"));
     try {
-      const files = [path.join(directory, "z-original.jsonl"), path.join(directory, "a-copy.jsonl")];
-      files.forEach((file, index) => {
-        const sessionId = rule === "transcript-id" || rule === "missing-time" ? index ? "z-copy" : "a-owner" : index ? "a-copy" : "z-owner";
-        const rows = [native("assistant", { id: "fictional-shared", usage: { output_tokens: 10 }, content: [] }, {
-          sessionId, uuid: "shared-event", timestamp: rule === "missing-time" ? undefined : index && rule === "timestamp" ? "2026-01-01T10:01:00Z" : "2026-01-01T10:00:00Z"
-        })];
-        if (!index && rule === "first-event") rows.unshift(native("user", { content: "Fictional earlier instruction." }, { sessionId, uuid: "earlier-event", timestamp: "2026-01-01T09:59:00Z" }));
-        if (index && rule === "timestamp") rows.unshift(native("user", { content: "Fictional earlier copy context." }, { sessionId, uuid: "copy-context", timestamp: "2026-01-01T09:58:00Z" }));
-        fs.writeFileSync(file, rows.map(row => JSON.stringify(row)).join("\n"));
-      });
-      const parse = createSessionParser(files.map(file => ({ file, source: "claude" })));
-      const original = parse(files[0], "claude").session;
-      const copied = parse(files[1], "claude").session;
-      expect(original.metrics.outputTokens.value).toBe(10);
-      expect(copied.metrics.outputTokens.value).toBeNull();
-      expect(copied.attribution?.inheritedEvents).toBe(1);
-      expect(copied.attribution?.historyCoverage).toBe("partial");
-      const reversed = createSessionParser([...files].reverse().map(file => ({ file, source: "claude" })));
-      expect(files.map(file => reversed(file, "claude").session.metrics.outputTokens.value)).toEqual([10, null]);
+      const files = [path.join(directory, "z-first.jsonl"), path.join(directory, "a-copy.jsonl")];
+      files.forEach((file, index) => fs.writeFileSync(file, JSON.stringify(native("assistant", {
+        id: "fictional-shared-message", usage: { output_tokens: 10 }, content: []
+      }, { sessionId: index ? "z-copy" : "a-first", requestId: "fictional-shared-request", uuid: `event-${index}`, timestamp: index ? "2026-01-01T09:00:00Z" : "2026-01-01T10:00:00Z" }))));
+      for (const ordered of [files, [...files].reverse()]) {
+        const parse = createSessionParser(ordered.map(file => ({ file, source: "claude" })));
+        expect(files.map(file => parse(file, "claude").session.metrics.outputTokens.value)).toEqual([10, null]);
+        expect(parse(files[1], "claude").session.attribution?.inheritedEvents).toBe(1);
+      }
     } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+  });
+  it.each([false, true])("counts one split request across partial transcripts, richer later copy: %s", richer => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "lunaobs-synthetic-split-request-"));
+    try {
+      const copyFile = path.join(directory, "a-copy.jsonl");
+      const liveFile = path.join(directory, "z-live.jsonl");
+      const first = native("assistant", {
+        id: "fictional-message", model: "fictional-model", usage: { input_tokens: 10, output_tokens: 10, cache_read_input_tokens: 3, cache_creation_input_tokens: 5 },
+        content: [{ type: "tool_use", id: "fictional-original-tool", name: "Bash", input: { command: "npm test" } }]
+      }, { uuid: "U1", requestId: "fictional-request", sessionId: "a-copy" });
+      fs.writeFileSync(copyFile, JSON.stringify(first));
+      const later = [
+        { ...first, sessionId: "z-live" },
+        native("assistant", { ...first.message, usage: { input_tokens: richer ? 20 : 10, output_tokens: richer ? 20 : 10, cache_read_input_tokens: richer ? 6 : 3, cache_creation_input_tokens: richer ? 10 : 5 },
+          content: [{ type: "text", text: "Fictional later streaming block." }, { type: "tool_use", id: "fictional-later-tool", name: "Read", input: {} }]
+        }, { uuid: "U2", requestId: "fictional-request", sessionId: "z-live" }),
+        native("user", { content: [{ type: "tool_result", tool_use_id: "fictional-original-tool", content: "Fictional result.", is_error: false }] }, { uuid: "R1", toolUseResult: { exitCode: 0 }, sessionId: "z-live" }),
+        native("user", { content: [{ type: "tool_result", tool_use_id: "fictional-later-tool", content: "Fictional data.", is_error: false }] }, { uuid: "R2", sessionId: "z-live" })
+      ];
+      fs.writeFileSync(liveFile, later.map(row => JSON.stringify(row)).join("\n"));
+      const read = vi.spyOn(fs, "readFileSync");
+      let parse: ReturnType<typeof createSessionParser>;
+      try {
+        parse = createSessionParser([liveFile, copyFile].map(file => ({ file, source: "unknown" })));
+        for (const file of [copyFile, liveFile]) expect(read.mock.calls.filter(args => args[0] === file)).toHaveLength(1);
+      } finally { read.mockRestore(); }
+      const sessions = [copyFile, liveFile].map(file => parse!(file, "unknown").session);
+      for (const field of ["inputTokens", "outputTokens", "cachedTokens"] as const) {
+        expect(sessions.reduce((sum, session) => sum + (session.metrics[field].value ?? 0), 0)).toBe(field === "cachedTokens" ? 3 : 10);
+      }
+      expect(sessions.flatMap(session => session.turns.flatMap(turn => turn.assistantMessages)).reduce((sum, message) => sum + (message.cacheCreationTokens?.value ?? 0), 0)).toBe(5);
+      expect(sessions.reduce((sum, session) => sum + session.metrics.modelRequests, 0)).toBe(1);
+      expect(sessions.reduce((sum, session) => sum + session.metrics.toolRequests, 0)).toBe(1);
+      expect(sessions[0].turns[0].toolCalls[0].status).toBe("requested");
+      expect(sessions[1].turns).toEqual([]);
+      expect(sessions[1].attribution?.historyCoverage).toBe("partial");
+      expect(sessions[1].attribution?.notes?.[0]).toContain("richer later copies can undercount");
+    } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+  });
+  it("keeps a new request and its result when a result row also contains copied tool history", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "lunaobs-synthetic-tool-history-"));
+    try {
+      const parentFile = path.join(directory, "parent.jsonl");
+      const childFile = path.join(directory, "child.jsonl");
+      const copied = native("assistant", { id: "parent-message", content: [{ type: "tool_use", id: "parent-tool", name: "Read", input: {} }] }, { requestId: "parent-request", uuid: "parent-event", sessionId: "a-parent" });
+      fs.writeFileSync(parentFile, JSON.stringify(copied));
+      fs.writeFileSync(childFile, [
+        { ...copied, uuid: "rewritten-copy-event", sessionId: "z-child" },
+        native("assistant", { id: "own-message", usage: { input_tokens: 2, output_tokens: 2 }, content: [{ type: "tool_use", id: "own-tool", name: "Write", input: { file_path: "/fictional/own.txt" } }] }, { requestId: "own-request", uuid: "own-event", sessionId: "z-child" }),
+        native("user", { content: [
+          { type: "text", text: "Fictional child result." },
+          { type: "tool_result", tool_use_id: "parent-tool", content: "Fictional copied failure.", is_error: true },
+          { type: "tool_result", tool_use_id: "own-tool", content: "Fictional own update.", is_error: false }
+        ] }, { uuid: "mixed-result", sessionId: "z-child" })
+      ].map(row => JSON.stringify(row)).join("\n"));
+      const parse = createSessionParser([childFile, parentFile].map(file => ({ file, source: "claude" })));
+      const child = parse(childFile, "claude").session;
+      expect(child.metrics.modelRequests).toBe(1);
+      expect(child.metrics.inputTokens.value).toBe(2);
+      expect(child.metrics.toolRequests).toBe(1);
+      expect(child.metrics.editCalls).toBe(1);
+      expect(child.turns.flatMap(turn => turn.toolCalls).map(tool => [tool.toolCallId, tool.status, tool.outputText])).toEqual([["own-tool", "completed", "Fictional own update."]]);
+      expect(child.userIntent?.text).toBe("Fictional child result.");
+      expect(child.attribution?.unknowns).not.toContain("orphan_tool_result");
+    } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+  });
+  it("uses event UUIDs when a complete message/request pair is unavailable", () => {
+    const { session } = parseRows([1, 2].map(() => native("assistant", { usage: { output_tokens: 4 }, content: [] }, { uuid: "fictional-event" })));
+    expect(session.metrics.modelRequests).toBe(1);
+    expect(session.metrics.outputTokens.value).toBe(4);
+    expect(session.attribution?.unknowns).toContain("request_identity_missing");
   });
   it("marks ambiguous lineage as partial rather than claiming complete history or usage", () => {
     const { session } = parseRows([

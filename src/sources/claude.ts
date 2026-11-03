@@ -22,10 +22,14 @@ export function isClaudeEventsFile(events: RawLogEvent[]): boolean {
 }
 
 type NativeRow = { data: RecordValue; line: number };
+const requestKey = (row: RecordValue): string | undefined => {
+  const messageId = str(obj(row.message).id);
+  const requestId = str(row.requestId);
+  return messageId && requestId ? `request:${JSON.stringify([messageId, requestId])}` : str(row.uuid) ? `event:${row.uuid}` : undefined;
+};
 const eventKey = (row: RecordValue): string | undefined => {
   if (str(row.uuid)) return `event:${row.uuid}`;
-  const message = obj(row.message);
-  return str(message.id) ? `message:${row.type}:${message.id}:${str(row.requestId) ?? ""}` : undefined;
+  return row.type !== "assistant" && str(obj(row.message).id) ? `message:${JSON.stringify([row.type, obj(row.message).id, str(row.requestId) ?? null])}` : undefined;
 };
 
 export function readClaudeTranscript(file: string) {
@@ -45,7 +49,6 @@ export function readClaudeTranscript(file: string) {
 }
 
 type Transcript = ReturnType<typeof readClaudeTranscript>;
-const eventTime = (row: RecordValue) => Number.isFinite(Date.parse(str(row.timestamp) ?? "")) ? Date.parse(String(row.timestamp)) : Infinity;
 
 function transcriptScope(file: string, input: NativeRow[]) {
   const last = input.filter(({ data }) => data.type === "user" || data.type === "assistant").at(-1)?.data;
@@ -54,58 +57,71 @@ function transcriptScope(file: string, input: NativeRow[]) {
   const child = scope.filter(({ data }) => typeof data.isSidechain === "boolean").at(-1)?.data.isSidechain === true;
   const childAgentId = str(scope.filter(({ data }) => data.isSidechain === child && str(data.agentId)).at(-1)?.data.agentId);
   const sessionId = child && childAgentId ? `${nativeSessionId}:agent:${childAgentId}` : nativeSessionId;
-  return { nativeSessionId, childAgentId, child, sessionId, sessionIdMissing: !str(last?.sessionId) };
+  return { childAgentId, child, sessionId, sessionIdMissing: !str(last?.sessionId) };
 }
 
 export function createClaudeCorpus(inputs: Map<string, Transcript>) {
-  const scopes = new Map([...inputs].map(([file, input]) => [file, transcriptScope(file, input.rows)]));
-  const firstTimes = new Map([...inputs].map(([file, input]) => [file, input.rows.reduce((first, { data }) => Math.min(first, eventTime(data)), Infinity)]));
-  const occurrences = new Map<string, Map<string, number>>();
-  for (const [file, input] of inputs) for (const { data } of input.rows) {
-    const key = eventKey(data);
-    if (!key) continue;
-    let files = occurrences.get(key);
-    if (!files) { files = new Map(); occurrences.set(key, files); }
-    files.set(file, Math.min(files.get(file) ?? Infinity, eventTime(data)));
-  }
-  const compare = (a: string, b: string, files: Map<string, number>): number => {
-    const timeA = files.get(a)!; const timeB = files.get(b)!;
-    if (timeA !== timeB) return timeA < timeB ? -1 : 1;
-    const firstA = firstTimes.get(a)!; const firstB = firstTimes.get(b)!;
-    if (firstA !== firstB) return firstA < firstB ? -1 : 1;
-    const idA = scopes.get(a)!.sessionId; const idB = scopes.get(b)!.sessionId;
-    if (idA !== idB) return idA < idB ? -1 : 1;
-    return a < b ? -1 : a > b ? 1 : 0;
-  };
-  const owners = new Map<string, string>();
-  for (const [key, files] of occurrences) {
-    const ordered = [...files.keys()].sort((a, b) => compare(a, b, files));
-    owners.set(key, ordered[0]);
-  }
+  const seenRequests = new Set<string>();
+  const seenEvents = new Set<string>();
+  const seenTools = new Set<string>();
+  const transcripts = [...inputs].map(([file, input]) => ({ file, input, scope: transcriptScope(file, input.rows) }));
+  transcripts.sort((a, b) => a.scope.sessionId < b.scope.sessionId ? -1 : a.scope.sessionId > b.scope.sessionId ? 1 : a.file < b.file ? -1 : a.file > b.file ? 1 : 0);
   const corpus = new Map<string, { input: Transcript; history: ReturnType<typeof normalizeHistory> }>();
-  for (const [file, input] of inputs) {
-    corpus.set(file, { input, history: normalizeHistory(file, input.rows, scopes.get(file)!, owners) });
+  for (const { file, input, scope } of transcripts) {
+    corpus.set(file, { input, history: normalizeHistory(input.rows, scope, seenRequests, seenEvents, seenTools) });
   }
   return corpus;
 }
 
-function normalizeHistory(file: string, input: NativeRow[], scope: ReturnType<typeof transcriptScope>, owners: Map<string, string>) {
+function normalizeHistory(input: NativeRow[], scope: ReturnType<typeof transcriptScope>, seenRequests: Set<string>, seenEvents: Set<string>, seenTools: Set<string>) {
   const unknowns = new Set<string>();
   if (scope.sessionIdMissing) unknowns.add("session_id_missing");
   const inherited = new Set<string>();
-  const seen = new Set<string>();
-  const rows = input.filter(({ data }) => {
-    const key = eventKey(data);
-    const identity = str(data.uuid) ? key : key && `${key}:${JSON.stringify(data.message)}:${JSON.stringify(data.toolUseResult)}`;
-    if (identity && seen.has(identity)) return false;
-    if (identity) seen.add(identity);
-    if (key && owners.get(key) !== file) { inherited.add(key); return false; }
-    if (!key) unknowns.add("history_event_identity_missing");
+  const ownRequests = new Set<string>();
+  const ownTools = new Set<string>();
+  const skippedTools = new Set<string>();
+  const snapshots = new Set<string>();
+  const retained = input.filter(({ data }) => {
+    const event = eventKey(data);
+    const request = data.type === "assistant" ? requestKey(data) : undefined;
+    const snapshot = event ?? (request && `${request}:${JSON.stringify(data.message)}`);
+    if (snapshot && snapshots.has(snapshot)) return false;
+    if (snapshot) snapshots.add(snapshot);
+    if (event && seenEvents.has(event)) { inherited.add(event); return false; }
+    if (data.type === "assistant") {
+      const blocks = Array.isArray(obj(data.message).content) ? obj(data.message).content as unknown[] : [];
+      const tools = blocks.map(obj).filter(block => block.type === "tool_use" && str(block.id)).map(block => str(block.id)!);
+      if (request && seenRequests.has(request) && !ownRequests.has(request)) {
+        inherited.add(event ?? request);
+        tools.forEach(id => skippedTools.add(id));
+        return false;
+      }
+      if (request) { ownRequests.add(request); seenRequests.add(request); }
+      else unknowns.add("history_event_identity_missing");
+      if (!str(obj(data.message).id) || !str(data.requestId)) unknowns.add("request_identity_missing");
+      tools.forEach(id => ownTools.add(id));
+    }
+    if (event) seenEvents.add(event);
+    else if (data.type !== "assistant") unknowns.add("history_event_identity_missing");
     return true;
   });
+  const rows: NativeRow[] = retained.flatMap(({ data, line }) => {
+    if (data.type !== "user" || !Array.isArray(obj(data.message).content)) return [{ data, line }];
+    const message = obj(data.message);
+    const content = (message.content as unknown[]).filter(value => {
+      const block = obj(value);
+      const id = str(block.tool_use_id);
+      if (block.type !== "tool_result" || !id || !skippedTools.has(id) && (!seenTools.has(id) || ownTools.has(id))) return true;
+      inherited.add(eventKey(data) ?? `tool_result:${id}`);
+      return false;
+    });
+    if (content.length === (message.content as unknown[]).length) return [{ data, line }];
+    return content.length ? [{ data: { ...data, message: { ...message, content } }, line }] : [];
+  });
+  ownTools.forEach(id => seenTools.add(id));
   if (inherited.size) unknowns.add("history_inherited_events");
   if (scope.child && !inherited.size) unknowns.add("history_lineage_unknown");
-  if (inherited.size || unknowns.has("history_lineage_unknown") || unknowns.has("history_event_identity_missing")) unknowns.add("usage_missing_or_partial");
+  if (inherited.size || unknowns.has("history_lineage_unknown") || unknowns.has("history_event_identity_missing") || unknowns.has("request_identity_missing")) unknowns.add("usage_missing_or_partial");
   return { ...scope, rows, unknowns, inheritedEvents: inherited.size,
     unresolvedInheritedEvents: unknowns.has("history_lineage_unknown") ? null : 0 };
 }
@@ -119,24 +135,6 @@ export function parseClaudeSessionFile(file: string, corpus = createClaudeCorpus
   const turns: NormalizedTurn[] = [];
   const tools = new Map<string, NormalizedToolCall>();
   const messages = new Map<string, { message: NormalizedAssistantMessage; blocks: Set<string>; usage: RecordValue }>();
-  // Either native key can tie split records together (some records have only one).
-  const aliases = new Map<string, string>();
-  // Union both request and message identities before processing split streaming rows.
-  const roots = new Map<string, string>();
-  const rootKey = (key: string): string => {
-    const parent = roots.get(key);
-    if (!parent || parent === key) return key;
-    const root = rootKey(parent); roots.set(key, root); return root;
-  };
-  for (const { data } of rows) {
-    if (data.type !== "assistant") continue;
-    const request = str(data.requestId); const message = str(obj(data.message).id);
-    if (request && message) roots.set(rootKey(`message:${message}`), rootKey(`request:${request}`));
-  }
-  for (const { data } of rows) {
-    const request = str(data.requestId); const message = str(obj(data.message).id);
-    for (const key of [request && `request:${request}`, message && `message:${message}`]) if (key) aliases.set(key, rootKey(key));
-  }
   const branches = new Set<string>();
   const worktreePaths = new Set<string>();
   const sidechains = new Set<boolean>();
@@ -183,10 +181,7 @@ export function parseClaudeSessionFile(file: string, corpus = createClaudeCorpus
     if (row.type === "assistant") {
       const requestId = str(row.requestId);
       const messageId = str(native.id);
-      const keys = [requestId && `request:${requestId}`, messageId && `message:${messageId}`].filter((key): key is string => Boolean(key));
-      const key = keys.map(alias => aliases.get(alias)).find(Boolean) ?? keys[0] ?? `line:${line}`;
-      keys.forEach(alias => aliases.set(alias, key));
-      if (!keys.length) unknowns.add("request_identity_missing");
+      const key = requestKey(row) ?? `line:${line}`;
       let group = messages.get(key);
       if (!group) {
         const message: NormalizedAssistantMessage = { messageId, requestId, kind: "text", model: str(native.model), contentLength: 0, hasContent: false,
@@ -265,8 +260,8 @@ export function parseClaudeSessionFile(file: string, corpus = createClaudeCorpus
     attribution: { branches: [...branches].sort(), worktreePaths: [...worktreePaths].sort(), firstInstruction,
       isSidechain: sidechains.size === 1 ? [...sidechains][0] : undefined, agentId,
       inheritedEvents, unresolvedInheritedEvents,
-      notes: ["Event ownership uses event timestamp, transcript first-event time, then transcript ID; allocation of shared history can differ from native lineage, including when a parent continues after a fork.",
-        ...(unresolvedInheritedEvents === null ? ["Inherited history is unresolved without another transcript owning its events; observed totals may include replayed history."] : [])],
+      notes: ["Assistant requests are counted once per scan by message ID plus request ID, falling back to event UUID. Transcripts are processed by native transcript ID, then source path; this does not reconstruct lineage. Reused identities and richer later copies can undercount usage or tool outcomes.",
+        ...(unresolvedInheritedEvents === null ? ["Inherited history is unresolved without another transcript containing the same requests; observed totals may include replayed history."] : [])],
       historyCoverage: inheritedEvents > 0 || unknowns.has("history_lineage_unknown") || unknowns.has("history_event_identity_missing") || parseErrors > 0 ? "partial" : "complete",
       usageCoverage: unknowns.has("usage_missing_or_partial") || parseErrors > 0 ? "partial" : "complete", unknowns: [...unknowns].sort() }
   };
