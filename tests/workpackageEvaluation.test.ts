@@ -121,6 +121,7 @@ describe("synthetic workpackage evidence scorecards", () => {
         const result = evaluateWorkpackage(input);
         expect(result.gateDisposition).toBe(state === "proven" ? "compliance_failure" : state === "unknown" ? "unknown" : "human_review");
         expect(result.reasons.some(reason => reason.code === "AUTHORIZED_STOP")).toBe(false);
+        expect(result.reasons.some(reason => reason.code === "STOP_AUTHORIZATION_WITHHELD")).toBe(true);
         expect(Object.values(result.dimensions).map(dimension => dimension.score)).toEqual([100, 100, 100, 100]);
         expect(result.composite).toEqual({ status: "Scored", score: 100 });
       });
@@ -131,10 +132,24 @@ describe("synthetic workpackage evidence scorecards", () => {
       const result = evaluateWorkpackage(input);
       expect(result.gateDisposition).toBe("human_review");
       expect(result.reasons.some(reason => reason.code === "AUTHORIZED_STOP")).toBe(false);
+      expect(result.reasons.some(reason => reason.code === "STOP_AUTHORIZATION_WITHHELD")).toBe(true);
+      expect(result.composite).toEqual({ status: "Scored", score: 100 });
+    });
+    it.each([true, false])(`withholds ${stop} authorization regardless of contradicted claim ordering (%s)`, reverse => {
+      const input = syntheticPacket(); input.result = known(stop);
+      if (input.claims.availability !== "known") throw new Error("Synthetic fixture error");
+      input.claims.value.push({ id: "other-claim", kind: "other", verdict: known("Contradicted"), revision: known("fictional-revision-b") });
+      if (reverse) input.claims.value.reverse();
+      const result = evaluateWorkpackage(input);
+      expect(result.gateDisposition).toBe("clear");
+      expect(result.confidence).toBe("limited");
+      expect(result.reasons.some(reason => reason.code === "AUTHORIZED_STOP")).toBe(false);
+      expect(result.reasons.some(reason => reason.code === "STOP_AUTHORIZATION_WITHHELD")).toBe(true);
+      expect(result.reasons.some(reason => reason.code === "CLAIM_CONTRADICTED")).toBe(true);
       expect(result.composite).toEqual({ status: "Scored", score: 100 });
     });
     for (const kind of ["completion", "verification", "other"] as const) {
-      it.each(["Contradicted", "Unproven", "unknown", "needs_review", "stale", "revision_unknown", "revision_needs_review"] as const)(`resolves ${stop} authorization after ${kind} claim %s`, state => {
+      it.each(["Supported", "Contradicted", "Unproven", "unknown", "needs_review", "stale", "revision_unknown", "revision_needs_review"] as const)(`resolves ${stop} authorization after ${kind} claim %s`, state => {
         const input = syntheticPacket(); input.result = known(stop);
         if (input.claims.availability !== "known") throw new Error("Synthetic fixture error");
         const claim = input.claims.value[0]; claim.kind = kind;
@@ -144,9 +159,13 @@ describe("synthetic workpackage evidence scorecards", () => {
         } else claim.verdict = state === "unknown" || state === "needs_review"
           ? { availability: state, reason: "Synthetic unresolved verdict" } : known(state);
         const result = evaluateWorkpackage(input);
-        const expectedGate = state === "Contradicted" ? kind === "other" ? "clear" : "compliance_failure" : "human_review";
+        const expectedGate = state === "Supported" ? "clear"
+          : state === "Contradicted" ? kind === "other" ? "clear" : "compliance_failure" : "human_review";
         expect(result.gateDisposition).toBe(expectedGate);
-        expect(result.reasons.some(reason => reason.code === "AUTHORIZED_STOP")).toBe(expectedGate === "clear");
+        expect(result.reasons.some(reason => reason.code === "AUTHORIZED_STOP")).toBe(state === "Supported");
+        expect(result.reasons.some(reason => reason.code === "STOP_AUTHORIZATION_WITHHELD")).toBe(state !== "Supported");
+        expect(result.confidence).toBe(state === "Supported" ? "sufficient" : "limited");
+        expect(Object.values(result.dimensions).map(dimension => dimension.score)).toEqual([100, 100, 100, 100]);
         expect(result.composite).toEqual({ status: "Scored", score: 100 });
       });
     }

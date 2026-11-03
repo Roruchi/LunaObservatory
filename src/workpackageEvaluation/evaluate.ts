@@ -4,7 +4,7 @@ import { EVALUATOR_REVISION, RUBRIC_V1 } from "./rubric.js";
 export type ReasonCode =
   | "BASELINE_MISSING" | "IDENTITY_UNJOINED" | "FINAL_REVISION_UNKNOWN"
   | "EVIDENCE_MISSING" | "EVIDENCE_NEEDS_REVIEW" | "CHECK_STALE" | "REQUIREMENT_FAILED"
-  | "WEIGHT_EXCLUDED" | "NO_APPLICABLE_EVIDENCE" | "AUTHORIZED_STOP" | "NO_VERIFIED_USEFUL_OUTCOME"
+  | "WEIGHT_EXCLUDED" | "NO_APPLICABLE_EVIDENCE" | "AUTHORIZED_STOP" | "STOP_AUTHORIZATION_WITHHELD" | "NO_VERIFIED_USEFUL_OUTCOME"
   | "USAGE_UNAVAILABLE" | "COMPARISON_UNAVAILABLE" | "REPEATED_COMMAND_LOOP"
   | "HIGH_OBSERVATION_SHARE" | "RESOURCE_OVER_REFERENCE"
   | "CLAIM_SUPPORTED" | "CLAIM_CONTRADICTED" | "CLAIM_UNPROVEN"
@@ -175,12 +175,14 @@ export function evaluateWorkpackage(value: unknown): WorkpackageEvaluation {
   }
   // Clean-room claim/receipt verdict design from truth (MIT). Stale receipts are
   // Unproven, never evidence of fabrication. Contradiction requires linked evidence.
+  let claimsClear = input.claims.availability === "known";
   if (input.claims.availability !== "known") {
     missingReason("claims", input.claims);
     if (gateDisposition === "clear" || gateDisposition === "unknown") gateDisposition = "human_review";
   } else for (const claim of input.claims.value) {
     const verdict = revision && known(claim.revision) === revision ? known(claim.verdict) : undefined;
     const refs = claim.verdict.availability === "known" ? claim.verdict.refs : [];
+    if (verdict !== "Supported") claimsClear = false;
     if (verdict === "Supported") reason("CLAIM_SUPPORTED", `claims.${claim.id}`, refs);
     else if (verdict === "Contradicted") {
       reason("CLAIM_CONTRADICTED", `claims.${claim.id}`, refs);
@@ -190,11 +192,12 @@ export function evaluateWorkpackage(value: unknown): WorkpackageEvaluation {
       if (gateDisposition !== "compliance_failure") gateDisposition = "human_review";
     }
   }
+  const evidenceClear = gateDisposition === "clear" && claimsClear;
   // Published abstention-quality idea: RigorBench, arXiv:2606.22678. No code reused
   // (repository unlicensed). A baseline may accept a verified blocker/escalation as useful work.
   if (["blocked", "escalated"].includes(known(input.result) ?? "") &&
-      gateDisposition === "clear" && useful !== null && useful > 0 && outcome.score === 100 && compliance.score === 100) {
-    reason("AUTHORIZED_STOP", "result", input.result.availability === "known" ? input.result.refs : []);
+      useful !== null && useful > 0 && outcome.score === 100 && compliance.score === 100) {
+    reason(evidenceClear ? "AUTHORIZED_STOP" : "STOP_AUTHORIZATION_WITHHELD", "result", input.result.availability === "known" ? input.result.refs : []);
   }
   const dimensions = { outcome, compliance, efficiency, handoff };
   const values = Object.values(dimensions);
@@ -212,7 +215,7 @@ export function evaluateWorkpackage(value: unknown): WorkpackageEvaluation {
     asOf: input.asOf, supersedes: input.supersedes, rubricRevision: RUBRIC_V1.revision,
     evaluatorRevision: EVALUATOR_REVISION, workpackage: input.workpackage, identities: input.identities,
     dimensions, composite, coverage, excludedWeight,
-    confidence: coverage === 1 && gateDisposition === "clear" && !reasons.some(r => r.code === "IDENTITY_UNJOINED") ? "sufficient" : "limited",
+    confidence: coverage === 1 && evidenceClear && !reasons.some(r => r.code === "IDENTITY_UNJOINED") ? "sufficient" : "limited",
     gateDisposition, reasons, diagnostics: { repeatedExecutionSteps, observationShare }
   };
 }

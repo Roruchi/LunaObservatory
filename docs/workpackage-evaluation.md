@@ -75,8 +75,9 @@ and link `supersedes`. The module does not store records.
 ## Rubric v1
 
 `RUBRIC_V1` is frozen and versioned as `workpackageEvaluation.rubric/1`.
-Evaluator revision `workpackageEvaluation.evaluator/2` corrects verified useful
-credit and authorized-stop labeling. Change the rubric/evaluator revision when
+Evaluator revision `workpackageEvaluation.evaluator/3` requires clear gate and
+claim evidence for authorized-stop labeling and sufficient confidence, retaining
+the verified useful credit correction from revision 2. Change the rubric/evaluator revision when
 changing policy or formulas.
 
 | Dimension | Weight | Evidence and subweights |
@@ -99,7 +100,7 @@ all four dimensions; it is the weighted mean over their eligible weights.
 Excluded weights are reported separately at both levels and never replaced with
 zero or 100. Values are rounded to four decimal places. `confidence` is the
 non-probabilistic label sufficient only when scoring coverage is complete, core
-identities are joined and the gate is clear; otherwise it is limited. Unknown
+identities are joined and gate and claim evidence is clear; otherwise it is limited. Unknown
 model or optional token telemetry does not invent a numeric uncertainty interval.
 
 Efficiency uses `u = accepted applicable criteria / all applicable criteria`,
@@ -130,7 +131,12 @@ An authorized blocked/escalated result can score 100 when its approved useful
 blocker/escalation criteria, applicable checks, compliance and handoff are met.
 Changing only a result string to blocked does not earn that credit.
 `AUTHORIZED_STOP` is emitted only after all gates and claims resolve to clear;
-non-clear dispositions retain raw audit scores without this authorization label.
+one shared evidence-clear predicate requires clear gates and fresh Supported
+verdicts for every claim kind, including `other`. Unknown or disputed claims,
+stale receipts, Unproven verdicts and Contradicted verdicts withhold the label
+and sufficient confidence. A contradicted `other` claim does not itself prove
+a hard-gate breach. `STOP_AUTHORIZATION_WITHHELD` explains withheld authorization
+for otherwise accepted, compliant stops. Raw audit scores remain unchanged.
 
 Gates never overwrite raw dimension scores or the raw composite. Proven breaches
 and fresh, independently contradicted completion/check claims cause
@@ -151,7 +157,8 @@ missing evidence or computed diagnostics, not independent proof.
 | EVIDENCE_MISSING, EVIDENCE_NEEDS_REVIEW, CHECK_STALE | Unavailable/disputed requirements or mismatching revisions |
 | REQUIREMENT_FAILED | Independently failed predicate |
 | WEIGHT_EXCLUDED, NO_APPLICABLE_EVIDENCE | Declared exclusions or an entirely excluded dimension |
-| AUTHORIZED_STOP | Accepted useful escalation/blocker and compliant stop |
+| AUTHORIZED_STOP | Accepted useful escalation/blocker and compliant stop with clear evidence |
+| STOP_AUTHORIZATION_WITHHELD | Otherwise accepted compliant stop lacks clear gate or claim evidence |
 | NO_VERIFIED_USEFUL_OUTCOME | No outcome-coupled efficiency credit |
 | USAGE_UNAVAILABLE, COMPARISON_UNAVAILABLE | Optional tokens missing, or unsuitable efficiency reference |
 | REPEATED_COMMAND_LOOP, HIGH_OBSERVATION_SHARE, RESOURCE_OVER_REFERENCE | Parametric repetition, observation share at least 80%, excessive effort per useful outcome |
