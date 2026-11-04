@@ -229,6 +229,13 @@ function toolOutputText(value: unknown, depth = 0): string {
     .join("\n");
 }
 
+function orchestrationFailed(value: unknown): boolean {
+  const header = typeof value === "string" ? value : Array.isArray(value)
+    ? value.find(part => part && (part.type === "input_text" || part.type === "text") && typeof part.text === "string" && part.text.length)?.text
+    : undefined;
+  return typeof header === "string" && /^(?:Script (?:failed|timed out|terminated)|Tool call failed)\b/i.test(header);
+}
+
 function normalizeText(text: string): string {
   return text.replace(/\r/g, "").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
 }
@@ -665,7 +672,7 @@ export function normalizeEventsToSession(
           const editFailed = Boolean(existing && isEditTool(existing)) &&
             /\b(?:apply_patch verification failed|failed to find expected|invalid context|patch failed|could not apply patch)\b/i.test(output);
           const failed = isOrchestration
-            ? typeof data.output === "string" && /^(?:Script (?:failed|timed out|terminated)|Tool call failed)\b/i.test(data.output)
+            ? orchestrationFailed(data.output)
             : commandResultStatus(results) === "failed" || editFailed;
           touchTurnTime(toolTurn, event.timestamp);
           addOrUpdateTool(toolTurn, {

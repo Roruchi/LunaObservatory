@@ -76,6 +76,61 @@ describe("authoritative command results", () => {
   });
 });
 
+describe("Codex wrapper failure headers", () => {
+  const shapes = (header: string): unknown[] => [
+    header,
+    [{ type: "input_text", text: header }],
+    [{ type: "text", text: header }],
+    [{ type: "input_text", text: "" }, { type: "input_text", text: header }]
+  ];
+  const patch = 'await tools.apply_patch("*** Begin Patch\\n*** End Patch");';
+
+  it.each(["Script failed: patch rejected", "Script timed out", "Script terminated", "Tool call failed"])("retains %s in string and native content-block shapes", header => {
+    for (const output of shapes(header)) {
+      const session = capture([{ name: "exec", args: patch + 'await tools.exec_command({cmd:"npm test"});', output }]);
+      const wrapper = session.turns.flatMap(turn => turn.toolCalls)[0];
+      expect(wrapper.status).toBe("failed");
+      expect(session.metrics.editAttempts).toBe(1);
+      expect(session.metrics.editCalls).toBe(0);
+      expect(session.metrics.verificationPassed).toBe(0);
+      expect(session.metrics.verificationClosure).toBe("not_applicable");
+    }
+  });
+
+  it("keeps an earlier passed verification fresh after a failed wrapped patch", () => {
+    for (const output of shapes("Script failed: patch rejected")) {
+      const session = capture([edit,
+        { name: "exec_command", args: { cmd: "npm test" }, output: envelope(0) },
+        { name: "exec", args: patch, output }
+      ]);
+      expect(session.metrics.editAttempts).toBe(2);
+      expect(session.metrics.editCalls).toBe(1);
+      expect(session.metrics.verificationClosure).toBe("passed");
+      expect(scoreSession(session).outcomeScore).toBe(80);
+    }
+  });
+
+  it("retains ordinary successful edits and ignores failure-like stdout", () => {
+    const stdout = JSON.stringify(envelope(0, undefined, "Script failed: ordinary stdout"));
+    for (const output of [
+      ...shapes("Script completed"),
+      { exit_code: 0, output: "Script failed: ordinary stdout" },
+      [{ type: "input_text", text: "Script completed" }, { type: "input_text", text: "Script failed: ordinary stdout" }],
+      [{ type: "input_text", text: "Script completed" }, { type: "input_text", text: stdout }]
+    ]) {
+      const session = capture([{ name: "exec", args: patch, output }]);
+      expect(session.turns.flatMap(turn => turn.toolCalls)[0].status).toBe("completed");
+      expect(session.metrics.editCalls).toBe(1);
+      expect(session.metrics.verificationClosure).toBe("missing");
+    }
+    const session = capture([{ name: "exec", args: patch + 'text(await tools.exec_command({cmd:"npm test"}));', output: [
+      { type: "input_text", text: "Script completed" }, { type: "input_text", text: stdout }
+    ] }]);
+    expect(session.metrics.editCalls).toBe(1);
+    expect(session.metrics.verificationClosure).toBe("passed");
+  });
+});
+
 describe("command polling identity", () => {
   it.each(["codex", "copilot"] as const)("resolves same-wrapper %s polling through the originating result", source => {
     for (const [exit, expected] of [[0, "passed"], [1, "failed"], [null, "missing"]] as const) {
