@@ -474,11 +474,22 @@ it("keeps unsupported read argument structures unknown", () => {
 
 it.each([
   ["test -f map.ts", false], ["CI=1 npm test", true], ["rtk CI=1 npm test", true],
-  ["bash -c 'CI=1 npm test'", true], ["sh -c 'CI=1 npm test'", true], ["CI=$VALUE npm test", false]
+  ["bash -c 'CI=1 npm test'", true], ["sh -c 'CI=1 npm test'", true], ["CI=$VALUE npm test", true]
 ])("uses the approved check policy in frozen Dream: %s", (cmd, verified) => {
   const session = dreamCapture("/repo/a", cmd);
   const { packet, report } = frozenVerification(session);
   expect(session.metrics.verificationClosure).toBe(verified ? "passed" : "missing");
+  expect(packet.selectedSessions[0].tasks![0].verificationChecks.length).toBe(verified ? 1 : 0);
+  expect(report.scores.find(score => score.category === "Verification quality")?.score).toBe(verified ? 5 : 0);
+});
+
+
+it.each([
+  ["ROOT=$(git rev-parse --show-toplevel) npm test", true], ["ROOT=$OTHER npm test", true],
+  ["npm test --prefix /repo/b", false], ["npm test --version", false],
+  ["node --require ./test-setup.js ./scripts/generate.js", false]
+])("uses the bounded assignment/invocation policy in frozen Dream: %s", (cmd, verified) => {
+  const { packet, report } = frozenVerification(dreamCapture("/repo/a", cmd));
   expect(packet.selectedSessions[0].tasks![0].verificationChecks.length).toBe(verified ? 1 : 0);
   expect(report.scores.find(score => score.category === "Verification quality")?.score).toBe(verified ? 5 : 0);
 });

@@ -448,7 +448,43 @@ export function resolveExecutionPath(value: unknown, base?: string): string | un
   return base ? path.posix.normalize(`${base}/${target}`).replace(/\/$/, "") : undefined;
 }
 
-function commandContext(tool: NormalizedToolCall): { command?: string; directory?: string } {
+function assignmentPrefix(command: string): { name: string; value: string | null; end: number } | undefined {
+  const name = /^([A-Za-z_]\w*)=/.exec(command);
+  if (!name) return undefined;
+  const start = name[0].length;
+  let index = start;
+  while (index < command.length && !/\s/.test(command[index])) {
+    const char = command[index];
+    if (char === "'" || char === '"') {
+      const end = literalEnd(command, index);
+      if (command[end - 1] !== char) return undefined;
+      index = end;
+    } else if (command.startsWith("$(", index)) {
+      let depth = 1;
+      index += 2;
+      while (index < command.length && depth) {
+        if (command[index] === "'" || command[index] === '"') index = literalEnd(command, index);
+        else {
+          if (command[index] === "(") depth++;
+          if (command[index] === ")") depth--;
+          index++;
+        }
+      }
+      if (depth) return undefined;
+    } else {
+      if (/[;&|<>`\\]/.test(char)) return undefined;
+      index++;
+    }
+  }
+  if (index === command.length || !command.slice(index).trim()) return undefined;
+  const raw = command.slice(start, index);
+  const value = /^[A-Za-z0-9_./:-]*$/.test(raw) ? raw
+    : /^'[^']*'$/.test(raw) || /^"[^"$`\\]*"$/.test(raw) ? raw.slice(1, -1) : null;
+  return { name: name[1], value, end: index };
+}
+
+function commandContext(tool: NormalizedToolCall): { command?: string; directory?: string; environment?: Record<string, string | null> } {
+  const environment = new Map<string, string | null>();
   let context = resolveExecutionPath(argumentString(tool.arguments, ["workdir"]), resolveExecutionPath(tool.executionCwd));
   let command = (toolCommand(tool) ?? "").trim().replace(/^rtk\s+(?:proxy\s+)?/i, "");
   const prefix = /^(?:cd|set-location)\s+(?:"([^"]+)"|'([^']+)'|([^\s;|&]+))\s*(?:&&|;)\s*/i;
@@ -457,40 +493,41 @@ function commandContext(tool: NormalizedToolCall): { command?: string; directory
   let environments = 0;
   while (true) {
     if (/^env\s/.test(command)) {
-      if (environments++) return {};
+      if (environments++) return { environment: Object.fromEntries(environment) };
       command = command.replace(/^env\s+/, "").replace(/^rtk\s+(?:proxy\s+)?/i, "");
-      if (/^-/.test(command)) return {};
+      if (/^-/.test(command)) return { environment: Object.fromEntries(environment) };
       continue;
     }
-    const assignments = /^(?:[A-Za-z_]\w*=(?:"[A-Za-z0-9_./:-]*"|'[A-Za-z0-9_./:-]*'|[A-Za-z0-9_./:-]+)\s+)+/.exec(command);
-    if (assignments) {
-      command = command.slice(assignments[0].length).replace(/^rtk\s+(?:proxy\s+)?/i, "");
+    const assignment = assignmentPrefix(command);
+    if (assignment) {
+      environment.set(assignment.name, assignment.value);
+      command = command.slice(assignment.end).trimStart().replace(/^rtk\s+(?:proxy\s+)?/i, "");
       continue;
     }
-    if (/^[A-Za-z_]\w*=/.test(command)) return {};
+    if (/^[A-Za-z_]\w*=/.test(command)) return { environment: Object.fromEntries(environment) };
     match = /^(?:\/(?:usr\/)?bin\/)?(?:bash|sh)\s+-(?:lc|cl|c)\s+(?:'([^']*)'|"([^"]*)")\s*$/i.exec(command);
     if (match) {
-      if (shells++) return {};
+      if (shells++) return { environment: Object.fromEntries(environment) };
       command = (match[1] ?? match[2]).trim().replace(/^rtk\s+(?:proxy\s+)?/i, "");
       continue;
     }
-    if (/[$`]/.test(command)) return { command };
+    if (/[$`]/.test(command)) return { command, environment: Object.fromEntries(environment) };
     match = prefix.exec(command);
     if (!match) break;
     const directory = match[1] ?? match[2] ?? match[3];
-    if (directory === "-" || /[*?{}]/.test(directory)) return { command };
+    if (directory === "-" || /[*?{}]/.test(directory)) return { command, environment: Object.fromEntries(environment) };
     context = resolveExecutionPath(directory, context);
     command = command.slice(match[0].length).replace(/^rtk\s+(?:proxy\s+)?/i, "");
   }
-  if (/(?:^|[\s;&|])(?:\/(?:usr\/)?bin\/)?(?:bash|sh|zsh|pwsh|powershell|cmd)(?:\s|$)/i.test(command)) return {};
-  if (/\b(?:cd|set-location|pushd|popd|source|eval)\s/i.test(command)) return {};
+  if (/(?:^|[\s;&|])(?:\/(?:usr\/)?bin\/)?(?:bash|sh|zsh|pwsh|powershell|cmd)(?:\s|$)/i.test(command)) return { environment: Object.fromEntries(environment) };
+  if (/\b(?:cd|set-location|pushd|popd|source|eval)\s/i.test(command)) return { environment: Object.fromEntries(environment) };
   match = /^git\s+-C\s+(?:"([^"]+)"|'([^']+)'|([^\s;|&]+))/i.exec(command);
   if (match) {
     const directory = match[1] ?? match[2] ?? match[3];
-    if (/[*?{}]/.test(directory)) return { command };
+    if (/[*?{}]/.test(directory)) return { command, environment: Object.fromEntries(environment) };
     context = resolveExecutionPath(directory, context);
   }
-  return { command, directory: context };
+  return { command, directory: context, environment: Object.fromEntries(environment) };
 }
 
 export function executionDirectory(tool: NormalizedToolCall): string | undefined {
@@ -499,6 +536,10 @@ export function executionDirectory(tool: NormalizedToolCall): string | undefined
 
 export function verificationCommand(tool: NormalizedToolCall): string | undefined {
   return commandContext(tool).command;
+}
+
+export function commandEnvironment(tool: NormalizedToolCall): Record<string, string | null> {
+  return commandContext(tool).environment ?? {};
 }
 
 export function executionScope(tool: NormalizedToolCall): string | undefined {
@@ -577,18 +618,24 @@ export function commandCheckType(tool: NormalizedToolCall): CommandCheckType | u
   if (executable === "npx") executable = words.shift();
   let action = executable ?? "";
   if (["npm", "pnpm", "yarn", "bun"].includes(action)) {
-    action = words[0] === "run" ? words[1] ?? "" : words[0] ?? "";
+    const scriptIndex = words[0] === "run" ? 1 : 0;
+    action = words[scriptIndex] ?? "";
+    const args = words.slice(scriptIndex + 1);
+    if (args.some((word, index) => word.startsWith("-") && !(index === 0 && word === "--"))) return undefined;
     if (action === "test") return "test";
   }
   else if (["node", "python", "python3", "pwsh", "powershell"].includes(action)) {
-    if (action === "node" && words[0] === "--check") return "build";
-    if (action === "node" && words[0] === "--test") return "test";
-    if (["-e", "--eval", "-c"].includes(words[0])) return undefined;
-    action = words.find(word => !word.startsWith("-"))?.split("/").at(-1) ?? "";
+    if (action === "node" && ["--check", "--test"].includes(words[0])) {
+      if (words.slice(1).some(word => word.startsWith("-"))) return undefined;
+      return words[0] === "--check" ? "build" : "test";
+    }
+    if (words.some(word => word.startsWith("-"))) return undefined;
+    action = words[0]?.split("/").at(-1) ?? "";
   } else if (action === "git") {
     const args = words[0] === "-c" ? words.slice(2) : words;
     return args[0] === "diff" && args.includes("--check") ? "diff_check" : undefined;
   } else if (["cargo", "go", "dotnet", "mvn", "gradle", "gradlew"].includes(action)) return words[0] === "test" ? "test" : words[0] === "build" ? "build" : undefined;
+  if (words.some(word => word.startsWith("-") && !(action === "tsc" && word === "--noemit") && !(action === "godot" && word === "--headless"))) return undefined;
   if (/^(?:pandoc|mkdocs|sphinx-build|render_docx|export_whitepaper|docs?:build|build[-_:]?(?:docs?|document|whitepaper))(?:\.|$|[-_:])/.test(action)) return "document_build";
   if (/^(?:typecheck|type-check|tsc|mypy)(?:$|[-_:.])/.test(action)) return "typecheck";
   if (/^(?:test(?=[-_.:])|vitest|pytest|jest|gut)(?:$|[-_:.])/.test(action)) return "test";

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import { discoverSources } from "../fs/discovery.js";
 import { createSessionParser } from "../normalize/parser.js";
-import { expandToolCalls, isCommandTool, toolCommand, isEditTool, editTargets, executionDirectory } from "../normalize/toolSemantics.js";
+import { expandToolCalls, isCommandTool, toolCommand, isEditTool, editTargets, executionDirectory, commandEnvironment } from "../normalize/toolSemantics.js";
 import type { NormalizedSession } from "../normalize/types.js";
 import { correlateTraceDirectory, taskRecordsSchema, type Correlation, type TaskRecord } from "../correlation/index.js";
 import type { RequestedSource } from "../sources/types.js";
@@ -82,6 +82,8 @@ export function generateWorkerReportCards(sessions: NormalizedSession[], records
       const commands = operations.filter(isCommandTool);
       const knownCommands = commands.filter(tool => Boolean(toolCommand(tool)?.trim())).length;
       const knownContexts = commands.filter(tool => executionDirectory(tool) !== undefined).length;
+      const assignmentValues = commands.flatMap(tool => Object.values(commandEnvironment(tool)));
+      const unknownAssignments = assignmentValues.filter(value => value === null).length;
       const edits = operations.filter(isEditTool);
       const knownTargets = edits.filter(tool => { const targets = editTargets(tool); return targets.length > 0 && targets.every(target => Boolean(target?.trim())); }).length;
       const models = Object.keys(metrics.models).map(safe).join(", ") || "unknown";
@@ -100,6 +102,7 @@ export function generateWorkerReportCards(sessions: NormalizedSession[], records
         `| Edits / commands | ${metrics.editCalls} successful direct/expanded edits; ${metrics.commandCalls} recognized command operations; shell-driven edits may be unobserved |`,
         `| Command extraction | ${knownCommands} known; ${commands.length - knownCommands} unknown |`,
         `| Command execution context | ${knownContexts} known; ${commands.length - knownContexts} unknown |`,
+        `| Environment assignment values | ${assignmentValues.length - unknownAssignments} known; ${unknownAssignments} unknown |`,
         `| Edit target extraction | ${knownTargets} known; ${edits.length - knownTargets} unknown |`,
         `| Verification | ${metrics.verificationEvents} recognized operations; ${metrics.verificationPassed} recorded successes; ${metrics.verificationFailed} failures; post-edit closure: ${safe(metrics.verificationClosure)} |`,
         `| Outcome | **Unscored / low confidence**: native lifecycle ${safe(session.lifecycleStatus)}; final answer ${session.finalAnswer?.text ? "present" : "absent"}; accepted work not assessed |`,

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { normalizeEventsToSession } from "../src/normalize/sessions.js";
-import { expandToolCalls, executionDirectory, verificationLaneKey, looksLikeVerificationTool, isCommandTool, toolCommand } from "../src/normalize/toolSemantics.js";
+import { expandToolCalls, executionDirectory, verificationLaneKey, looksLikeVerificationTool, isCommandTool, toolCommand, commandEnvironment, verificationCommand } from "../src/normalize/toolSemantics.js";
 import { scoreSession } from "../src/scoring/score.js";
 import type { RawLogEvent } from "../src/normalize/types.js";
 
@@ -467,10 +467,59 @@ describe("approved literal environment prefixes", () => {
     }
   });
 
-  it.each(["CI=$VALUE npm test", "rtk CI=$(value) npm test", "bash -c 'CI=$VALUE npm test'", "env CI=$VALUE npm test"])("leaves dynamic prefixes unknown: %s", cmd => {
+  it.each(["CI=$VALUE npm test", "rtk CI=$(value) npm test", "bash -c 'CI=$VALUE npm test'", "env CI=$VALUE npm test"])("retains commands with opaque assignment values: %s", cmd => {
     const session = capture([edit, { name: "exec_command", args: { cmd }, output: envelope(0) }]);
     const check = session.turns.flatMap(turn => turn.toolCalls).at(-1)!;
-    expect(executionDirectory(check)).toBeUndefined();
-    expect(session.metrics.verificationClosure).toBe("missing");
+    expect(executionDirectory(check)).toBe("/repo/a");
+    expect(verificationCommand(check)).toBe("npm test");
+    expect(commandEnvironment(check)).toEqual({ CI: null });
+    expect(session.metrics.verificationClosure).toBe("passed");
+  });
+});
+
+
+describe("bounded opaque assignment evidence", () => {
+  it.each([
+    'ROOT=$(git rev-parse --show-toplevel) npm test', 'ROOT=$OTHER npm test',
+    'ROOT="$(git rev-parse --show-toplevel)" npm test', 'ROOT="$OTHER" npm test',
+    'rtk ROOT=$(git rev-parse --show-toplevel) npm test',
+    "env ROOT=$OTHER npm test", "bash -c 'ROOT=$OTHER npm test'", "sh -c 'ROOT=$OTHER npm test'"
+  ])("keeps the safe command body and unknown value: %s", cmd => {
+    for (const nested of [false, true]) for (const workdir of [undefined, "/repo/a", "/repo/b"]) {
+      const args = { cmd, workdir };
+      const call = nested ? wrapped(`text(await tools.exec_command(${JSON.stringify(args)}));`, [envelope(0)])
+        : { name: "exec_command", args, output: envelope(0) };
+      const session = capture([edit, call]);
+      const check = expandToolCalls(session.turns.flatMap(turn => turn.toolCalls)).find(tool => tool.name === "exec_command")!;
+      expect(verificationCommand(check)).toBe("npm test");
+      expect(commandEnvironment(check)).toEqual({ ROOT: null });
+      expect(executionDirectory(check)).toBe(workdir ?? "/repo/a");
+      expect(session.metrics.verificationClosure).toBe(workdir === "/repo/b" ? "missing" : "passed");
+    }
+  });
+
+  it("records literal and opaque values independently", () => {
+    const session = capture([{ name: "exec_command", args: { cmd: "CI=1 ROOT=$OTHER npm test" }, output: envelope(0) }]);
+    const check = session.turns.flatMap(turn => turn.toolCalls)[0];
+    expect(commandEnvironment(check)).toEqual({ CI: "1", ROOT: null });
+    expect(verificationCommand(check)).toBe("npm test");
+  });
+});
+
+describe("unsupported invocation options", () => {
+  it.each([
+    "npm test --prefix /repo/b", "npm test --version", "npm run build --version", "npm test -- --version",
+    "node --require ./test-setup.js ./scripts/generate.js", "node --test --version", "pytest --version", "tsc --help",
+    "VALUE=$(npm test) echo done", "VALUE=$OTHER rg -n pytest README.md"
+  ])("does not award verification for unsupported forms: %s", cmd => {
+    for (const nested of [false, true]) {
+      const call = nested ? wrapped(`text(await tools.exec_command(${JSON.stringify({ cmd })}));`, [envelope(0)])
+        : { name: "exec_command", args: { cmd }, output: envelope(0) };
+      const session = capture([edit, call]);
+      session.lifecycleStatus = "completed";
+      expect(session.metrics.verificationEvents).toBe(0);
+      expect(session.metrics.verificationClosure).toBe("missing");
+      expect(scoreSession(session).outcomeScore).toBe(50);
+    }
   });
 });

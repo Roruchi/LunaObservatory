@@ -119,3 +119,18 @@ it("reports extraction and context coverage without command or patch text", () =
   expect(card).not.toContain("dynamicPatch");
   expect(card).not.toContain("dynamicCommand");
 });
+
+
+it("keeps opaque environment values separate from command evidence without exposing values", () => {
+  const session = parseSessionFile(path.resolve("tests/fixtures/claude-streaming.jsonl"), "claude").session;
+  const check = session.turns.flatMap(turn => turn.toolCalls).find(tool => tool.name === "Bash")!;
+  check.arguments = { command: "SECRET=$PRIVATE npm test" };
+  session.metrics = calculateMetrics(session);
+  expect(session.metrics.verificationEvents).toBe(1);
+  expect(session.metrics.verificationClosure).toBe("passed");
+  const card = generateWorkerReportCards([session], [task], [correlateSession(session, [task])]);
+  expect(card).toContain("| Command extraction | 1 known; 0 unknown |");
+  expect(card).toContain("| Environment assignment values | 0 known; 1 unknown |");
+  expect(card).not.toContain("SECRET");
+  expect(card).not.toContain("PRIVATE");
+});
