@@ -2,7 +2,7 @@ import type { SourceName } from "../sources/types.js";
 import { stableId } from "../utils/stableId.js";
 import { durationMs, maxIso, minIso } from "../utils/time.js";
 import { calculateMetrics, reported, unavailable } from "./metrics.js";
-import { commandOutputStatus, isCommandTool, isEditTool, orchestrationScript } from "./toolSemantics.js";
+import { commandResults, commandResultStatus, isCommandTool, isEditTool, orchestrationScript } from "./toolSemantics.js";
 import type {
   EvidenceRef,
   NormalizedAssistantMessage,
@@ -223,9 +223,8 @@ function toolOutputText(value: unknown, depth = 0): string {
   if (Array.isArray(value)) return value.map((item) => toolOutputText(item, depth + 1)).filter(Boolean).join("\n");
   if (typeof value !== "object") return String(value);
   const record = value as Record<string, unknown>;
-  const metadata = Object.fromEntries(["exit_code", "session_id"].filter((key) => key in record).map((key) => [key, record[key]]));
-  return [Object.keys(metadata).length ? JSON.stringify(metadata) : "", ...["text", "value", "output", "result", "content"]
-    .map((key) => toolOutputText(record[key], depth + 1))]
+  return ["text", "value", "output", "result", "content"]
+    .map((key) => toolOutputText(record[key], depth + 1))
     .filter(Boolean)
     .join("\n");
 }
@@ -660,20 +659,23 @@ export function normalizeEventsToSession(
         if (toolCallId) {
           const toolTurn = findTurnByToolCall(turns, [toolCallId]) ?? turn;
           const output = toolOutputText(data.output);
+          const results = commandResults(data.output);
           const existing = toolTurn.toolMap.get(toolCallId);
           const isOrchestration = Boolean(existing && orchestrationScript(existing));
           const editFailed = Boolean(existing && isEditTool(existing)) &&
             /\b(?:apply_patch verification failed|failed to find expected|invalid context|patch failed|could not apply patch)\b/i.test(output);
           const failed = isOrchestration
-            ? /\bScript (?:failed|timed out|terminated)\b|\bTool call failed\b/i.test(output)
-            : commandOutputStatus(output) === "failed" || editFailed;
+            ? typeof data.output === "string" && /^(?:Script (?:failed|timed out|terminated)|Tool call failed)\b/i.test(data.output)
+            : commandResultStatus(results) === "failed" || editFailed;
           touchTurnTime(toolTurn, event.timestamp);
           addOrUpdateTool(toolTurn, {
             toolCallId,
             name: toolTurn.toolMap.get(toolCallId)?.name ?? "unknown",
             executionEndedAt: event.timestamp,
             outputText: output,
-            status: failed ? "failed" : commandOutputStatus(output) === "requested" ? "requested" : "completed",
+            commandResults: results,
+            status: failed ? "failed" : existing && isCommandTool(existing) && !isOrchestration
+              ? commandResultStatus(results) : "completed",
             evidence: output
               ? [evidence(event, "data.output", `${failed ? "failed" : "completed"} output: ${excerpt(output, 220)}`)]
               : undefined
@@ -775,12 +777,15 @@ export function normalizeEventsToSession(
       const existing = turn.toolMap.get(toolCallId);
       const existingArguments = existing?.arguments;
       const output = toolOutputText(data.result ?? data.output);
-      const resultStatus = existing && isCommandTool(existing) && !orchestrationScript(existing) ? commandOutputStatus(output) : "completed";
+      const results = commandResults(data.result ?? data.output);
+      const resultStatus = existing && isCommandTool(existing) && !orchestrationScript(existing) && results.length
+        ? commandResultStatus(results) : "completed";
       addOrUpdateTool(turn, {
         toolCallId,
         name: stringValue(data.toolName) ?? turn.toolMap.get(toolCallId)?.name ?? "unknown",
         arguments: existingArguments,
         outputText: output,
+        commandResults: results,
         executionEndedAt: event.timestamp,
         status: failed ? "failed" : resultStatus
       });

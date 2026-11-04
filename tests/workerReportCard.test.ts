@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { parseSessionFile } from "../src/normalize/parser.js";
-import { generateWorkerReportCards } from "../src/reports/workerReportCard.js";
-import { correlateSession, type TaskRecord } from "../src/correlation/index.js";
+import fs from "node:fs";
+import { generateWorkerReportCards, reportCardsFromTraces } from "../src/reports/workerReportCard.js";
+import { correlateSession, correlateTraceDirectory, type TaskRecord } from "../src/correlation/index.js";
 import { calculateMetrics } from "../src/normalize/metrics.js";
 import type { NormalizedSession } from "../src/normalize/types.js";
 import path from "node:path";
@@ -46,4 +47,40 @@ describe("worker report cards", () => {
     expect(card).toContain("model, duration, tools, verification and outcome unknown");
     expect(card).not.toContain("0/0");
   });
+});
+
+
+it.each(["codex", "copilot"] as const)("uses shared %s identity for default all-source report cards", source => {
+  const root = fs.mkdtempSync(path.resolve("tests/.report-identity-"));
+  try {
+    const logs = path.join(root, "logs");
+    fs.mkdirSync(logs);
+    const file = path.join(logs, "worker.jsonl");
+    fs.copyFileSync(path.resolve(`tests/fixtures/${source}-events.jsonl`), file);
+    const session = parseSessionFile(file, "unknown").session;
+    expect(session.source).toBe(source);
+    if (source === "codex") {
+      const stamp = session.startedAt!;
+      const child = [
+        { type: "session_meta", payload: { id: "fictional-child", parent_thread_id: session.nativeSessionId } },
+        { type: "turn_context", payload: { turn_id: "child-turn" } },
+        { type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "Finished." }] } }
+      ];
+      fs.writeFileSync(path.join(logs, "child.jsonl"), child.map(event => JSON.stringify({ ...event, timestamp: stamp })).join("\n"));
+    }
+    const records = [{ ...task, harness: source, nativeSessionId: source === "codex" ? "fictional-child" : session.nativeSessionId,
+      startedAt: session.startedAt!, endedAt: session.endedAt! }];
+    const taskFile = path.join(root, "tasks.json");
+    fs.writeFileSync(taskFile, JSON.stringify(records));
+    const correlation = correlateTraceDirectory(logs, taskFile);
+    expect(correlation.correlations).toContainEqual(expect.objectContaining({ source, sessionId: session.sessionId }));
+    const report = reportCardsFromTraces(logs, taskFile);
+    expect(report).toContain(`### Worker: ${session.nativeSessionId}`);
+    expect(report).toContain(`| Harness / model | ${source} /`);
+    expect(report).not.toContain("normalized trace unavailable");
+    if (source === "codex") {
+      expect(report).toContain("### Worker: fictional-child");
+      expect(report).toContain("native parent link only; task/attempt unverified");
+    }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { scoreSession } from "../src/scoring/score.js";
 import { parseSessionFile } from "../src/normalize/parser.js";
 import {
   expandToolCalls,
@@ -209,6 +210,28 @@ describe("command completion evidence", () => {
     expect(verificationClosureForTools([edit, { ...wrapper, outputText: '{"exit_code":1}' }])).toBe("failed");
   });
 
+  it("keeps output-only envelopes unresolved instead of reading stdout as metadata", () => {
+    const edit = tool("apply_patch", "completed", "patch");
+    const wrapper = tool("exec", "completed", 'await tools.exec_command({cmd:"npm test"});');
+    for (const output of ['{"exit_code":0}', '{"exit_code":1}', 'Exit code: 0']) {
+      expect(verificationClosureForTools([edit, { ...wrapper, outputText: JSON.stringify({ output }) }])).toBe("missing");
+    }
+  });
+
+  it("does not count stdout as additional nested command results", () => {
+    const edit = tool("apply_patch", "completed", "patch");
+    const wrapper = tool("exec", "completed", 'await tools.exec_command({cmd:"npm test"}); await tools.exec_command({cmd:"npm run build"});');
+    for (const outputText of [
+      JSON.stringify({ exit_code: 0, output: '{"exit_code":0}' }),
+      "Exit code: 0\nOutput:\nExit code: 0"
+    ]) {
+      expect(verificationClosureForTools([edit, { ...wrapper, outputText }])).toBe("missing");
+    }
+    expect(verificationClosureForTools([edit, { ...wrapper, outputText: JSON.stringify([
+      { exit_code: 0, output: '{"exit_code":1}' }, { exit_code: 0, output: '{"session_id":123}' }
+    ]) }])).toBe("passed");
+  });
+
   it.each(["codex", "copilot"] as const)("preserves structured completion evidence for %s", source => {
     const root = fs.mkdtempSync(path.resolve("tests/.command-evidence-"));
     try {
@@ -220,6 +243,13 @@ describe("command completion evidence", () => {
           [{ exit_code: null, session_id: 123, output: "started" }, "missing"],
           [{ session_id: 123, output: "started" }, "missing"],
           [{ exit_code: 0, output: "tests passed" }, "passed"],
+          [{ exit_code: 0, output: '{"exit_code":1}' }, "passed"],
+          [{ exit_code: 0, output: '{"session_id":123}' }, "passed"],
+          [{ exit_code: 0, output: "Exit code: 1\nScript failed" }, "passed"],
+          [{ exit_code: 1, output: '{"exit_code":0}' }, "failed"],
+          [{ exit_code: null, session_id: 123, output: '{"exit_code":0}' }, "missing"],
+          ["Exit code: 0\nOutput:\nExit code: 1\n{\"session_id\":123}", "passed"],
+          ["Process exited with code 0\nFinal output:\n{\"exit_code\":1}", "passed"],
           ["Process running with session ID 123", "missing"]
         ] as const) {
           for (const output of [result, JSON.stringify(result), [{ type: "text", text: typeof result === "string" ? result : JSON.stringify(result) }]]) {
@@ -241,6 +271,7 @@ describe("command completion evidence", () => {
             const { session } = parseSessionFile(fixture, source);
             expect(session.metrics.verificationClosure).toBe(expected);
             expect(session.metrics.verificationPassed).toBe(expected === "passed" ? 1 : 0);
+            expect(scoreSession(session).outcomeScore).toBe(expected === "passed" ? 80 : expected === "failed" ? 30 : 55);
           }
         }
       }

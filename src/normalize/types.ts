@@ -116,6 +116,7 @@ export type NormalizedToolCall = {
   executionStartedAt?: string;
   executionEndedAt?: string;
   outputText?: string;
+  commandResults?: ("completed" | "failed" | "requested")[];
   status: "requested" | "started" | "completed" | "failed" | "unknown";
   evidence?: EvidenceRef[];
 };

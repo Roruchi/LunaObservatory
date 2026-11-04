@@ -138,10 +138,6 @@ export function correlateTraceDirectory(logs: string, taskFile: string, source: 
     const parsed = parseSession(file, discovered.source);
     parseErrors += parsed.parseErrors;
     const session = parsed.session;
-    if (session.source === "unknown") {
-      const events = readJsonl(file).events;
-      session.source = events.some(event => event.type === "session_meta") ? "codex" : events.some(event => event.type.startsWith("assistant.")) ? "copilot" : "unknown";
-    }
     const key = `${session.source}:${session.sessionId}`;
     const digest = parsed.traceDigest ?? createHash("sha256").update(fs.readFileSync(file)).digest("hex");
     const previous = sessions.get(key);

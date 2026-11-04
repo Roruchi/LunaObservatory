@@ -170,9 +170,30 @@ function isSemanticOperationName(name: string): boolean {
   return isDirectView(name) || isDirectGlob(name) || isDirectSearch(name) || isDirectEdit(name) || isDirectCommand(name);
 }
 
-export function commandOutputStatus(output: string): NormalizedToolCall["status"] {
-  if (/Exit code:\s*(?!0\b)-?\d+|"exit_code"\s*:\s*(?!0\b)-?\d+/i.test(output)) return "failed";
-  if (/Script running with cell ID|Process running with session ID|"session_id"\s*:\s*\d+|"exit_code"\s*:\s*null/i.test(output)) return "requested";
+export function commandResults(value: unknown): NonNullable<NormalizedToolCall["commandResults"]> {
+  if (Array.isArray(value)) return value.flatMap(commandResults);
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    if ("exit_code" in record || "session_id" in record) {
+      if (typeof record.exit_code === "number") return [record.exit_code === 0 ? "completed" : "failed"];
+      return ["requested"];
+    }
+    return ["text", "value", "result", "content"].flatMap(key => commandResults(record[key]));
+  }
+  if (typeof value !== "string") return [];
+  try { return commandResults(JSON.parse(value)); } catch {}
+  const header = value.split(/^(?:Final output|Output):[^\S\r\n]*$/im)[0];
+  return header.split(/\r?\n/).flatMap(line => {
+    try { return commandResults(JSON.parse(line)); } catch {}
+    const exit = /^(?:Exit code:|Process exited with code)\s*(-?\d+)\s*$/i.exec(line);
+    if (exit) return [Number(exit[1]) === 0 ? "completed" as const : "failed" as const];
+    return /^(?:Script running with cell ID|Process running with session ID)\b/i.test(line) ? ["requested" as const] : [];
+  });
+}
+
+export function commandResultStatus(results: NonNullable<NormalizedToolCall["commandResults"]>): NormalizedToolCall["status"] {
+  if (results.includes("failed")) return "failed";
+  if (!results.length || results.includes("requested")) return "requested";
   return "completed";
 }
 
@@ -181,11 +202,10 @@ function nestedOperations(tool: NormalizedToolCall): NormalizedToolCall[] {
   if (!script) return [tool];
   const matches = scriptCalls(script);
   const nestedCommandCount = matches.filter((match) => isDirectCommand(match.name)).length;
-  const wrapperFailed = tool.status === "failed" || commandOutputStatus(tool.outputText ?? "") === "failed";
-  const output = tool.outputText ?? "";
-  const resultCount = [...output.matchAll(/Exit code:\s*-?\d+|"exit_code"\s*:\s*-?\d+/gi)].length;
+  const results = tool.commandResults ?? commandResults(tool.outputText);
+  const wrapperFailed = tool.status === "failed" || results.includes("failed");
   // A wrapper finishing does not prove that every nested command finished.
-  const partial = commandOutputStatus(output) === "requested" || resultCount < nestedCommandCount;
+  const partial = results.includes("requested") || results.length < nestedCommandCount;
   const operations: NormalizedToolCall[] = [];
   for (let index = 0; index < matches.length; index += 1) {
     const name = matches[index].name;
