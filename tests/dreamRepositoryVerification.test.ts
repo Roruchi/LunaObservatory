@@ -437,3 +437,15 @@ it.each(["Edit", "Write"])("checks native Claude %s targets before awarding veri
     }
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+
+it("does not turn unsupported orchestration into frozen Dream verification", () => {
+  const session = captureVerificationCalls([
+    { name: "apply_patch", args: "*** Begin Patch\n*** Update File: map.ts\n*** End Patch", output: "Done" },
+    { name: "exec", args: 'text(await tools.web__run({search_query:[{q:"pytest npm test tsc"}]}));', output: JSON.stringify({ exit_code: 0, output: "pytest" }) }
+  ]);
+  const { packet, report } = frozenVerification(session);
+  expect(packet.selectedSessions[0].tasks![0].verificationChecks).toEqual([]);
+  expect(session.metrics.verificationEvents).toBe(0);
+  expect(report.scores.find(score => score.category === "Verification quality")?.score).toBe(0);
+});

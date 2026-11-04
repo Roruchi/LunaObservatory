@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { normalizeEventsToSession } from "../src/normalize/sessions.js";
-import { expandToolCalls, executionDirectory, verificationLaneKey, looksLikeVerificationTool } from "../src/normalize/toolSemantics.js";
+import { expandToolCalls, executionDirectory, verificationLaneKey, looksLikeVerificationTool, isCommandTool, toolCommand } from "../src/normalize/toolSemantics.js";
 import { scoreSession } from "../src/scoring/score.js";
 import type { RawLogEvent } from "../src/normalize/types.js";
 
@@ -351,4 +351,53 @@ it("preserves unresolved nested edit target expressions", () => {
   }
   const genuine = capture([wrapped('await tools.write_file({path:"map.ts",content:"changed"}); text(await tools.exec_command({cmd:"npm test"}));', [envelope(0)])]);
   expect(genuine.metrics.verificationClosure).toBe("passed");
+});
+
+
+describe("orchestration is not shell text", () => {
+  it.each(["codex", "copilot"] as const)("does not certify unsupported-only %s wrappers", source => {
+    for (const name of ["exec", "functions.exec", "exec_command"]) for (const query of ["pytest documentation", "npm test", "tsc --noEmit"]) {
+      const script = `text(await tools.web__run({search_query:[{q:${JSON.stringify(query)}}]}));`;
+      const session = capture([edit, { name, args: script, output: JSON.stringify({ exit_code: 0, output: query }) }], source);
+      session.lifecycleStatus = "completed";
+      const wrapper = session.turns.flatMap(turn => turn.toolCalls).at(-1)!;
+      expect(isCommandTool(wrapper)).toBe(false);
+      expect(toolCommand(wrapper)).toBeUndefined();
+      expect(session.metrics.commandCalls).toBe(0);
+      expect(session.metrics.verificationEvents).toBe(0);
+      expect(session.metrics.verificationClosure).toBe("missing");
+      expect(scoreSession(session).outcomeScore).toBe(50);
+    }
+    for (const script of ['text("pytest npm test tsc");', 'text(await tools.unsupported({command:"pytest"}));']) {
+      const session = capture([edit, wrapped(script, [envelope(0, undefined, "npm test")])], source);
+      expect(session.metrics.verificationEvents).toBe(0);
+      expect(session.metrics.verificationClosure).toBe("missing");
+    }
+  });
+
+  it.each(["codex", "copilot"] as const)("exposes only genuine shell operations from mixed %s wrappers", source => {
+    for (const exit of [0, 1]) {
+      const session = capture([edit, wrapped('text(await tools.web__run({search_query:[{q:"pytest npm test tsc"}]})); text(await tools.exec_command({cmd:"npm test"}));', [{ title: "documentation" }, envelope(exit)])], source);
+      const original = session.turns.flatMap(turn => turn.toolCalls).at(-1)!;
+      expect(isCommandTool(original)).toBe(false);
+      expect(toolCommand(original)).toBeUndefined();
+      const commands = expandToolCalls([original]).filter(isCommandTool);
+      expect(commands.map(toolCommand)).toEqual(["npm test"]);
+      expect(session.metrics.commandCalls).toBe(1);
+      expect(session.metrics.verificationEvents).toBe(1);
+      expect(session.metrics.verificationPassed).toBe(exit === 0 ? 1 : 0);
+      expect(session.metrics.verificationClosure).toBe(exit === 0 ? "passed" : "failed");
+    }
+  });
+
+  it.each(["Bash", "shell_command", "exec_command"])("preserves direct native %s shell strings", name => {
+    const session = capture([edit, { name, args: "npm test", output: envelope(0) }]);
+    const command = session.turns.flatMap(turn => turn.toolCalls).at(-1)!;
+    expect(isCommandTool(command)).toBe(true);
+    expect(toolCommand(command)).toBe("npm test");
+    expect(session.metrics.verificationClosure).toBe("passed");
+    const quoted = { ...command, arguments: 'echo "tools.exec_command({cmd: fake})"' };
+    expect(isCommandTool(quoted)).toBe(true);
+    expect(toolCommand(quoted)).toBe(quoted.arguments);
+  });
 });

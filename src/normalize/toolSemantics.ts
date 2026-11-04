@@ -148,7 +148,7 @@ function embeddedPatch(value: string): string | undefined {
 
 export function orchestrationScript(tool: NormalizedToolCall): string | undefined {
   const name = baseToolName(tool.name);
-  return (name === "exec" || name === "exec_command") && typeof tool.arguments === "string" && /\btools\.[\w_]+\s*\(/.test(tool.arguments)
+  return typeof tool.arguments === "string" && (name === "exec" || name === "exec_command" && scriptCalls(tool.arguments).length > 0)
     ? tool.arguments
     : undefined;
 }
@@ -485,8 +485,7 @@ export function isEditTool(tool: NormalizedToolCall): boolean {
 }
 
 export function isCommandTool(tool: NormalizedToolCall): boolean {
-  if (orchestrationScript(tool)) return nestedOperations(tool).some((operation) => operation !== tool && isDirectCommand(operation.name));
-  return isDirectCommand(tool.name);
+  return !orchestrationScript(tool) && isDirectCommand(tool.name);
 }
 
 export function looksLikeVerificationTool(tool: NormalizedToolCall): boolean {
