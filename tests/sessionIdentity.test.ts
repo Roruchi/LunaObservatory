@@ -25,6 +25,20 @@ function scan(logs: string, out: string) {
 }
 
 describe("session identity boundaries", () => {
+  it("filters nested Windows working directories through the CLI", () => {
+    const root = path.join(directory, "windows-repo-filter");
+    fs.mkdirSync(path.join(root, ".git"), { recursive: true });
+    const logs = path.join(root, "session.jsonl");
+    const repo = "C:\\Repo\\Personal\\LunaObservatory";
+    write(logs, rows().map(row => ({ ...row, cwd: `${repo}\\src` })));
+    const out = path.join(root, "out");
+    const stdout = execFileSync(process.execPath, [path.join(dist, "cli.js"), "scan", "--source", "claude", "--logs", logs, "--repo", repo, "--out", out], { cwd: root, encoding: "utf8" });
+    const sessions = fs.readFileSync(path.join(out, "index", "sessions.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]).toMatchObject({ repoMatch: "matched", repoRoot: repo });
+    expect(stdout).toContain("Included sessions: 1");
+    expect(stdout).toContain("Excluded sessions: 0");
+  });
   it("writes and scores an identical Claude session only once", () => {
     const logs = path.join(directory, "identical"); fs.mkdirSync(logs);
     for (const name of ["a", "b"]) fs.copyFileSync(fixture, path.join(logs, `${name}.jsonl`));

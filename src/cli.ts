@@ -26,6 +26,7 @@ import { scoreSession, type InefficiencyScore } from "./scoring/score.js";
 import { installDreamSkill, type SkillAgent } from "./skills/install.js";
 import type { RequestedSource } from "./sources/types.js";
 import { correlateTraceDirectory } from "./correlation/index.js";
+import { pathStyle } from "./utils/pathMatch.js";
 
 function numberOption(value: string): number {
   const parsed = Number(value);
@@ -77,7 +78,7 @@ function scan(options: {
   top: number;
 }): void {
   const outputRoot = detectRepoRoot();
-  const repoRoot = options.repo ? path.resolve(options.repo) : outputRoot;
+  const repoRoot = options.repo ? pathStyle(options.repo).resolve(options.repo) : outputRoot;
   initProject(outputRoot, options.out);
   const paths = getLunaObsPaths(outputRoot, options.out);
   const discovered = discoverSources(options.source, options.logs);
