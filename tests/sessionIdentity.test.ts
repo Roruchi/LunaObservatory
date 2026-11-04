@@ -59,11 +59,11 @@ describe("session identity boundaries", () => {
     expect(correlation).toHaveLength(1);
     expect(correlation[0].reasons).toEqual(["conflicting_session_copies"]);
   });
-  it("orders a later suffix and a complete copy chronologically before extracting evidence", () => {
-    const logs = path.join(directory, "chronology"); fs.mkdirSync(logs);
+  it.each([[false, false], [true, false], [true, true]])("orders overlapping copies before extracting evidence (tied: %s, partial: %s)", (tied, partial) => {
+    const logs = path.join(directory, `chronology-${tied}-${partial}`); fs.mkdirSync(logs);
     const base = { sessionId: "fictional-chronology", cwd: "/fictional/repo", gitBranch: "fm/fictional-nebula" };
     const history = [0, 1].flatMap(index => {
-      const stamp = (offset: number) => `2026-01-01T10:00:0${index * 4 + offset}Z`;
+      const stamp = (offset: number) => `2026-01-01T10:00:0${tied ? 0 : index * 4 + offset}Z`;
       return [
         { ...base, type: "user", uuid: `user-${index}`, timestamp: stamp(0), message: { content: index ? "Later instruction" : "First instruction" } },
         ...(index ? [] : [
@@ -76,15 +76,31 @@ describe("session identity boundaries", () => {
       ];
     });
     const suffix = path.join(logs, "a.jsonl"); const complete = path.join(logs, "b.jsonl");
-    write(suffix, history.slice(6)); write(complete, history);
+    write(suffix, history.slice(tied ? 2 : 6));
+    write(complete, partial ? history.slice(0, 6) : history);
+    if (tied) {
+      fs.appendFileSync(complete, `\n${JSON.stringify(history[1])}`);
+    }
     for (const files of [[suffix, complete], [complete, suffix]]) {
       const session = createSessionParser(files.map(file => ({ file, source: "claude" })))(suffix, "claude").session;
       expect(session.userIntent?.text).toBe("First instruction");
       expect(session.finalAnswer?.text).toBe("Final answer");
       expect(session.turns.map(turn => turn.userMessages?.[0].text)).toEqual(["First instruction", "Later instruction"]);
       expect(session.turns.flatMap(turn => turn.toolCalls).map(tool => tool.exitCode)).toEqual([0, 1, 0]);
+      const tools = session.turns.flatMap(turn => turn.toolCalls);
+      expect(tools.map(tool => tool.name)).toEqual(["Edit", "Bash", "Bash"]);
+      expect(tools[0].arguments).toMatchObject({ file_path: "/fictional/repo/app.ts", path: "/fictional/repo/app.ts" });
+      expect(tools[0].evidence).toContainEqual(expect.objectContaining({ sourceFile: complete, lineNumber: 2, fieldPath: "message.content.tool_use" }));
+      expect(tools[1].arguments).toEqual({ command: "npm test" });
+      expect(tools[1].evidence).toContainEqual(expect.objectContaining({ fieldPath: "message.content.tool_use" }));
+      expect(session.metrics.editCalls).toBe(1);
+      expect(session.metrics.toolRequests).toBe(3);
+      expect(session.metrics.verificationEvents).toBe(2);
+      expect(session.metrics.verificationPassed).toBe(1);
+      expect(session.metrics.verificationFailed).toBe(1);
       expect(session.metrics.verificationClosure).toBe("passed");
-      expect(session.turns.map(turn => turn.startedAt)).toEqual(["2026-01-01T10:00:00.000Z", "2026-01-01T10:00:04.000Z"]);
+      expect(session.attribution?.unknowns).not.toContain("orphan_tool_result");
+      expect(session.turns.map(turn => turn.startedAt)).toEqual(["2026-01-01T10:00:00.000Z", tied ? "2026-01-01T10:00:00.000Z" : "2026-01-01T10:00:04.000Z"]);
     }
   });
   it("keeps unidentified observations at the same line in different copies separate", () => {

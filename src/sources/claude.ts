@@ -60,6 +60,53 @@ function transcriptScope(file: string, input: NativeRow[]) {
   return { childAgentId, child, sessionId, nativeSessionId: str(last?.sessionId) ?? null, sessionIdMissing: !str(last?.sessionId) };
 }
 
+const snapshotKey = (row: RecordValue): string | undefined => {
+  const request = row.type === "assistant" ? requestKey(row) : undefined;
+  return eventKey(row) ?? (request ? `${request}:${JSON.stringify(row.message)}` : undefined);
+};
+
+function orderCopiedRows(rows: NativeRow[], copies: Transcript[]): NativeRow[] {
+  const key = (row: NativeRow) => snapshotKey(row.data) ?? `line:${JSON.stringify([row.sourceFile, row.line])}`;
+  const time = (row: NativeRow) => {
+    const timestamp = Date.parse(str(row.data.timestamp) ?? "");
+    return Number.isFinite(timestamp) ? timestamp : Infinity;
+  };
+  const buckets = new Map<number, NativeRow[]>();
+  for (const row of rows) {
+    const bucket = buckets.get(time(row)) ?? [];
+    bucket.push(row);
+    buckets.set(time(row), bucket);
+  }
+  const successors = new Map(rows.map(row => [key(row), new Set<string>()]));
+  const incoming = new Map(rows.map(row => [key(row), 0]));
+  for (const copy of copies) {
+    const previous = new Map<number, string>();
+    const seen = new Set<string>();
+    for (const row of copy.rows) {
+      const id = key(row);
+      if (!incoming.has(id) || seen.has(id)) continue;
+      seen.add(id);
+      const before = previous.get(time(row));
+      if (before && before !== id && !successors.get(before)!.has(id)) {
+        successors.get(before)!.add(id);
+        incoming.set(id, incoming.get(id)! + 1);
+      }
+      previous.set(time(row), id);
+    }
+  }
+  return [...buckets].sort(([a], [b]) => a - b).flatMap(([, bucket]) => {
+    const remaining = new Map(bucket.map(row => [key(row), row]));
+    const ordered: NativeRow[] = [];
+    while (remaining.size) {
+      const id = [...remaining.keys()].find(id => incoming.get(id) === 0) ?? remaining.keys().next().value!;
+      ordered.push(remaining.get(id)!);
+      remaining.delete(id);
+      for (const next of successors.get(id)!) incoming.set(next, incoming.get(next)! - 1);
+    }
+    return ordered;
+  });
+}
+
 export function createClaudeCorpus(inputs: Map<string, Transcript>) {
   const seenRequests = new Set<string>();
   const seenEvents = new Set<string>();
@@ -83,13 +130,7 @@ export function createClaudeCorpus(inputs: Map<string, Transcript>) {
     const history = normalizeHistory(copies.flatMap(item => item.input.rows), group[0].scope, seenRequests, seenEvents, seenTools);
     if (copies.length > 1) {
       history.unknowns.add("conflicting_session_copies");
-      history.rows.sort((a, b) => {
-        const time = (row: NativeRow) => {
-          const timestamp = Date.parse(str(row.data.timestamp) ?? "");
-          return Number.isFinite(timestamp) ? timestamp : Infinity;
-        };
-        return (time(a) - time(b) || 0) || (a.sourceFile < b.sourceFile ? -1 : a.sourceFile > b.sourceFile ? 1 : a.line - b.line);
-      });
+      history.rows = orderCopiedRows(history.rows, copies.map(copy => copy.input));
     }
     const sourceFiles = group.map(item => item.file);
     const sessionParseErrors = copies.reduce((sum, item) => sum + item.input.parseErrors, 0);
@@ -109,7 +150,7 @@ function normalizeHistory(input: NativeRow[], scope: ReturnType<typeof transcrip
   const retained = input.filter(({ data }) => {
     const event = eventKey(data);
     const request = data.type === "assistant" ? requestKey(data) : undefined;
-    const snapshot = event ?? (request && `${request}:${JSON.stringify(data.message)}`);
+    const snapshot = snapshotKey(data);
     if (snapshot && snapshots.has(snapshot)) return false;
     if (snapshot) snapshots.add(snapshot);
     if (event && seenEvents.has(event)) { inherited.add(event); return false; }
