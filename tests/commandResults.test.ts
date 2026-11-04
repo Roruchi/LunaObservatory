@@ -444,3 +444,33 @@ it("credits the common bounded static worker patch binding", () => {
   expect(session.metrics.verificationClosure).toBe("passed");
   expect(scoreSession(session).outcomeScore).toBe(90);
 });
+
+
+describe("approved literal environment prefixes", () => {
+  it.each(["test -f map.ts", "rtk test -f map.ts", "bash -c 'test -f map.ts'"])("does not certify the shell builtin: %s", cmd => {
+    const session = capture([edit, { name: "exec_command", args: { cmd }, output: envelope(0) }]);
+    session.lifecycleStatus = "completed";
+    expect(session.metrics.verificationEvents).toBe(0);
+    expect(session.metrics.verificationClosure).toBe("missing");
+    expect(scoreSession(session).outcomeScore).toBe(50);
+  });
+
+  it.each(["CI=1 npm test", "rtk CI=1 npm test", "bash -c 'CI=1 npm test'", "sh -c 'CI=1 npm test'", "env CI=1 npm test", "npm test", "node test.js"])("retains common checks: %s", cmd => {
+    for (const nested of [false, true]) {
+      const call = nested ? wrapped(`text(await tools.exec_command(${JSON.stringify({ cmd })}));`, [envelope(0)])
+        : { name: "exec_command", args: { cmd }, output: envelope(0) };
+      const session = capture([edit, call]);
+      const check = expandToolCalls(session.turns.flatMap(turn => turn.toolCalls)).find(tool => tool.name === "exec_command")!;
+      expect(executionDirectory(check)).toBe("/repo/a");
+      expect(session.metrics.verificationEvents).toBe(1);
+      expect(session.metrics.verificationClosure).toBe("passed");
+    }
+  });
+
+  it.each(["CI=$VALUE npm test", "rtk CI=$(value) npm test", "bash -c 'CI=$VALUE npm test'", "env CI=$VALUE npm test"])("leaves dynamic prefixes unknown: %s", cmd => {
+    const session = capture([edit, { name: "exec_command", args: { cmd }, output: envelope(0) }]);
+    const check = session.turns.flatMap(turn => turn.toolCalls).at(-1)!;
+    expect(executionDirectory(check)).toBeUndefined();
+    expect(session.metrics.verificationClosure).toBe("missing");
+  });
+});

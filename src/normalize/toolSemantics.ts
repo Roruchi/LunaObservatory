@@ -458,11 +458,16 @@ function commandContext(tool: NormalizedToolCall): { command?: string; directory
   while (true) {
     if (/^env\s/.test(command)) {
       if (environments++) return {};
-      const environment = /^env\s+(?:[A-Za-z_]\w*=(?:"[^"]*"|'[^']*'|[^\s]+)\s+)*/.exec(command)!;
-      command = command.slice(environment[0].length).replace(/^rtk\s+(?:proxy\s+)?/i, "");
+      command = command.replace(/^env\s+/, "").replace(/^rtk\s+(?:proxy\s+)?/i, "");
       if (/^-/.test(command)) return {};
       continue;
     }
+    const assignments = /^(?:[A-Za-z_]\w*=(?:"[A-Za-z0-9_./:-]*"|'[A-Za-z0-9_./:-]*'|[A-Za-z0-9_./:-]+)\s+)+/.exec(command);
+    if (assignments) {
+      command = command.slice(assignments[0].length).replace(/^rtk\s+(?:proxy\s+)?/i, "");
+      continue;
+    }
+    if (/^[A-Za-z_]\w*=/.test(command)) return {};
     match = /^(?:\/(?:usr\/)?bin\/)?(?:bash|sh)\s+-(?:lc|cl|c)\s+(?:'([^']*)'|"([^"]*)")\s*$/i.exec(command);
     if (match) {
       if (shells++) return {};
@@ -571,7 +576,10 @@ export function commandCheckType(tool: NormalizedToolCall): CommandCheckType | u
   let executable = words.shift()?.split("/").at(-1)?.replace(/\.exe$/, "");
   if (executable === "npx") executable = words.shift();
   let action = executable ?? "";
-  if (["npm", "pnpm", "yarn", "bun"].includes(action)) action = words[0] === "run" ? words[1] ?? "" : words[0] ?? "";
+  if (["npm", "pnpm", "yarn", "bun"].includes(action)) {
+    action = words[0] === "run" ? words[1] ?? "" : words[0] ?? "";
+    if (action === "test") return "test";
+  }
   else if (["node", "python", "python3", "pwsh", "powershell"].includes(action)) {
     if (action === "node" && words[0] === "--check") return "build";
     if (action === "node" && words[0] === "--test") return "test";
@@ -583,7 +591,7 @@ export function commandCheckType(tool: NormalizedToolCall): CommandCheckType | u
   } else if (["cargo", "go", "dotnet", "mvn", "gradle", "gradlew"].includes(action)) return words[0] === "test" ? "test" : words[0] === "build" ? "build" : undefined;
   if (/^(?:pandoc|mkdocs|sphinx-build|render_docx|export_whitepaper|docs?:build|build[-_:]?(?:docs?|document|whitepaper))(?:\.|$|[-_:])/.test(action)) return "document_build";
   if (/^(?:typecheck|type-check|tsc|mypy)(?:$|[-_:.])/.test(action)) return "typecheck";
-  if (/^(?:test|vitest|pytest|jest|gut)(?:$|[-_:.])/.test(action)) return "test";
+  if (/^(?:test(?=[-_.:])|vitest|pytest|jest|gut)(?:$|[-_:.])/.test(action)) return "test";
   if (/^(?:lint|eslint|ruff|cspell)(?:$|[-_:.])/.test(action)) return "lint";
   if (/^(?:build|validate|check)(?:$|[-_:.])/.test(action)) return "build";
   if (action === "godot.ps1" && ["parse", "boot", "test", "export", "check-android-env"].some(value => words.includes(value))) return "build";

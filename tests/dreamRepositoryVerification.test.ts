@@ -470,3 +470,15 @@ it("keeps unsupported read argument structures unknown", () => {
   expect(packet.selectedSessions[0].tasks![0].verificationChecks[0].target).toBeUndefined();
   expect(report.scores.find(score => score.category === "Verification quality")?.score).toBe(0);
 });
+
+
+it.each([
+  ["test -f map.ts", false], ["CI=1 npm test", true], ["rtk CI=1 npm test", true],
+  ["bash -c 'CI=1 npm test'", true], ["sh -c 'CI=1 npm test'", true], ["CI=$VALUE npm test", false]
+])("uses the approved check policy in frozen Dream: %s", (cmd, verified) => {
+  const session = dreamCapture("/repo/a", cmd);
+  const { packet, report } = frozenVerification(session);
+  expect(session.metrics.verificationClosure).toBe(verified ? "passed" : "missing");
+  expect(packet.selectedSessions[0].tasks![0].verificationChecks.length).toBe(verified ? 1 : 0);
+  expect(report.scores.find(score => score.category === "Verification quality")?.score).toBe(verified ? 5 : 0);
+});
