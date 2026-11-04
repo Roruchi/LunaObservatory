@@ -269,9 +269,11 @@ function assessTaskVerification(task: DreamTaskWindow): TaskVerificationAssessme
       .filter((check) => changes.some((change) => targetMatches(change, check)))
       .sort((left, right) => (left.actionIndex ?? 0) - (right.actionIndex ?? 0));
     if (!checks.length) return { status: "missing", changes, matchingChecks: [] };
-    const latest = checks.at(-1);
-    if (latest?.status === "passed") return { status: "verified", changes, matchingChecks: checks };
-    if (latest?.status === "failed") return { status: "failed", changes, matchingChecks: checks };
+    const latestByLane = new Map<string, typeof checks[number]>();
+    for (const check of checks) latestByLane.set(check.lane ?? commandKey(check.command), check);
+    const finalChecks = [...latestByLane.values()];
+    if (finalChecks.some((check) => check.status === "failed")) return { status: "failed", changes, matchingChecks: checks };
+    if (finalChecks.every((check) => check.status === "passed")) return { status: "verified", changes, matchingChecks: checks };
     return { status: "missing", changes, matchingChecks: checks };
   });
 }

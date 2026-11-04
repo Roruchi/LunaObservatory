@@ -8,7 +8,16 @@ import { prepareDreamPacket } from "../src/dream/prepare.js";
 import { validateDreamPacket } from "../src/dream/validate.js";
 
 describe("repository verification through Scan and Dream", () => {
-  it.each(["passed", "failed", "stale"] as const)("preserves %s nested checks through preparation and validation", status => {
+  it.each([
+    { name: "passed", status: "passed", checks: [["npm test", 0], ["npm run build", 0]] },
+    { name: "failed", status: "failed", checks: [["npm test", 1], ["npm run build", 1]] },
+    { name: "stale", status: "stale", checks: [["npm test", 0], ["npm run build", 0]] },
+    { name: "failed test then passing build", status: "failed", checks: [["npm test", 1], ["npm run build", 0]] },
+    { name: "failed build then passing test", status: "failed", checks: [["npm run build", 1], ["npm test", 0]] },
+    { name: "same-lane recovery", status: "passed", checks: [["npm test", 1], ["npm test", 0]] },
+    { name: "same-type distinct command", status: "failed", checks: [["npm test -- unit", 1], ["npm test -- integration", 0]] },
+    { name: "distinct workdir", status: "failed", checks: [["npm test", 1, "a"], ["npm test", 0, "b"]] }
+  ] as const)("preserves $name nested checks through preparation and validation", ({ status, checks }) => {
     const root = fs.mkdtempSync(path.resolve("tests/.dream-repository-"));
     try {
       const events: unknown[] = [];
@@ -24,10 +33,9 @@ describe("repository verification through Scan and Dream", () => {
       };
       const edit = () => call("edit", "apply_patch", "*** Begin Patch\n*** Update File: map.ts\n@@\n-old\n+new\n*** End Patch", "Success");
       if (status !== "stale") edit();
-      call("checks", "exec", 'text(await tools.exec_command({cmd:"npm test"})); text(await tools.exec_command({cmd:"npm run build"}));', JSON.stringify([
-        { exit_code: status === "failed" ? 1 : 0, output: "test result" },
-        { exit_code: status === "failed" ? 1 : 0, output: "build result" }
-      ]));
+      call("checks", "exec", checks.map(([cmd, , workdir]) =>
+        `text(await tools.exec_command(${JSON.stringify({ cmd, workdir })}));`
+      ).join(" "), JSON.stringify(checks.map(([, exit_code]) => ({ exit_code, output: "check result" }))));
       if (status === "stale") edit();
       add("response_item", { type: "message", role: "assistant", content: [{ type: "output_text", text: "Finished." }] });
       const transcript = path.join(root, "events.jsonl");
@@ -49,7 +57,13 @@ describe("repository verification through Scan and Dream", () => {
       expect(report.scores.find(score => score.category === "Verification quality")?.score).toBe(status === "passed" ? 5 : 0);
       const gaps = report.findings.filter(finding => finding.category === "Verification quality" && finding.severity === "high");
       expect(gaps).toHaveLength(status === "passed" ? 0 : 1);
-      if (status === "failed") expect(gaps[0].title).toBe("Relevant verification ended with a failure");
+      if (status === "failed") {
+        expect(gaps[0].title).toBe("Relevant verification ended with a failure");
+        expect(report.findings.some(finding => finding.title === "Verification had failed attempts that were later recovered")).toBe(false);
+      }
+      if (checks[0][1] === 1 && status === "passed") {
+        expect(report.findings.some(finding => finding.title === "Verification had failed attempts that were later recovered")).toBe(true);
+      }
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

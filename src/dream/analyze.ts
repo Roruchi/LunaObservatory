@@ -5,7 +5,8 @@ import {
   isEditTool,
   isGlobTool,
   isViewTool,
-  toolCommand
+  toolCommand,
+  verificationLaneKey
 } from "../normalize/toolSemantics.js";
 import type {
   EvidenceRef,
@@ -648,7 +649,9 @@ function classifyVerificationChecks(
     const refs = toDreamRefs(session.sessionId, action.tool.evidence, `${taskId}:verification:${action.actionIndex}`);
     checks.push({
       command: toolCommand(action.tool) ?? action.tool.name,
-      lane: `${semantic.target ?? "unknown-target"}|${semantic.type}`,
+      lane: toolCommand(action.tool)
+        ? verificationLaneKey(action.tool)
+        : `${semantic.target ?? "unknown-target"}|${semantic.type}`,
       verificationType: semantic.type,
       actionIndex: action.actionIndex,
       target: semantic.target,
