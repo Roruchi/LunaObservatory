@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { commandResults, orchestrationScript } from "../normalize/toolSemantics.js";
 import { createHash } from "node:crypto";
 import { calculateMetrics, reported, unavailable } from "../normalize/metrics.js";
 import type { EvidenceRef, NormalizedAssistantMessage, NormalizedSession, NormalizedToolCall, NormalizedTurn, RawLogEvent } from "../normalize/types.js";
@@ -235,6 +236,7 @@ export function parseClaudeSessionFile(file: string, corpus = createClaudeCorpus
   const worktreePaths = new Set<string>();
   const sidechains = new Set<boolean>();
   let agentId: string | undefined;
+  let executionRoot: string | undefined;
   let firstInstruction: NormalizedSession["userIntent"];
   let finalAnswer: NormalizedSession["finalAnswer"];
   let current: NormalizedTurn | undefined;
@@ -250,6 +252,7 @@ export function parseClaudeSessionFile(file: string, corpus = createClaudeCorpus
     const stamp = str(row.timestamp);
     const time = stamp && Number.isFinite(Date.parse(stamp)) ? new Date(stamp).toISOString() : undefined;
     if (time) times.push(time); else unknowns.add("timestamp_missing_or_invalid");
+    executionRoot ??= str(row.cwd);
     if (str(row.cwd)) worktreePaths.add(str(row.cwd)!);
     if (str(row.gitBranch)) branches.add(str(row.gitBranch)!);
     if (typeof row.isSidechain === "boolean") sidechains.add(row.isSidechain);
@@ -312,8 +315,8 @@ export function parseClaudeSessionFile(file: string, corpus = createClaudeCorpus
             const name = str(block.name) ?? "unknown";
             const args = obj(block.input);
             const aliases: Record<string, string> = { Read: "view", MultiEdit: "edit", NotebookEdit: "edit" };
-            const tool: NormalizedToolCall = { toolCallId: id, name: aliases[name] ?? name, arguments: { ...args, ...(str(args.file_path) ? { path: args.file_path } : {}) },
-              requestedAt: time, status: "requested", evidence: [ref(row, line, "message.content.tool_use")] };
+            const tool: NormalizedToolCall = { toolCallId: id, name: aliases[name] ?? name, arguments: typeof block.input === "string" ? block.input : { ...args, ...(str(args.file_path) ? { path: args.file_path } : {}) },
+              executionRoot, executionCwd: str(row.cwd), requestedAt: time, status: "requested", evidence: [ref(row, line, "message.content.tool_use")] };
             tools.set(id, tool); active.toolCalls.push(tool);
           }
         } else if (block.type !== "tool_use") unknowns.add(`unsupported_content:${String(block.type)}`);
@@ -329,6 +332,7 @@ export function parseClaudeSessionFile(file: string, corpus = createClaudeCorpus
         tools.set(id, tool); active.toolCalls.push(tool); unknowns.add("orphan_tool_result");
       }
       tool.outputText = text(block.content);
+      if (orchestrationScript(tool)) tool.commandResults = commandResults(block.content, tool);
       tool.executionEndedAt = time;
       tool.evidence = [...(tool.evidence ?? []), ref(row, line, "message.content.tool_result")];
       const result = obj(row.toolUseResult);

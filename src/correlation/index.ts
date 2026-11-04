@@ -13,6 +13,7 @@ const timestamp = z.string().datetime({ offset: true });
 export const taskRecordSchema = z.object({
   taskId: text, attemptId: text.nullable(), project: text,
   harness: z.enum(["codex", "claude", "copilot"]), spawnGeneration: text.nullable(),
+  nativeSessionId: text.nullable().optional(),
   branchName: text.optional(), worktreePath: text.optional(), steeringInboxPath: text.optional(),
   startedAt: timestamp, endedAt: timestamp.nullable(),
   provenance: z.object({ uri: text, digest: text }).strict()
@@ -30,6 +31,7 @@ export type Candidate = {
   evidence: string[]; unknowns: string[]; recordIndexes: number[];
 };
 export type Correlation = {
+  traceDigest?: string;
   sessionId: string; source: NormalizedSession["source"];
   status: "matched" | "ambiguous" | "unmatched";
   confidence: "high" | "medium" | "low" | "none";
@@ -58,6 +60,8 @@ export function correlateSession(session: NormalizedSession, records: TaskRecord
   const instruction = observations.firstInstruction ?? "";
   records.forEach((record, index) => {
     if (record.harness !== session.source) return;
+    if (record.nativeSessionId && record.nativeSessionId !== session.nativeSessionId) return;
+    const native = Boolean(record.nativeSessionId && record.nativeSessionId === session.nativeSessionId);
     const explicitTaskIds = [...instruction.matchAll(/(?:^|\n)\s*(?:task[ _-]?id|endpoint_task_id)\s*[:=]\s*["']?([a-zA-Z0-9_.-]+)/gi)].map(match => match[1]);
     if (explicitTaskIds.some(taskId => taskId !== record.taskId)) return;
     if (records.some(other => other.taskId !== record.taskId && other.steeringInboxPath &&
@@ -67,7 +71,7 @@ export function correlateSession(session: NormalizedSession, records: TaskRecord
     const path = Boolean(record.worktreePath && observations.worktreePaths.some(value => canonicalPath(value) === canonicalPath(record.worktreePath!)));
     const inbox = Boolean(record.steeringInboxPath && new RegExp(`(?:^|[\\s"'\x60])${escape(record.steeringInboxPath)}(?=$|[\\s"'\x60.,;])`).test(instruction));
     const task = new RegExp(`(?:^|\\n)\\s*(?:task[ _-]?id|endpoint_task_id)\\s*[:=]\\s*["']?${escape(record.taskId)}["']?(?=\\s|$)`, "i").test(instruction);
-    if (!branch && !path && !inbox && !task) return;
+    if (!native && !branch && !path && !inbox && !task) return;
     // A known conflicting task branch is contradictory, never a weaker fallback.
     if (observations.branches.some(value => value.startsWith("fm/") && value !== `fm/${record.taskId}`)) return;
     if (record.worktreePath && observations.worktreePaths.length && !path) return;
@@ -76,8 +80,8 @@ export function correlateSession(session: NormalizedSession, records: TaskRecord
     const completeTime = Number.isFinite(start) && Number.isFinite(end) && end >= start && record.endedAt !== null;
     if (Number.isFinite(end) && end < Date.parse(record.startedAt)) return;
     if (Number.isFinite(start) && record.endedAt !== null && start > Date.parse(record.endedAt)) return;
-    const evidence = [branch && "branch", path && "worktree_path", inbox && "first_instruction_inbox", task && "first_instruction_task", completeTime && "time_overlap"].filter((value): value is string => Boolean(value));
-    const unknowns = [...nativeIdentityUnknowns, ...(session.attribution?.unknowns.filter(reason => ["conflicting_session_copies", "sidechain_agent_identity_missing", "mixed_sidechain_markers", "timestamp_missing_or_invalid", "history_lineage_unknown"].includes(reason)) ?? []), !completeTime && "time_window_incomplete", !record.attemptId && "attempt_identity_unknown", !(branch || inbox || task) && "task_identity_unverified"].filter((value): value is string => Boolean(value));
+    const evidence = [native && "native_session_id", branch && "branch", path && "worktree_path", inbox && "first_instruction_inbox", task && "first_instruction_task", completeTime && "time_overlap"].filter((value): value is string => Boolean(value));
+    const unknowns = [...nativeIdentityUnknowns, ...(session.attribution?.unknowns.filter(reason => ["conflicting_session_copies", "sidechain_agent_identity_missing", "mixed_sidechain_markers", "timestamp_missing_or_invalid", "history_lineage_unknown"].includes(reason)) ?? []), !completeTime && "time_window_incomplete", !record.attemptId && "attempt_identity_unknown", !(native || branch || inbox || task) && "task_identity_unverified"].filter((value): value is string => Boolean(value));
     // Exact repeated caller records are one observation; contradictory metadata remains ambiguous.
     const duplicate = candidates.find(candidate => candidate.taskId === record.taskId && candidate.attemptId === record.attemptId &&
       candidate.project === record.project && candidate.spawnGeneration === record.spawnGeneration &&
@@ -134,10 +138,6 @@ export function correlateTraceDirectory(logs: string, taskFile: string, source: 
     const parsed = parseSession(file, discovered.source);
     parseErrors += parsed.parseErrors;
     const session = parsed.session;
-    if (session.source === "unknown") {
-      const events = readJsonl(file).events;
-      session.source = events.some(event => event.type === "session_meta") ? "codex" : events.some(event => event.type.startsWith("assistant.")) ? "copilot" : "unknown";
-    }
     const key = `${session.source}:${session.sessionId}`;
     const digest = parsed.traceDigest ?? createHash("sha256").update(fs.readFileSync(file)).digest("hex");
     const previous = sessions.get(key);

@@ -2,7 +2,7 @@ import type { SourceName } from "../sources/types.js";
 import { stableId } from "../utils/stableId.js";
 import { durationMs, maxIso, minIso } from "../utils/time.js";
 import { calculateMetrics, reported, unavailable } from "./metrics.js";
-import { isEditTool } from "./toolSemantics.js";
+import { commandResults, commandResultStatus, isCommandTool, isEditTool, orchestrationScript } from "./toolSemantics.js";
 import type {
   EvidenceRef,
   NormalizedAssistantMessage,
@@ -151,6 +151,8 @@ function addOrUpdateTool(turn: MutableTurn, tool: NormalizedToolCall): Normalize
     Object.assign(existing, {
       ...tool,
       arguments: tool.arguments ?? existing.arguments,
+      executionCwd: tool.executionCwd ?? existing.executionCwd,
+      executionRoot: tool.executionRoot ?? existing.executionRoot,
       evidence: [...(existing.evidence ?? []), ...(tool.evidence ?? [])]
     });
     return existing;
@@ -227,6 +229,13 @@ function toolOutputText(value: unknown, depth = 0): string {
     .map((key) => toolOutputText(record[key], depth + 1))
     .filter(Boolean)
     .join("\n");
+}
+
+function orchestrationFailed(value: unknown): boolean {
+  const header = typeof value === "string" ? value : Array.isArray(value)
+    ? value.find(part => part && (part.type === "input_text" || part.type === "text") && typeof part.text === "string" && part.text.length)?.text
+    : undefined;
+  return typeof header === "string" && /^(?:Script (?:failed|timed out|terminated)|Tool call failed)\b/i.test(header);
 }
 
 function normalizeText(text: string): string {
@@ -406,6 +415,7 @@ export function normalizeEventsToSession(
   let parentSessionId: string | undefined;
   let agentPath: string | undefined;
   let sessionCwd: string | undefined;
+  const turnCwds = new Map<string, string>();
   let sessionModel: string | undefined;
   let currentTurnId = "unknown";
 
@@ -414,6 +424,11 @@ export function normalizeEventsToSession(
     const turnId = codexTurnId(data) ?? stringValue(data.turnId) ?? currentTurnId;
     const interactionId = stringValue(data.interactionId);
     if (interactionId) interactions.add(interactionId);
+
+    if (event.type === "session.start") {
+      const context = data.context && typeof data.context === "object" ? data.context as Record<string, unknown> : {};
+      sessionCwd = stringValue(context.cwd) ?? stringValue(data.cwd);
+    }
 
     if (event.type === "session_meta") {
       const parent = stringValue(data.parent_thread_id) ?? stringValue(data.session_id);
@@ -429,7 +444,9 @@ export function normalizeEventsToSession(
       currentTurnId = contextTurnId;
       const turn = getTurn(turns, contextTurnId);
       touchTurnTime(turn, event.timestamp);
-      addSyntheticCwdHook(turn, event, stringValue(data.cwd) ?? sessionCwd);
+      const cwd = stringValue(data.cwd) ?? sessionCwd;
+      if (cwd) turnCwds.set(contextTurnId, cwd);
+      addSyntheticCwdHook(turn, event, cwd);
       const model = stringValue(data.model) ?? sessionModel;
       if (model) turnModels.set(contextTurnId, model);
       continue;
@@ -642,6 +659,8 @@ export function normalizeEventsToSession(
             toolCallId,
             name: toolName,
             arguments: parsedArgs,
+            executionCwd: turnCwds.get(responseTurnId) ?? sessionCwd,
+            executionRoot: sessionCwd,
             requestedAt: event.timestamp,
             status: "requested",
             evidence: [
@@ -660,20 +679,22 @@ export function normalizeEventsToSession(
           const toolTurn = findTurnByToolCall(turns, [toolCallId]) ?? turn;
           const output = toolOutputText(data.output);
           const existing = toolTurn.toolMap.get(toolCallId);
-          const isOrchestration = /(?:^|[.:/])exec(?:_command)?$/i.test(existing?.name ?? "") &&
-            typeof existing?.arguments === "string" && /\btools\.[\w_]+\s*\(/.test(existing.arguments);
+          const results = commandResults(data.output, existing, true);
+          const isOrchestration = Boolean(existing && orchestrationScript(existing));
           const editFailed = Boolean(existing && isEditTool(existing)) &&
             /\b(?:apply_patch verification failed|failed to find expected|invalid context|patch failed|could not apply patch)\b/i.test(output);
           const failed = isOrchestration
-            ? /\bScript (?:failed|timed out|terminated)\b|\bTool call failed\b/i.test(output)
-            : /Exit code:\s*(?!0\b)\d+/i.test(output) || editFailed;
+            ? orchestrationFailed(data.output)
+            : commandResultStatus(results) === "failed" || editFailed;
           touchTurnTime(toolTurn, event.timestamp);
           addOrUpdateTool(toolTurn, {
             toolCallId,
             name: toolTurn.toolMap.get(toolCallId)?.name ?? "unknown",
             executionEndedAt: event.timestamp,
             outputText: output,
-            status: failed ? "failed" : "completed",
+            commandResults: results,
+            status: failed ? "failed" : existing && isCommandTool(existing) && !isOrchestration
+              ? commandResultStatus(results) : "completed",
             evidence: output
               ? [evidence(event, "data.output", `${failed ? "failed" : "completed"} output: ${excerpt(output, 220)}`)]
               : undefined
@@ -731,6 +752,8 @@ export function normalizeEventsToSession(
           toolCallId,
           name: toolName,
           arguments: request.arguments,
+          executionCwd: stringValue(data.cwd) ?? sessionCwd,
+          executionRoot: sessionCwd,
           intentionSummary: stringValue(request.intentionSummary),
           requestedAt: event.timestamp,
           status: "requested",
@@ -755,6 +778,8 @@ export function normalizeEventsToSession(
         toolCallId,
         name: toolName,
         arguments: data.arguments,
+        executionCwd: stringValue(data.cwd) ?? sessionCwd,
+        executionRoot: sessionCwd,
         executionStartedAt: event.timestamp,
         status: "started",
         evidence: [
@@ -772,13 +797,20 @@ export function normalizeEventsToSession(
       touchTurnTime(turn, event.timestamp);
       const status = stringValue(data.status)?.toLowerCase();
       const failed = data.success === false || status === "failed" || status === "error" || status === "cancelled";
-      const existingArguments = turn.toolMap.get(toolCallId)?.arguments;
+      const existing = turn.toolMap.get(toolCallId);
+      const existingArguments = existing?.arguments;
+      const output = toolOutputText(data.result ?? data.output);
+      const results = commandResults(data.result ?? data.output, existing);
+      const resultStatus = existing && isCommandTool(existing) && !orchestrationScript(existing) && results.length
+        ? commandResultStatus(results) : "completed";
       addOrUpdateTool(turn, {
         toolCallId,
         name: stringValue(data.toolName) ?? turn.toolMap.get(toolCallId)?.name ?? "unknown",
         arguments: existingArguments,
+        outputText: output,
+        commandResults: results,
         executionEndedAt: event.timestamp,
-        status: failed ? "failed" : "completed"
+        status: failed ? "failed" : resultStatus
       });
       continue;
     }
@@ -815,6 +847,8 @@ export function normalizeEventsToSession(
           toolCallId,
           name: toolName,
           arguments: parsedArgs,
+          executionCwd: stringValue(input.cwd),
+          executionRoot: sessionCwd,
           status: "unknown",
           evidence: [
             evidence(event, "data.input.toolCalls", `tool=${toolName}`),

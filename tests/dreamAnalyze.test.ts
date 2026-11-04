@@ -13,6 +13,7 @@ let toolId = 0;
 function tool(name: string, argumentsValue: unknown, status: NormalizedToolCall["status"] = "completed", outputText?: string): NormalizedToolCall {
   return {
     toolCallId: `${name}-${toolId++}`,
+    executionCwd: "C:\\Repo\\Example",
     name,
     arguments: argumentsValue,
     status,
@@ -74,7 +75,7 @@ describe("dream task analysis", () => {
             tool(
               "apply_patch",
               "*** Begin Patch\n*** Update File: C:\\Users\\roelv\\.codex\\automations\\luna-os-v2-issue-worker\\memory.md\n*** End Patch",
-              "completed",
+              "failed",
               "apply_patch verification failed: Failed to find expected lines"
             ),
             tool(
@@ -111,7 +112,7 @@ describe("dream task analysis", () => {
     ]);
   });
 
-  it("treats PowerShell Test-Path as a filesystem observation instead of a test suite", () => {
+  it("leaves an unsupported PowerShell conditional without verification credit", () => {
     const analyzed = analyzeDreamTasks(
       session([
         turn("one", "Inspect the automation memory.", [
@@ -123,10 +124,8 @@ describe("dream task analysis", () => {
       ])
     )[0];
 
-    expect(analyzed.verificationChecks).toContainEqual(
-      expect.objectContaining({ verificationType: "persistence_check", status: "unknown" })
-    );
-    expect(analyzed.verificationChecks).not.toContainEqual(expect.objectContaining({ verificationType: "test" }));
+    // The conditional's execution and read target are outside the bounded shell grammar.
+    expect(analyzed.verificationChecks).toEqual([]);
   });
 
   it("accepts a fresh build after a product-code edit", () => {

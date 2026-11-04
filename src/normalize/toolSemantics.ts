@@ -1,4 +1,5 @@
-import type { NormalizedToolCall, VerificationClosure } from "./types.js";
+import path from "node:path";
+import type { CommandResult, NormalizedToolCall, VerificationClosure } from "./types.js";
 
 const viewToolNames = new Set(["view", "read_file", "read_text_file", "get_file", "view_image"]);
 const globToolNames = new Set(["glob", "list_files", "list_directory", "list_dir", "file_search", "rg_files"]);
@@ -50,23 +51,165 @@ function parseQuotedString(value: string): string | undefined {
   }
 }
 
-function embeddedProperty(value: string, property: string): string | undefined {
-  const match = new RegExp(`\\b${property}\\s*:\\s*("(?:\\\\.|[^"\\\\])*")`, "i").exec(value);
-  return match ? parseQuotedString(match[1]) : undefined;
+/** Decode static JS string literals without evaluating trace code. */
+function literalValue(literal: string): string | undefined {
+  if (literal.startsWith('"')) return parseQuotedString(literal);
+  if (literal.startsWith("`") && literal.includes("${")) return undefined;
+  let value = "";
+  const escapes: Record<string, string> = { n: "\n", r: "\r", t: "\t", b: "\b", f: "\f", v: "\v", "0": "\0" };
+  for (let index = 1; index < literal.length - 1; index++) {
+    const char = literal[index];
+    if (char !== "\\") { value += char; continue; }
+    const escaped = literal[++index];
+    if (escaped === "x" || escaped === "u") {
+      const length = escaped === "x" ? 2 : 4;
+      const hex = literal.slice(index + 1, index + 1 + length);
+      if (!new RegExp(`^[a-f0-9]{${length}}$`, "i").test(hex)) return undefined;
+      value += String.fromCharCode(parseInt(hex, 16)); index += length;
+    } else if (escaped === "\n") continue;
+    else value += escapes[escaped] ?? escaped;
+  }
+  return value;
+}
+
+function literalEnd(value: string, start: number): number {
+  const quote = value[start];
+  let end = start + 1;
+  for (; end < value.length; end++) {
+    if (value[end] === "\\") end++;
+    else if (value[end] === quote) return end + 1;
+  }
+  return value.length;
+}
+
+function maskedSource(value: string): string {
+  let result = "";
+  for (let index = 0; index < value.length;) {
+    if ('"\'`'.includes(value[index])) {
+      const end = literalEnd(value, index);
+      result += '""' + " ".repeat(Math.max(0, end - index - 2));
+      index = end;
+    } else if (value.startsWith("//", index) || value.startsWith("/*", index)) {
+      const block = value.startsWith("/*", index);
+      const end = block ? value.indexOf("*/", index + 2) : value.indexOf("\n", index + 2);
+      const stop = end < 0 ? value.length : end + (block ? 2 : 0);
+      result += " ".repeat(stop - index);
+      index = stop;
+    } else result += value[index++];
+  }
+  return result;
+}
+
+function supportedArguments(source: string): boolean {
+  const masked = maskedSource(source);
+  const call = /^tools\.\w+\s*\(\s*/.exec(masked);
+  if (!call || masked[call[0].length] !== "{" || !/\}\s*\)$/.test(masked) || /\.\.\./.test(masked)) return false;
+  const keys = new Set<string>();
+  let depth = 0;
+  let keyExpected = false;
+  for (let index = call[0].length; index < masked.length - 1; index++) {
+    const char = masked[index];
+    if (depth === 1 && keyExpected && !/\s/.test(char) && char !== "}") {
+      const property = /^(?:[a-zA-Z_$][\w$]*|"")\s*:/.exec(masked.slice(index));
+      if (!property) return false;
+      const raw = source.slice(index, index + property[0].length - 1).trim();
+      const key = /^["']/.test(raw) ? literalValue(raw) : raw;
+      if (!key || keys.has(key)) return false;
+      keys.add(key);
+      index += property[0].length - 1;
+      keyExpected = false;
+      continue;
+    }
+    if ("{[(".includes(char)) { depth++; if (depth === 1) keyExpected = true; }
+    if ("}])".includes(char)) depth--;
+    if (depth === 1 && char === ",") keyExpected = true;
+  }
+  return depth === 0;
+}
+
+function embeddedProperty(value: string, property: string): string | null | undefined {
+  if (/^tools\./.test(value) && !supportedArguments(value)) return null;
+  const key = new RegExp(`^(?:${property}|"${property}"|'${property}')\\s*:\\s*`, "i");
+  let depth = 0;
+  for (let index = 0; index < value.length;) {
+    const preceding = value.slice(0, index).trimEnd().at(-1);
+    if (depth <= 1 && (preceding === "{" || preceding === "," || index === 0)) {
+      const match = key.exec(value.slice(index));
+      if (match) {
+        const start = index + match[0].length;
+        if (property === "session_id") {
+          const number = /^\d+(?=\s*[,}])/.exec(value.slice(start));
+          if (number) return number[0];
+        }
+        if (!'"\'`'.includes(value[start] ?? " ")) return null;
+        const end = literalEnd(value, start);
+        // A literal followed by concatenation or interpolation is not static.
+        if (!/^[,}]/.test(value.slice(end).trimStart())) return null;
+        return literalValue(value.slice(start, end)) ?? null;
+      }
+    }
+    if ('"\'`'.includes(value[index])) { index = literalEnd(value, index); continue; }
+    if (value.startsWith("//", index)) { const end = value.indexOf("\n", index); index = end < 0 ? value.length : end + 1; continue; }
+    if (value.startsWith("/*", index)) { const end = value.indexOf("*/", index + 2); index = end < 0 ? value.length : end + 2; continue; }
+    if (value[index] === "{") depth++;
+    if (value[index] === "}") depth--;
+    index++;
+  }
+  return undefined;
+}
+
+/** Locate bounded call arguments; strings/comments never introduce tool calls. */
+type ScriptCall = { name: string; source: string; start: number; end: number };
+
+function scriptCalls(script: string): ScriptCall[] {
+  const calls: ScriptCall[] = [];
+  for (let index = 0; index < script.length;) {
+    if ('"\'`'.includes(script[index])) { index = literalEnd(script, index); continue; }
+    if (script.startsWith("//", index)) { const end = script.indexOf("\n", index); index = end < 0 ? script.length : end + 1; continue; }
+    if (script.startsWith("/*", index)) { const end = script.indexOf("*/", index + 2); index = end < 0 ? script.length : end + 2; continue; }
+    const match = /^(?:tools)\.([a-zA-Z0-9_]+)\s*\(/.exec(script.slice(index));
+    if (!match || index > 0 && /[\w$.]/.test(script[index - 1])) { index++; continue; }
+    const start = index;
+    index += match[0].length;
+    let depth = 1;
+    while (index < script.length && depth) {
+      if ('"\'`'.includes(script[index])) { index = literalEnd(script, index); continue; }
+      if (script[index] === "(") depth++;
+      if (script[index] === ")") depth--;
+      index++;
+    }
+    calls.push({ name: match[1], source: script.slice(start, index), start, end: index });
+  }
+  return calls;
 }
 
 function embeddedPatch(value: string): string | undefined {
-  for (const match of value.matchAll(/("(?:\\.|[^"\\])*")/g)) {
-    const decoded = parseQuotedString(match[1]);
-    if (decoded?.includes("*** Begin Patch")) return decoded;
-  }
-  const template = /`([\s\S]*?\*\*\* Begin Patch[\s\S]*?\*\*\* End Patch[\s\S]*?)`/.exec(value);
-  return template?.[1].replace(/\\n/g, "\n").replace(/\\r/g, "\r");
+  const call = /^tools\.[\w]+\s*\(\s*/.exec(value);
+  if (!call || !'"\'`'.includes(value[call[0].length] ?? " ")) return undefined;
+  const end = literalEnd(value, call[0].length);
+  if (value.slice(end).trim() !== ")") return undefined;
+  const patch = literalValue(value.slice(call[0].length, end));
+  return patch?.includes("*** Begin Patch") ? patch : undefined;
 }
 
-function orchestrationScript(tool: NormalizedToolCall): string | undefined {
+function boundPatch(script: string, call: ScriptCall): string | undefined {
+  const argument = /^tools\.apply_patch\(\s*([a-zA-Z_]\w*)\s*\)$/.exec(call.source)?.[1];
+  if (!argument) return undefined;
+  const masked = maskedSource(script);
+  if ([...masked.matchAll(new RegExp(`\\b${argument}\\b`, "g"))].length !== 2) return undefined;
+  const declarations = [...script.matchAll(new RegExp(`(?:^|;|\\n)\\s*const\\s+${argument}\\s*=\\s*("(?:\\\\.|[^"\\\\])*")\\s*;`, "g"))];
+  if (declarations.length !== 1 || declarations[0].index! >= call.start) return undefined;
+  const declarationStart = script.indexOf("const", declarations[0].index!);
+  if (masked.slice(declarationStart, declarationStart + 5) !== "const") return undefined;
+  const depth = (end: number) => [...masked.slice(0, end)].reduce((count, char) => count + (char === "{" ? 1 : char === "}" ? -1 : 0), 0);
+  if (depth(declarations[0].index!) !== 0 || depth(call.start) !== 0) return undefined;
+  const patch = parseQuotedString(declarations[0][1]);
+  return patch?.startsWith("*** Begin Patch") ? patch : undefined;
+}
+
+export function orchestrationScript(tool: NormalizedToolCall): string | undefined {
   const name = baseToolName(tool.name);
-  return (name === "exec" || name === "exec_command") && typeof tool.arguments === "string" && /\btools\.[\w_]+\s*\(/.test(tool.arguments)
+  return typeof tool.arguments === "string" && (name === "exec" || name === "exec_command" && scriptCalls(tool.arguments).length > 0)
     ? tool.arguments
     : undefined;
 }
@@ -95,71 +238,351 @@ function isSemanticOperationName(name: string): boolean {
   return isDirectView(name) || isDirectGlob(name) || isDirectSearch(name) || isDirectEdit(name) || isDirectCommand(name);
 }
 
+function scriptPrints(script: string, calls: ScriptCall[]) {
+  let skeleton = "";
+  for (let index = 0; index < script.length;) {
+    const callIndex = calls.findIndex(call => call.start === index);
+    if (callIndex >= 0) { skeleton += `CALL_${callIndex}`; index = calls[callIndex].end; continue; }
+    if ('"\'`'.includes(script[index])) {
+      const end = literalEnd(script, index);
+      if (script[index] === "`" && script.slice(index, end).includes("${")) return undefined;
+      skeleton += '""'; index = end; continue;
+    }
+    if (script.startsWith("//", index)) { const end = script.indexOf("\n", index); index = end < 0 ? script.length : end + 1; continue; }
+    if (script.startsWith("/*", index)) { const end = script.indexOf("*/", index + 2); index = end < 0 ? script.length : end + 2; continue; }
+    skeleton += script[index++];
+  }
+  const bindings = new Map<string, number[]>();
+  const prints: number[] = [];
+  while ((skeleton = skeleton.trim().replace(/^;+/, "").trim())) {
+    let match: RegExpExecArray | null;
+    if ((match = /^const\s+(\w+)\s*=\s*await\s+Promise\.all(?:Settled)?\(\[([\s\S]*?)\]\)\s*;?/.exec(skeleton))) {
+      if (!/^(?:\s*CALL_\d+\s*,?)*$/.test(match[2]) || bindings.has(match[1])) return undefined;
+      bindings.set(match[1], [...match[2].matchAll(/CALL_(\d+)/g)].map(item => Number(item[1])));
+    } else if ((match = /^const\s+(\w+)\s*=\s*(?:await\s+)?CALL_(\d+)\s*;?/.exec(skeleton))) {
+      if (bindings.has(match[1])) return undefined;
+      bindings.set(match[1], [Number(match[2])]);
+    } else if ((match = /^text\(\s*(?:await\s+)?CALL_(\d+)\s*\)\s*;?/.exec(skeleton))) {
+      prints.push(Number(match[1]));
+    } else if ((match = /^text\(\s*(\w+)\s*\)\s*;?/.exec(skeleton))) {
+      const binding = bindings.get(match[1]);
+      if (!binding) return undefined;
+      prints.push(...binding);
+    } else if ((match = /^for\s*\(const\s+(\w+)\s+of\s+(\w+)\)\s*(?:\{\s*)?text\(\1\)\s*;?\s*\}?/.exec(skeleton))) {
+      const binding = bindings.get(match[2]);
+      if (!binding) return undefined;
+      prints.push(...binding);
+    } else if (!(match = /^(?:(?:await\s+)?CALL_\d+|const\s+\w+\s*=\s*"")\s*;?/.exec(skeleton))) return undefined;
+    skeleton = skeleton.slice(match[0].length);
+  }
+  return { prints, bindings };
+}
+
+function nativeCommandResult(value: unknown, allowText: boolean, decodeJson = true): CommandResult | undefined {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const record = value as Record<string, unknown>;
+    if (record.status === "fulfilled") return nativeCommandResult(record.value, allowText);
+    if (record.status === "rejected") return undefined;
+    if ("exit_code" in record || "session_id" in record) {
+      const sessionId = typeof record.session_id === "number" || typeof record.session_id === "string" ? String(record.session_id) : undefined;
+      const status = typeof record.exit_code === "number" && Number.isInteger(record.exit_code)
+        ? record.exit_code === 0 ? "completed" : "failed" : "requested";
+      return { status, sessionId };
+    }
+    if (allowText && Array.isArray(record.content)) return nativeCommandResult(record.content, true, false);
+  }
+  if (!allowText) return undefined;
+  if (Array.isArray(value)) {
+    const texts = value.filter(item => item && typeof item === "object" && (item.type === "text" || item.type === "input_text"))
+      .map(item => item.text).filter((text): text is string => typeof text === "string");
+    return nativeCommandResult(texts.join("\n"), true, decodeJson);
+  }
+  if (typeof value !== "string") return undefined;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (decodeJson && typeof parsed !== "string") return nativeCommandResult(parsed, true);
+  } catch {}
+  const header = value.split(/^(?:Final output|Output):[^\S\r\n]*$/im)[0];
+  const exit = /^(?:Exit code:|Process exited with code)\s*(-?\d+)\s*$/im.exec(header);
+  const sessionId = /^Process running with session ID\s+(\d+)\s*$/im.exec(header)?.[1];
+  return exit ? { status: Number(exit[1]) === 0 ? "completed" : "failed", sessionId }
+    : sessionId ? { status: "requested", sessionId } : undefined;
+}
+
+function printedValues(value: unknown): unknown[] {
+  if (Array.isArray(value)) return value.flatMap(printedValues);
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    if ("exit_code" in record || "session_id" in record) return [record];
+    if (record.type === "text" || record.type === "input_text") return printedValues(record.text ?? record.value);
+    if (Array.isArray(record.content) || typeof record.content === "string") return printedValues(record.content);
+    return [record];
+  }
+  if (typeof value !== "string" || /^Script completed\s*$/.test(value)) return [];
+  try { const parsed: unknown = JSON.parse(value); return Array.isArray(parsed) ? parsed : [parsed]; } catch {}
+  const lines = value.replace(/^Script completed\s*\n/, "").trim().split(/\r?\n/);
+  try { return lines.map(line => JSON.parse(line) as unknown); } catch { return [value]; }
+}
+
+export function commandResults(value: unknown, tool: NormalizedToolCall | undefined, allowText = false): CommandResult[] {
+  const script = tool && orchestrationScript(tool);
+  if (!script) {
+    const result = nativeCommandResult(value, allowText);
+    return result ? [result] : [];
+  }
+  const layout = scriptPrints(script, scriptCalls(script));
+  if (!layout?.prints.length) return [];
+  const values = printedValues(value);
+  if (values.length !== layout.prints.length) return [];
+  return values.map((item, index) => ({ ...(nativeCommandResult(item, true) ?? { status: "requested" as const }), operationIndex: layout.prints[index] }));
+}
+
+export function commandResultStatus(results: CommandResult[]): NormalizedToolCall["status"] {
+  return results.at(-1)?.status ?? "requested";
+}
+
 function nestedOperations(tool: NormalizedToolCall): NormalizedToolCall[] {
   const script = orchestrationScript(tool);
-  if (!script) return [tool];
-  const matches = [...script.matchAll(/\btools\.([a-zA-Z0-9_]+)\s*\(/g)];
-  const nestedCommandCount = matches.filter((match) => isDirectCommand(match[1])).length;
-  const wrapperFailed = tool.status === "failed" || /Exit code:\s*(?!0\b)\d+/i.test(tool.outputText ?? "");
+  if (!script) return [{ ...tool }];
+  const matches = scriptCalls(script);
+  const layout = scriptPrints(script, matches);
   const operations: NormalizedToolCall[] = [];
   for (let index = 0; index < matches.length; index += 1) {
-    const name = matches[index][1];
-    if (!isSemanticOperationName(name)) continue;
-    const start = matches[index].index ?? 0;
-    const end = matches[index + 1]?.index ?? script.length;
-    const callSource = script.slice(start, end);
+    const name = matches[index].name;
+    const polling = baseToolName(name) === "write_stdin";
+    if (!isSemanticOperationName(name) && !polling) continue;
+    const callSource = matches[index].source;
     let args: unknown = callSource;
+    let pollForToolCallId: string | undefined;
     if (isDirectCommand(name)) {
       args = {
-        command: embeddedProperty(callSource, "command") ?? embeddedProperty(script, "command"),
-        workdir: embeddedProperty(callSource, "workdir") ?? embeddedProperty(script, "workdir")
+        command: embeddedProperty(callSource, "command") ?? embeddedProperty(callSource, "cmd"),
+        workdir: embeddedProperty(callSource, "workdir")
       };
+    } else if (polling) {
+      args = { session_id: embeddedProperty(callSource, "session_id") };
+      const variable = /[,{]\s*session_id\s*:\s*(\w+)\.session_id\s*[,}]/.exec(callSource)?.[1];
+      const binding = variable && supportedArguments(callSource) ? layout?.bindings.get(variable) : undefined;
+      if (binding?.length === 1 && binding[0] < index) pollForToolCallId = `${tool.toolCallId}:nested:${binding[0] + 1}`;
     } else if (isDirectEdit(name)) {
-      args = embeddedPatch(callSource) ?? embeddedPatch(script) ?? callSource;
+      if (baseToolName(name) === "apply_patch") args = embeddedPatch(callSource) ?? boundPatch(script, matches[index]) ?? callSource;
+      else {
+        const targets: Record<string, string | null> = {};
+        for (const key of ["path", "file_path", "filePath", "file", "filename", "uri", "target", "destination", "output", "paths", "files", "targets"]) {
+          const value = embeddedProperty(callSource, key);
+          if (value !== undefined) targets[key] = value;
+        }
+        args = targets;
+      }
     } else {
       const path = embeddedProperty(callSource, "path") ?? embeddedProperty(callSource, "file") ?? embeddedProperty(callSource, "uri");
       args = path ? { path } : callSource;
     }
+    const results = tool.commandResults?.filter(result => result.operationIndex === index) ?? [];
     operations.push({
       ...tool,
       toolCallId: `${tool.toolCallId}:nested:${index + 1}`,
+      originToolCallId: tool.toolCallId,
+      pollForToolCallId,
       name,
       arguments: args,
-      status: isDirectCommand(name) && wrapperFailed ? (nestedCommandCount === 1 ? "failed" : "requested") : tool.status
+      commandResults: results,
+      status: isDirectCommand(name) || polling ? commandResultStatus(results) : tool.status
     });
   }
-  return operations.length ? operations : [tool];
+  return operations.length ? operations : [{ ...tool }];
 }
 
 export function expandToolCalls(tools: NormalizedToolCall[]): NormalizedToolCall[] {
-  return tools.flatMap(nestedOperations);
+  const operations = tools.flatMap(nestedOperations);
+  const commands = new Map<string, NormalizedToolCall>();
+  const commandByCallId = new Map<string, NormalizedToolCall>();
+  for (const tool of operations) {
+    if (isDirectCommand(tool.name)) commandByCallId.set(tool.toolCallId, tool);
+    const result = tool.commandResults?.at(-1);
+    if (isDirectCommand(tool.name) && result?.sessionId) commands.set(result.sessionId, tool);
+    if (baseToolName(tool.name) !== "write_stdin" || !result) continue;
+    const args = commandArgumentRecord(tool.arguments);
+    const sessionId = args?.session_id === undefined ? undefined : String(args.session_id);
+    const target = tool.pollForToolCallId ? commandByCallId.get(tool.pollForToolCallId) : sessionId ? commands.get(sessionId) : undefined;
+    const targetSession = target?.commandResults?.at(-1)?.sessionId;
+    if (!target || !targetSession || result.sessionId && result.sessionId !== targetSession) continue;
+    if (result.sessionId) commandByCallId.set(tool.toolCallId, target);
+    target.status = result.status;
+  }
+  return operations;
+}
+
+function commandArgumentRecord(args: unknown): Record<string, unknown> | undefined {
+  if (typeof args === "string") { try { return commandArgumentRecord(JSON.parse(args)); } catch { return undefined; } }
+  return args && typeof args === "object" ? args as Record<string, unknown> : undefined;
 }
 
 export function toolCommand(tool: NormalizedToolCall): string | undefined {
   if (!isCommandTool(tool)) return undefined;
   const args = tool.arguments;
-  if (typeof args === "string") return embeddedProperty(args, "command") ?? args;
-  if (!args || typeof args !== "object") return undefined;
-  const record = args as Record<string, unknown>;
-  if (typeof record.command === "string") return record.command;
-  const nested = record.arguments;
-  if (nested && typeof nested === "object" && typeof (nested as Record<string, unknown>).command === "string") {
-    return (nested as Record<string, unknown>).command as string;
+  if (typeof args === "string") {
+    try { return argumentString(JSON.parse(args), ["command", "cmd"]) ?? undefined; } catch { /* Native shell strings are also valid. */ }
+    return embeddedProperty(args, "command") ?? embeddedProperty(args, "cmd") ?? args;
   }
+  return argumentString(args, ["command", "cmd"]) ?? undefined;
+}
+
+function argumentString(args: unknown, keys: string[]): string | null | undefined {
+  const record = commandArgumentRecord(args);
+  if (!record) return undefined;
+  for (const key of keys) {
+    if (record[key] === undefined) continue;
+    return typeof record[key] === "string" ? record[key] : null;
+  }
+  if (record.arguments !== args) return argumentString(record.arguments, keys);
   return undefined;
 }
 
-function toolWorkdir(tool: NormalizedToolCall): string | undefined {
-  const args = tool.arguments;
-  if (typeof args === "string") return embeddedProperty(args, "workdir");
-  if (!args || typeof args !== "object") return undefined;
-  const record = args as Record<string, unknown>;
-  if (typeof record.workdir === "string") return record.workdir;
-  const nested = record.arguments;
-  if (nested && typeof nested === "object" && typeof (nested as Record<string, unknown>).workdir === "string") {
-    return (nested as Record<string, unknown>).workdir as string;
+export function resolveExecutionPath(value: unknown, base?: string): string | undefined {
+  if (value === undefined) return base;
+  if (typeof value !== "string") return undefined;
+  const target = value.trim().replace(/^["']|["']$/g, "").replace(/\\/g, "/").toLowerCase();
+  if (!target || /^[$%~]/.test(target) || /^[a-z][\w+.-]*:\/\//i.test(target)) return undefined;
+  if (path.posix.isAbsolute(target) || path.win32.isAbsolute(target)) return path.posix.normalize(target).replace(/\/$/, "");
+  return base ? path.posix.normalize(`${base}/${target}`).replace(/\/$/, "") : undefined;
+}
+
+function assignmentPrefix(command: string): { name: string; value: string | null; end: number } | undefined {
+  const name = /^([A-Za-z_]\w*)=/.exec(command);
+  if (!name) return undefined;
+  const start = name[0].length;
+  let index = start;
+  while (index < command.length && !/\s/.test(command[index])) {
+    const char = command[index];
+    if (char === "'" || char === '"') {
+      const end = literalEnd(command, index);
+      if (command[end - 1] !== char) return undefined;
+      index = end;
+    } else if (command.startsWith("$(", index)) {
+      let depth = 1;
+      index += 2;
+      while (index < command.length && depth) {
+        if (command[index] === "'" || command[index] === '"') index = literalEnd(command, index);
+        else {
+          if (command[index] === "(") depth++;
+          if (command[index] === ")") depth--;
+          index++;
+        }
+      }
+      if (depth) return undefined;
+    } else {
+      if (/[;&|<>`\\]/.test(char)) return undefined;
+      index++;
+    }
   }
-  return undefined;
+  if (index === command.length || !command.slice(index).trim()) return undefined;
+  const raw = command.slice(start, index);
+  const value = /^[A-Za-z0-9_./:-]*$/.test(raw) ? raw
+    : /^'[^']*'$/.test(raw) || /^"[^"$`\\]*"$/.test(raw) ? raw.slice(1, -1) : null;
+  return { name: name[1], value, end: index };
+}
+
+function commandContext(tool: NormalizedToolCall): { command?: string; directory?: string; environment?: Record<string, string | null> } {
+  const environment = new Map<string, string | null>();
+  let context = resolveExecutionPath(argumentString(tool.arguments, ["workdir"]), resolveExecutionPath(tool.executionCwd));
+  let command = (toolCommand(tool) ?? "").trim().replace(/^rtk\s+(?:proxy\s+)?/i, "");
+  const prefix = /^(?:cd|set-location)\s+(?:"([^"]+)"|'([^']+)'|([^\s;|&]+))\s*(?:&&|;)\s*/i;
+  let match: RegExpExecArray | null;
+  let shells = 0;
+  let environments = 0;
+  while (true) {
+    if (/^env\s/.test(command)) {
+      if (environments++) return { environment: Object.fromEntries(environment) };
+      command = command.replace(/^env\s+/, "").replace(/^rtk\s+(?:proxy\s+)?/i, "");
+      if (/^-/.test(command)) return { environment: Object.fromEntries(environment) };
+      continue;
+    }
+    const assignment = assignmentPrefix(command);
+    if (assignment) {
+      environment.set(assignment.name, assignment.value);
+      command = command.slice(assignment.end).trimStart().replace(/^rtk\s+(?:proxy\s+)?/i, "");
+      continue;
+    }
+    if (/^[A-Za-z_]\w*=/.test(command)) return { environment: Object.fromEntries(environment) };
+    match = /^(?:\/(?:usr\/)?bin\/)?(?:bash|sh)\s+-(?:lc|cl|c)\s+(?:'([^']*)'|"([^"]*)")\s*$/i.exec(command);
+    if (match) {
+      if (shells++) return { environment: Object.fromEntries(environment) };
+      command = (match[1] ?? match[2]).trim().replace(/^rtk\s+(?:proxy\s+)?/i, "");
+      continue;
+    }
+    if (/[$`]/.test(command)) return { command, environment: Object.fromEntries(environment) };
+    match = prefix.exec(command);
+    if (!match) break;
+    const directory = match[1] ?? match[2] ?? match[3];
+    if (directory === "-" || /[*?{}]/.test(directory)) return { command, environment: Object.fromEntries(environment) };
+    context = resolveExecutionPath(directory, context);
+    command = command.slice(match[0].length).replace(/^rtk\s+(?:proxy\s+)?/i, "");
+  }
+  if (/(?:^|[\s;&|])(?:\/(?:usr\/)?bin\/)?(?:bash|sh|zsh|pwsh|powershell|cmd)(?:\s|$)/i.test(command)) return { environment: Object.fromEntries(environment) };
+  if (/\b(?:cd|set-location|pushd|popd|source|eval)\s/i.test(command)) return { environment: Object.fromEntries(environment) };
+  match = /^git\s+-C\s+(?:"([^"]+)"|'([^']+)'|([^\s;|&]+))/i.exec(command);
+  if (match) {
+    const directory = match[1] ?? match[2] ?? match[3];
+    if (/[*?{}]/.test(directory)) return { command, environment: Object.fromEntries(environment) };
+    context = resolveExecutionPath(directory, context);
+  }
+  return { command, directory: context, environment: Object.fromEntries(environment) };
+}
+
+export function executionDirectory(tool: NormalizedToolCall): string | undefined {
+  return commandContext(tool).directory;
+}
+
+export function verificationCommand(tool: NormalizedToolCall): string | undefined {
+  return commandContext(tool).command;
+}
+
+export function commandEnvironment(tool: NormalizedToolCall): Record<string, string | null> {
+  return commandContext(tool).environment ?? {};
+}
+
+export function executionScope(tool: NormalizedToolCall): string | undefined {
+  const directory = executionDirectory(tool);
+  const root = resolveExecutionPath(tool.executionRoot);
+  return directory && root && (directory === root || directory.startsWith(`${root}/`)) ? root : directory;
+}
+
+export function editTargets(tool: NormalizedToolCall): Array<string | undefined> {
+  const args = tool.arguments;
+  if (baseToolName(tool.name) === "apply_patch" && typeof args === "string") {
+    return [...new Set([...args.matchAll(/^\*\*\* (?:(?:Add|Update|Delete) File|Move to):\s*(.+)$/gm)].map(match => match[1].trim()))];
+  }
+  const targets: Array<string | undefined> = [];
+  const visit = (value: unknown): void => {
+    if (!value || typeof value !== "object") return;
+    if (Array.isArray(value)) { value.forEach(visit); return; }
+    for (const [key, item] of Object.entries(value)) {
+      if (/^(?:path|file|filePath|file_path|filename|uri|target|destination|output)$/i.test(key)) targets.push(typeof item === "string" ? item : undefined);
+      else if (/^(?:paths|files|targets)$/i.test(key)) targets.push(...(Array.isArray(item) ? item.map(target => typeof target === "string" ? target : undefined) : [undefined]));
+      else if (key === "arguments") visit(commandArgumentRecord(item));
+      else visit(item);
+    }
+  };
+  visit(commandArgumentRecord(args));
+  return [...new Set(targets)];
+}
+
+export function editExecutionScope(tool: NormalizedToolCall): string | undefined {
+  const scope = executionScope(tool);
+  const directory = executionDirectory(tool);
+  const targets = editTargets(tool);
+  if (!scope || !targets.length) return undefined;
+  return targets.every(target => {
+    if (!target) return false;
+    const resolved = resolveExecutionPath(target, directory);
+    return resolved && (resolved === scope || resolved.startsWith(`${scope}/`));
+  }) ? scope : undefined;
+}
+
+export function executionScopesMatch(left: string | undefined, right: string | undefined): boolean {
+  const scope = resolveExecutionPath(left);
+  return Boolean(scope && scope === resolveExecutionPath(right));
 }
 
 export function isViewTool(tool: NormalizedToolCall): boolean {
@@ -179,25 +602,46 @@ export function isEditTool(tool: NormalizedToolCall): boolean {
 }
 
 export function isCommandTool(tool: NormalizedToolCall): boolean {
-  if (orchestrationScript(tool)) return nestedOperations(tool).some((operation) => operation !== tool && isDirectCommand(operation.name));
-  return isDirectCommand(tool.name);
+  return !orchestrationScript(tool) && isDirectCommand(tool.name);
+}
+
+export type CommandCheckType = "test" | "build" | "lint" | "typecheck" | "document_build" | "diff_check";
+
+export function commandCheckType(tool: NormalizedToolCall): CommandCheckType | undefined {
+  if (isEditTool(tool)) return undefined;
+  const command = verificationCommand(tool);
+  if (!command) return undefined;
+  const tokens = command.match(/"[^"]*"|'[^']*'|[^\s]+/g) ?? [];
+  if (tokens.some(token => !/^["']/.test(token) && /[;&|<>`$]/.test(token))) return undefined;
+  const words = tokens.map(token => token.replace(/^["']|["']$/g, "").replace(/\\/g, "/").toLowerCase());
+  let executable = words.shift()?.split("/").at(-1)?.replace(/\.exe$/, "");
+  if (executable === "npx") executable = words.shift();
+  let action = executable ?? "";
+  if (["npm", "pnpm", "yarn", "bun"].includes(action)) {
+    action = words[0] === "run" ? words[1] ?? "" : words[0] ?? "";
+    if (action === "test") return "test";
+  }
+  else if (["node", "python", "python3", "pwsh", "powershell"].includes(action)) {
+    if (action === "node" && words[0] === "--check") return "build";
+    if (action === "node" && words[0] === "--test") return "test";
+    if (["-e", "--eval", "-c"].includes(words[0])) return undefined;
+    action = words.find(word => !word.startsWith("-"))?.split("/").at(-1) ?? "";
+  } else if (action === "git") {
+    const args = words[0] === "-c" ? words.slice(2) : words;
+    return args[0] === "diff" && args.includes("--check") ? "diff_check" : undefined;
+  } else if (["cargo", "go", "dotnet", "mvn", "gradle", "gradlew"].includes(action)) return words[0] === "test" ? "test" : words[0] === "build" ? "build" : undefined;
+  if (/^(?:pandoc|mkdocs|sphinx-build|render_docx|export_whitepaper|docs?:build|build[-_:]?(?:docs?|document|whitepaper))(?:\.|$|[-_:])/.test(action)) return "document_build";
+  if (/^(?:typecheck|type-check|tsc|mypy)(?:$|[-_:.])/.test(action)) return "typecheck";
+  if (/^(?:test(?=[-_.:])|vitest|pytest|jest|gut)(?:$|[-_:.])/.test(action)) return "test";
+  if (/^(?:lint|eslint|ruff|cspell)(?:$|[-_:.])/.test(action)) return "lint";
+  if (/^(?:build|validate|check)(?:$|[-_:.])/.test(action)) return "build";
+  if (action === "godot.ps1" && ["parse", "boot", "test", "export", "check-android-env"].some(value => words.includes(value))) return "build";
+  if (action === "godot" && words.includes("--headless")) return "build";
+  return undefined;
 }
 
 export function looksLikeVerificationTool(tool: NormalizedToolCall): boolean {
-  if (tool.name === "report_intent" || isEditTool(tool)) return false;
-  const command = toolCommand(tool);
-  if (!command) return false;
-  const normalized = command.replace(/\\/g, "/").toLowerCase();
-  return [
-    /(?:^|[;&|]\s*|\s)(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|build|lint|check|validate|typecheck)(?:[:_-][\w-]+)*\b/,
-    /\b(?:vitest|pytest|jest|cargo\s+test|go\s+test|dotnet\s+test|mvn\s+test|gradle\w*\s+test|eslint|ruff|mypy)\b/,
-    /(?:^|\s)tsc(?:\s|$)/,
-    /\bnode\s+--check\b/,
-    /\bgit\b[^\r\n;|]*\bdiff\s+--check\b/,
-    /(?:^|\s)[^\s;|]*(?:test|validate|lint|check)(?:[-_][\w-]+)?\.(?:ps1|sh|js|mjs|cjs|ts|py)(?:\s|$)/,
-    /\btools\/godot\.ps1\b[^\r\n;|]*\b(?:parse|boot|test|export|check-android-env)\b/,
-    /\bgodot(?:\.exe)?\b[^\r\n;|]*\b--headless\b/
-  ].some((pattern) => pattern.test(normalized));
+  return commandCheckType(tool) !== undefined;
 }
 
 export function canonicalCommand(command: string): string {
@@ -210,10 +654,10 @@ export function canonicalCommand(command: string): string {
 }
 
 export function verificationLaneKey(tool: NormalizedToolCall): string {
-  const command = canonicalCommand(toolCommand(tool) ?? tool.name);
-  const explicitWorkdir = toolWorkdir(tool)?.replace(/\\/g, "/").replace(/\/$/, "").toLowerCase();
-  const commandWorkdir = /(?:^|[;&|]\s*)(?:cd|set-location)\s+["']?([^"';|]+)["']?/i.exec(command)?.[1]?.trim();
-  const workdir = explicitWorkdir ?? commandWorkdir ?? "unknown-workdir";
+  const command = canonicalCommand(verificationCommand(tool) ?? toolCommand(tool) ?? tool.name);
+  const assignments = Object.entries(commandEnvironment(tool)).sort(([left], [right]) => left.localeCompare(right));
+  const environment = assignments.length ? `|env:${JSON.stringify(assignments)}${assignments.some(([, value]) => value === null) ? `|unknown:${tool.toolCallId}` : ""}` : "";
+  const workdir = `${executionDirectory(tool) ?? `unknown-workdir:${tool.toolCallId}`}${environment}`;
   const packageScript = /\b(npm|pnpm|yarn|bun)\s+(?:run\s+)?((?:test|build|lint|check|validate|typecheck)(?:[:_-][\w-]+)*)\b/.exec(command);
   if (packageScript) return `${workdir}|${packageScript[1]}:${packageScript[2]}|${command}`;
   const godot = /\btools\/godot\.ps1\b.*?\b(parse|boot|test|export(?:-web)?|check-android-env)\b/.exec(command);
@@ -228,43 +672,55 @@ export function verificationLaneKey(tool: NormalizedToolCall): string {
 }
 
 export function canonicalToolSignature(tool: NormalizedToolCall): string {
-  if (isCommandTool(tool)) return `${baseToolName(tool.name)}:${verificationLaneKey(tool)}`;
-  return `${baseToolName(tool.name)}:${JSON.stringify(stableValue(tool.arguments))}`;
+  if (isCommandTool(tool)) {
+    // Unknown commands are not evidence that two operations were redundant.
+    if (!toolCommand(tool)) return `${baseToolName(tool.name)}:unknown:${tool.toolCallId}`;
+    return `${baseToolName(tool.name)}:${verificationLaneKey(tool)}`;
+  }
+  return `${baseToolName(tool.name)}:${executionDirectory(tool) ?? "unknown-workdir"}:${JSON.stringify(stableValue(tool.arguments))}`;
 }
 
 export function verificationClosureForTools(tools: NormalizedToolCall[]): VerificationClosure {
   const semanticTools = expandToolCalls(tools);
-  const lastEdit = semanticTools.reduce((last, tool, index) => (isDirectEdit(tool.name) && tool.status === "completed" ? index : last), -1);
-  if (lastEdit < 0) return "not_applicable";
-  const checks = semanticTools
-    .map((tool, index) => ({ tool, index }))
-    .filter(({ tool, index }) => index > lastEdit && looksLikeVerificationTool(tool));
-  if (!checks.length) return "missing";
-
-  const finalByLane = new Map<string, NormalizedToolCall["status"]>();
-  for (const { tool } of checks) finalByLane.set(verificationLaneKey(tool), tool.status);
-  const finalStatuses = [...finalByLane.values()];
+  const lastEditByScope = new Map<string | undefined, number>();
+  semanticTools.forEach((tool, index) => {
+    if (isDirectEdit(tool.name) && tool.status === "completed") lastEditByScope.set(editExecutionScope(tool), index);
+  });
+  if (!lastEditByScope.size) return "not_applicable";
+  const finalStatuses: NormalizedToolCall["status"][] = [];
+  for (const [scope, lastEdit] of lastEditByScope) {
+    const finalByLane = new Map<string, NormalizedToolCall["status"]>();
+    if (scope) semanticTools.forEach((tool, index) => {
+      if (index > lastEdit && looksLikeVerificationTool(tool) && executionScopesMatch(scope, executionScope(tool))) {
+        finalByLane.set(verificationLaneKey(tool), tool.status);
+      }
+    });
+    finalStatuses.push(...(finalByLane.size ? finalByLane.values() : ["unknown" as const]));
+  }
   if (finalStatuses.some((status) => status === "failed")) return "failed";
   if (finalStatuses.every((status) => status === "completed")) return "passed";
   return "missing";
 }
 
 export function repeatedFailureStats(tools: NormalizedToolCall[]): { repeated: number; failed: number } {
-  const activeFailures = new Map<string, number>();
+  const activeFailures = new Map<string, { attempts: number; scope?: string }>();
   let repeated = 0;
   let failed = 0;
   for (const tool of expandToolCalls(tools)) {
     if (isDirectEdit(tool.name) && tool.status === "completed") {
-      activeFailures.clear();
+      const scope = editExecutionScope(tool);
+      for (const [key, failure] of activeFailures) {
+        if (executionScopesMatch(scope, failure.scope)) activeFailures.delete(key);
+      }
       continue;
     }
     if (!isCommandTool(tool)) continue;
     const key = canonicalToolSignature(tool);
     if (tool.status === "failed") {
       failed += 1;
-      const attempts = activeFailures.get(key) ?? 0;
+      const attempts = activeFailures.get(key)?.attempts ?? 0;
       if (attempts > 0) repeated += 1;
-      activeFailures.set(key, attempts + 1);
+      activeFailures.set(key, { attempts: attempts + 1, scope: executionScope(tool) });
     } else if (tool.status === "completed") {
       activeFailures.delete(key);
     }

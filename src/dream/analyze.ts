@@ -1,11 +1,17 @@
-import path from "node:path";
 import {
   expandToolCalls,
-  isCommandTool,
+  executionDirectory,
+  editTargets,
+  commandCheckType,
+  verificationCommand,
+  executionScope,
+  executionScopesMatch,
+  resolveExecutionPath,
   isEditTool,
   isGlobTool,
   isViewTool,
-  toolCommand
+  toolCommand,
+  verificationLaneKey
 } from "../normalize/toolSemantics.js";
 import type {
   EvidenceRef,
@@ -126,16 +132,6 @@ function baseToolName(name: string): string {
   return name.toLowerCase().split(/__|[.:/]/).filter(Boolean).at(-1) ?? name.toLowerCase();
 }
 
-function valueText(value: unknown): string {
-  if (typeof value === "string") return value;
-  if (value === undefined) return "";
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
-}
-
 function evidenceId(sessionId: string, suffix: string): string {
   return `${sessionId}:analysis:${suffix.replace(/[^a-zA-Z0-9._:-]/g, "_")}`;
 }
@@ -234,10 +230,15 @@ function segmentTasks(session: NormalizedSession): TaskDraft[] {
 function orderedActions(session: NormalizedSession): Map<NormalizedTurn, OrderedAction[]> {
   const byTurn = new Map<NormalizedTurn, OrderedAction[]>();
   let actionIndex = 0;
+  const expandedByCall = new Map<string, NormalizedToolCall[]>();
+  for (const tool of expandToolCalls(session.turns.flatMap(turn => turn.toolCalls))) {
+    const key = tool.originToolCallId ?? tool.toolCallId;
+    expandedByCall.set(key, [...expandedByCall.get(key) ?? [], tool]);
+  }
   for (const turn of session.turns) {
     const actions: OrderedAction[] = [];
     for (const original of turn.toolCalls) {
-      for (const tool of expandToolCalls([original])) {
+      for (const tool of expandedByCall.get(original.toolCallId) ?? []) {
         actions.push({ actionIndex: actionIndex++, turn, tool });
       }
     }
@@ -268,11 +269,6 @@ function pathValues(value: unknown, depth = 0): string[] {
     }
   }
   return paths;
-}
-
-function patchTargets(tool: NormalizedToolCall): string[] {
-  const text = valueText(tool.arguments);
-  return [...text.matchAll(/^\*\*\* (?:Add|Update|Delete) File:\s*(.+)$/gm)].map((match) => match[1].trim());
 }
 
 function shellVariables(command: string): Map<string, string> {
@@ -352,10 +348,10 @@ function shellMutation(command: string): ShellMutation | undefined {
 
 function shellReadTarget(command: string): string | undefined {
   const variables = shellVariables(command);
+  const read = /^\s*(Get-Content|Select-String|Test-Path|Get-ChildItem|Get-Item|Resolve-Path|cat|type|ls)\b/i.exec(command);
+  if (!read) return undefined;
   const named = namedShellTargets(command, variables);
   if (named.length) return named.at(-1);
-  const read = /\b(Get-Content|Select-String|Test-Path|Get-ChildItem|Get-Item|Resolve-Path|cat|type|ls)\b/i.exec(command);
-  if (!read) return undefined;
   const segment = command.slice(read.index).split(/[;|\r\n]/, 1)[0];
   return pathLikeTokens(segment, variables).at(-1);
 }
@@ -373,23 +369,21 @@ function canonicalTarget(target: string | undefined): string | undefined {
   return normalized || undefined;
 }
 
-function repoName(session: NormalizedSession): string | undefined {
-  const normalized = canonicalTarget(session.repoRoot);
-  return normalized?.split("/").at(-1);
+export function repositoryVerificationMatches(change: DreamChangeClassification, check: VerificationCheck): boolean {
+  const scope = canonicalTarget(change.executionScope);
+  const target = canonicalTarget(change.target);
+  const checkScope = check.target?.startsWith("repo:") ? canonicalTarget(check.target.slice(5)) : undefined;
+  if (!scope || !target || !checkScope) return false;
+  if (!["product_code", "tests", "documentation", "repository_metadata"].includes(change.changeType)) return false;
+  return (target === scope || target.startsWith(`${scope}/`)) &&
+    executionScopesMatch(scope, checkScope);
 }
 
-function repoTarget(session: NormalizedSession): string {
-  return `repo:${repoName(session) ?? canonicalTarget(session.repoRoot) ?? "unknown"}`;
-}
-
-function isRepoPath(target: string, session: NormalizedSession): boolean {
+function isRepoPath(target: string, executionScope?: string): boolean {
   const normalized = canonicalTarget(target);
   if (!normalized) return false;
-  if (!path.win32.isAbsolute(target) && !path.posix.isAbsolute(target) && !/^[$%~]/.test(target)) return true;
-  const root = canonicalTarget(session.repoRoot);
-  if (root && (normalized === root || normalized.startsWith(`${root}/`))) return true;
-  const name = repoName(session);
-  return Boolean(name && new RegExp(`/worktrees/[^/]+/${name}(?:/|$)`, "i").test(normalized));
+  const scope = canonicalTarget(executionScope);
+  return Boolean(scope && (normalized === scope || normalized.startsWith(`${scope}/`)));
 }
 
 function fileName(target: string): string {
@@ -400,7 +394,7 @@ function generatedAssetPath(target: string): boolean {
   return /\.(?:png|jpe?g|gif|webp|bmp|ico|svg|mp3|wav|flac|ogg|mp4|webm|pdf|docx|pptx|xlsx)$/i.test(target);
 }
 
-function classifyTarget(target: string | undefined, session: NormalizedSession, operation?: ShellMutation["operation"]): {
+function classifyTarget(target: string | undefined, executionScope: string | undefined, operation?: ShellMutation["operation"]): {
   type: DreamChangeType;
   confidence: DreamConfidence;
   reason: string;
@@ -412,7 +406,7 @@ function classifyTarget(target: string | undefined, session: NormalizedSession, 
   if (normalized && generatedAssetPath(normalized)) {
     return { type: "generated_asset", confidence: "high", reason: "target has a generated-asset file type" };
   }
-  if (target && isRepoPath(target, session)) {
+  if (target && isRepoPath(target, executionScope)) {
     const name = fileName(target);
     if (/(?:^|\/)(?:tests?|specs?|__tests__|fixtures)(?:\/|$)|\.(?:test|spec)\.[^.]+$/i.test(normalized ?? target)) {
       return { type: "tests", confidence: "high", reason: "target is a repository test or fixture" };
@@ -439,17 +433,14 @@ function classifyTarget(target: string | undefined, session: NormalizedSession, 
 }
 
 function effectiveOutcome(tool: NormalizedToolCall): EffectiveOutcome {
-  const output = tool.outputText ?? "";
   if (tool.status === "failed") return "failed";
-  if (/apply_patch verification failed|failed to find expected lines|invalid context|patch failed/i.test(output)) return "failed";
-  if (/Exit code:\s*(?!0\b)\d+|Script failed|Tool call failed/i.test(output)) return "failed";
   if (tool.status === "completed") return "passed";
   return "unknown";
 }
 
 function mutationKind(action: OrderedAction): {
   mutation: boolean;
-  targets: string[];
+  targets: Array<string | undefined>;
   shell?: ShellMutation;
   forcedType?: DreamChangeType;
   confidence?: DreamConfidence;
@@ -462,11 +453,11 @@ function mutationKind(action: OrderedAction): {
   if (shell) return { mutation: true, targets: shell.targets, shell };
 
   if (isEditTool(tool)) {
-    const targets = [...patchTargets(tool), ...pathValues(argumentRecord(tool))];
+    const targets = editTargets(tool);
     return { mutation: true, targets };
   }
 
-  if (generatedToolNames.test(`${tool.name} ${name}`)) {
+  if (generatedToolNames.test(`${tool.name} ${name}`) && !/view|inspect|read/i.test(tool.name)) {
     const outputPaths = [...(tool.outputText ?? "").matchAll(/(?:[a-z]:)?[^\s"']+\.(?:png|jpe?g|webp|gif|svg|mp3|wav|mp4|pdf|docx|pptx|xlsx)/gi)].map(
       (match) => match[0]
     );
@@ -507,18 +498,23 @@ function classifyChanges(session: NormalizedSession, taskId: string, actions: Or
     const semantic = mutationKind(action);
     if (!semantic.mutation) continue;
     const outcome = effectiveOutcome(action.tool);
+    const directory = executionDirectory(action.tool);
+    const scope = executionScope(action.tool);
     const rawTargets = semantic.targets.length ? semantic.targets : [undefined];
     rawTargets.forEach((rawTarget, targetIndex) => {
+      const target = rawTarget === undefined ? undefined : semantic.forcedType === "external_system"
+        ? canonicalTarget(rawTarget) : filesystemTarget(rawTarget, directory);
       const classified = semantic.forcedType
         ? { type: semantic.forcedType, confidence: semantic.confidence ?? "medium", reason: semantic.reason ?? "tool semantics" }
-        : classifyTarget(rawTarget, session, semantic.shell?.operation);
+        : classifyTarget(target ?? canonicalTarget(rawTarget), scope, semantic.shell?.operation);
       const policy = DREAM_CHANGE_POLICY[classified.type];
       const refs = toDreamRefs(session.sessionId, action.tool.evidence, `${taskId}:change:${action.actionIndex}:${targetIndex}`);
       changes.push({
         changeId: `${taskId}:change:${action.actionIndex}:${targetIndex + 1}`,
         actionIndex: action.actionIndex,
         changeType: classified.type,
-        target: canonicalTarget(rawTarget),
+        target: target ?? canonicalTarget(rawTarget),
+        executionScope: scope,
         stateChanging: outcome === "passed",
         verificationRequired: policy.verificationRequired,
         acceptableVerificationTypes: [...policy.acceptableVerificationTypes],
@@ -539,33 +535,26 @@ function classifyChanges(session: NormalizedSession, taskId: string, actions: Or
   return changes;
 }
 
-function commandWorkdir(tool: NormalizedToolCall): string | undefined {
-  const record = argumentRecord(tool);
-  if (typeof record?.workdir === "string") return record.workdir;
-  const nested = record?.arguments;
-  if (nested && typeof nested === "object" && typeof (nested as Record<string, unknown>).workdir === "string") {
-    return (nested as Record<string, unknown>).workdir as string;
-  }
-  const command = toolCommand(tool) ?? "";
-  return /(?:^|[;&]\s*)(?:cd|set-location)\s+["']?([^"';|]+)["']?/i.exec(command)?.[1]?.trim();
+function filesystemTarget(value: string | undefined, directory?: string): string | undefined {
+  const target = canonicalTarget(value);
+  if (!target) return undefined;
+  return /^%(?:codex_home|userprofile)%\//.test(target) ? target : resolveExecutionPath(target, directory);
 }
 
-function verificationType(action: OrderedAction, session: NormalizedSession): { type: DreamVerificationType; target?: string } | undefined {
+function verificationType(action: OrderedAction): { type: DreamVerificationType; target?: string } | undefined {
   const { tool } = action;
   const name = baseToolName(tool.name);
-  const command = toolCommand(tool);
-  const normalized = command?.replace(/\\/g, "/").toLowerCase() ?? "";
+  const command = verificationCommand(tool);
   const directTargets = pathValues(argumentRecord(tool));
-
-  if (/\bgit\b[^\r\n;|]*\b(?:diff|status)\b/.test(normalized) || /\bdiff\s+--check\b/.test(normalized)) {
-    return { type: "diff_check", target: repoTarget(session) };
-  }
+  const directory = executionDirectory(tool);
+  const scope = executionScope(tool);
+  const repositoryTarget = scope ? `repo:${scope}` : undefined;
 
   // PowerShell's Test-Path is an observation, not a repository test suite.
   // Resolve read targets before applying the broad command-name matchers below.
   const readTarget = command ? shellReadTarget(command) : undefined;
   if (readTarget) {
-    const canonical = canonicalTarget(readTarget);
+    const canonical = filesystemTarget(readTarget, directory);
     if (canonical && /%codex_home%\/automations\//.test(canonical) && /\b(?:Test-Path|Select-String)\b/i.test(command ?? "")) {
       return { type: "persistence_check", target: canonical };
     }
@@ -575,31 +564,20 @@ function verificationType(action: OrderedAction, session: NormalizedSession): { 
     return { type: "read_back", target: canonical };
   }
 
-  if (/\b(?:typecheck|type-check|tsc|mypy)\b/.test(normalized)) return { type: "typecheck", target: repoTarget(session) };
-  if (/\b(?:test|vitest|pytest|jest|cargo\s+test|go\s+test|dotnet\s+test|gut)\b/.test(normalized)) {
-    return { type: "test", target: repoTarget(session) };
-  }
-  if (/\b(?:lint|eslint|ruff|cspell)\b/.test(normalized)) return { type: "lint", target: repoTarget(session) };
-  if (
-    /\b(?:pandoc|mkdocs|sphinx-build|render_docx|export_whitepaper|build[_:-]?(?:docs?|document|whitepaper)|docs?:build)\b/.test(normalized) ||
-    (/\b(?:build|render|export)\b/.test(normalized) && /\b(?:docs?|document|docx|pdf|markdown|whitepaper)\b/.test(normalized))
-  ) {
-    return { type: "document_build", target: repoTarget(session) };
-  }
-  if (/\b(?:build|validate|check)\b/.test(normalized)) return { type: "build", target: repoTarget(session) };
+  const checkType = commandCheckType(tool);
+  if (checkType) return { type: checkType, target: repositoryTarget };
 
   if (isViewTool(tool)) {
-    const target = canonicalTarget(directTargets[0]);
+    const target = filesystemTarget(directTargets[0], directory);
     return { type: target && generatedAssetPath(target) ? "asset_inspection" : "read_back", target };
   }
-  if (isGlobTool(tool)) return { type: "filesystem_check", target: canonicalTarget(directTargets[0]) };
+  if (isGlobTool(tool)) return { type: "filesystem_check", target: filesystemTarget(directTargets[0], directory) };
   if (generatedToolNames.test(tool.name) && /view|inspect|read/i.test(tool.name)) {
-    return { type: "asset_inspection", target: canonicalTarget(directTargets[0]) };
+    return { type: "asset_inspection", target: filesystemTarget(directTargets[0], directory) };
   }
   if (externalReadNames.test(tool.name) || /(?:browser|chrome|computer).*(?:screenshot|inspect|read|snapshot)/i.test(tool.name)) {
     return { type: "external_confirmation", target: canonicalTarget(directTargets[0]) };
   }
-  if (isCommandTool(tool) && commandWorkdir(tool)) return undefined;
   return undefined;
 }
 
@@ -615,16 +593,14 @@ function verificationStatus(action: OrderedAction, type: DreamVerificationType):
   return "passed";
 }
 
-function repoChange(change: DreamChangeClassification): boolean {
-  return ["product_code", "tests", "documentation", "repository_metadata"].includes(change.changeType) && Boolean(change.target);
-}
-
-function targetsMatch(change: DreamChangeClassification, check: VerificationCheck, session: NormalizedSession): boolean {
-  if (repoChange(change)) return check.target === repoTarget(session);
-  if (!change.target || !check.target) return false;
-  if (change.target === check.target) return true;
+export function verificationTargetsMatch(change: DreamChangeClassification, check: VerificationCheck): boolean {
+  if (check.target?.startsWith("repo:")) return repositoryVerificationMatches(change, check);
+  const changeTarget = canonicalTarget(change.target);
+  const checkTarget = canonicalTarget(check.target);
+  if (!changeTarget || !checkTarget) return false;
+  if (changeTarget === checkTarget) return true;
   if (change.changeType === "local_file_organization") {
-    return change.target.startsWith(`${check.target}/`) || check.target.startsWith(`${change.target}/`);
+    return changeTarget.startsWith(`${checkTarget}/`) || checkTarget.startsWith(`${changeTarget}/`);
   }
   return false;
 }
@@ -638,12 +614,14 @@ function classifyVerificationChecks(
   const checks: VerificationCheck[] = [];
   for (const action of actions) {
     if (mutationKind(action).mutation) continue;
-    const semantic = verificationType(action, session);
+    const semantic = verificationType(action);
     if (!semantic) continue;
     const refs = toDreamRefs(session.sessionId, action.tool.evidence, `${taskId}:verification:${action.actionIndex}`);
     checks.push({
       command: toolCommand(action.tool) ?? action.tool.name,
-      lane: `${semantic.target ?? "unknown-target"}|${semantic.type}`,
+      lane: toolCommand(action.tool)
+        ? verificationLaneKey(action.tool)
+        : `${semantic.target ?? "unknown-target"}|${semantic.type}`,
       verificationType: semantic.type,
       actionIndex: action.actionIndex,
       target: semantic.target,
@@ -661,7 +639,7 @@ function classifyVerificationChecks(
         change.stateChanging &&
         change.verificationRequired === true &&
         Boolean(check.verificationType && change.acceptableVerificationTypes.includes(check.verificationType)) &&
-        targetsMatch(change, check, session)
+        verificationTargetsMatch(change, check)
     );
     const lastChange = relevant.reduce((latest, change) => Math.max(latest, change.actionIndex), -1);
     check.fresh = lastChange >= 0 && (check.actionIndex ?? -1) > lastChange;

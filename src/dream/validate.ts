@@ -17,6 +17,7 @@ import type {
   InstructionCheck
 } from "./types.js";
 import type { VerificationClosure } from "../normalize/types.js";
+import { verificationTargetsMatch } from "./analyze.js";
 import { buildDreamDecisionReport } from "./decisionReport.js";
 
 function packetRef(session: DreamSession, metric: string, summary: string): DreamEvidenceRef {
@@ -230,16 +231,8 @@ function normalizedTarget(target?: string): string | undefined {
   return target?.replace(/\\/g, "/").replace(/["']/g, "").replace(/\/$/, "").toLowerCase();
 }
 
-function targetMatches(change: DreamChangeClassification, check: DreamTaskWindow["verificationChecks"][number]): boolean {
-  if (!change.target || !check.target) return true;
-  const changeTarget = normalizedTarget(change.target);
-  const checkTarget = normalizedTarget(check.target);
-  if (!changeTarget || !checkTarget) return true;
-  return changeTarget === checkTarget || changeTarget.endsWith(checkTarget) || checkTarget.endsWith(changeTarget);
-}
-
 function changeGroupKey(change: DreamChangeClassification): string {
-  if (["product_code", "tests", "documentation", "repository_metadata"].includes(change.changeType)) return change.changeType;
+  if (["product_code", "tests", "documentation", "repository_metadata"].includes(change.changeType)) return `${change.changeType}:${normalizedTarget(change.executionScope) ?? "unknown-scope"}:${normalizedTarget(change.target) ?? "unknown-target"}`;
   return `${change.changeType}:${normalizedTarget(change.target) ?? "unknown-target"}`;
 }
 
@@ -263,12 +256,14 @@ function assessTaskVerification(task: DreamTaskWindow): TaskVerificationAssessme
     const checks = task.verificationChecks
       .filter((check) => (check.actionIndex ?? Number.MAX_SAFE_INTEGER) > lastChange && check.fresh !== false)
       .filter((check) => accepted.has(check.verificationType ?? legacyVerificationType(check.command)))
-      .filter((check) => changes.some((change) => targetMatches(change, check)))
+      .filter((check) => changes.some((change) => verificationTargetsMatch(change, check)))
       .sort((left, right) => (left.actionIndex ?? 0) - (right.actionIndex ?? 0));
     if (!checks.length) return { status: "missing", changes, matchingChecks: [] };
-    const latest = checks.at(-1);
-    if (latest?.status === "passed") return { status: "verified", changes, matchingChecks: checks };
-    if (latest?.status === "failed") return { status: "failed", changes, matchingChecks: checks };
+    const latestByLane = new Map<string, typeof checks[number]>();
+    for (const check of checks) latestByLane.set(check.lane ?? commandKey(check.command), check);
+    const finalChecks = [...latestByLane.values()];
+    if (finalChecks.some((check) => check.status === "failed")) return { status: "failed", changes, matchingChecks: checks };
+    if (finalChecks.every((check) => check.status === "passed")) return { status: "verified", changes, matchingChecks: checks };
     return { status: "missing", changes, matchingChecks: checks };
   });
 }
@@ -611,7 +606,7 @@ function scoreGrounding(unsupported: ClaimCheck[], sessions: DreamSession[]): Dr
 }
 
 function scoreVerification(sessions: DreamSession[]): DreamScore {
-  const assessments = sessions.flatMap((session) => taskWindows(session).flatMap(assessTaskVerification));
+  const assessments = sessions.flatMap((session) => taskWindows(session).flatMap(task => assessTaskVerification(task)));
   const relevant = assessments.filter((assessment) => assessment.status !== "not_required");
   if (!relevant.length) {
     return {

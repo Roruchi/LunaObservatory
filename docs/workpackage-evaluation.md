@@ -6,8 +6,9 @@ across unrelated roles, task classes or difficulty levels. All examples and fixt
 here are fully synthetic. No real sessions were evaluated and no data collection
 was added.
 
-This module is independent of Scan and Dream. Existing `outcomeScore` remains a
-trace heuristic; existing `inefficiencyScore` still has **0 = best, 100 = worst**.
+This module is independent of Scan and Dream. Scan score availability follows the
+[session scoring limits](session-correlation.md#per-worker-report-cards); numeric
+`inefficiencyScore` values still have **0 = best, 100 = worst**.
 The new `workpackageEvaluation/1` record has its own dimensions with 100 = best.
 The module performs no I/O, network requests, model calls, randomness or clock reads.
 
@@ -219,8 +220,9 @@ prompts, secrets and private session content out of public packets and reports.
 
 The second slice adds [Claude Code ingestion](claude-adapter.md) and
 [trace-to-task/attempt correlation](session-correlation.md) alongside this module.
-Final-state check freshness, curated evidence adapters, live Firstmate integration
-and dashboard visualisation remain later work needing separate approval.
+[Final-state check freshness](session-correlation.md#command-evidence) is shared by
+Scan and Dream. Curated evidence adapters, live Firstmate integration and dashboard
+visualisation remain later work needing separate approval.
 Real-session evaluation and independent adjudication are not implemented.
 
 ## Prior-art credit

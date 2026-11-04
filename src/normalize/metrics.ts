@@ -88,6 +88,11 @@ export function calculateMetrics(session: Omit<NormalizedSession, "metrics">, pa
   let changedLines = 0;
   const changedPaths = new Set<string>();
   const orderedTools: NormalizedToolCall[] = [];
+  const expandedByCall = new Map<string, NormalizedToolCall[]>();
+  for (const tool of expandToolCalls(session.turns.flatMap(turn => turn.toolCalls))) {
+    const key = tool.originToolCallId ?? tool.toolCallId;
+    expandedByCall.set(key, [...expandedByCall.get(key) ?? [], tool]);
+  }
   const seenTextFingerprints = new Set<string>();
 
   for (const turn of session.turns) {
@@ -137,7 +142,7 @@ export function calculateMetrics(session: Omit<NormalizedSession, "metrics">, pa
       if (originalTool.status === "completed") toolExecutionsCompleted += 1;
       if (originalTool.status === "failed") toolExecutionsFailed += 1;
 
-      const semanticTools = expandToolCalls([originalTool]);
+      const semanticTools = expandedByCall.get(originalTool.toolCallId) ?? [];
       for (const tool of semanticTools) {
       orderedTools.push(tool);
       increment(toolCallsByName, tool.name);

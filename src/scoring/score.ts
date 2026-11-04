@@ -3,7 +3,7 @@ import type { ReasonCode } from "./reasonCodes.js";
 import { classifySession } from "./classify.js";
 
 export type InefficiencyScore = {
-  scoringVersion: 3;
+  scoringVersion: 3 | 4;
   sessionId: string;
   parentSessionId?: string;
   agentPath?: string;
@@ -13,8 +13,11 @@ export type InefficiencyScore = {
   startedAt?: string;
   endedAt?: string;
   lifecycleStatus: NormalizedSession["lifecycleStatus"];
-  inefficiencyScore: number;
-  outcomeScore: number;
+  inefficiencyScore: number | null;
+  outcomeScore: number | null;
+  evidenceStatus?: "unscored" | "heuristic";
+  confidence?: "low";
+  scoringReasons?: string[];
   classification: ReturnType<typeof classifySession>;
   reasonCodes: ReasonCode[];
   metrics: NormalizedSession["metrics"];
@@ -143,8 +146,13 @@ export function scoreSession(session: NormalizedSession): InefficiencyScore {
     reasonCodes
   });
 
+  // A final answer alone cannot establish an outcome or measured efficiency.
+  const noTools = !session.turns.some(turn => turn.toolCalls.length > 0);
   return {
-    scoringVersion: 3,
+    scoringVersion: 4,
+    evidenceStatus: noTools ? "unscored" : "heuristic",
+    confidence: "low",
+    scoringReasons: noTools ? ["no_tool_evidence", "acceptance_not_assessed"] : ["session_heuristic_only", "acceptance_not_assessed"],
     sessionId: session.sessionId,
     parentSessionId: session.parentSessionId,
     agentPath: session.agentPath,
@@ -154,9 +162,9 @@ export function scoreSession(session: NormalizedSession): InefficiencyScore {
     startedAt: session.startedAt,
     endedAt: session.endedAt,
     lifecycleStatus: session.lifecycleStatus,
-    inefficiencyScore,
-    outcomeScore,
-    classification,
+    inefficiencyScore: noTools ? null : inefficiencyScore,
+    outcomeScore: noTools ? null : outcomeScore,
+    classification: noTools ? "unknown" : classification,
     reasonCodes,
     metrics,
     sourceFiles: session.sourceFiles

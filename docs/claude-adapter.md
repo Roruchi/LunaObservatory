@@ -1,6 +1,6 @@
 # Claude Code transcripts
 
-`lunaobs scan --source claude --logs /fictional/traces` accepts native Claude Code JSONL, including the `projects/**/*.jsonl` layout. `--source all --logs ...` also detects native Claude records. Codex and Copilot keep their existing parser. Existing Scan and Dream report formats and scoring semantics are unchanged.
+`lunaobs scan --source claude --logs /fictional/traces` accepts native Claude Code JSONL, including the `projects/**/*.jsonl` layout. `--source all --logs ...` also detects native Claude records. Codex and Copilot use the shared native parser. See the [session scoring and report-card limits](session-correlation.md#per-worker-report-cards) for evidence requirements and score availability.
 
 The adapter retains native session identity, timestamps, first user instruction, cwd, git branch, model, text, tool calls/results and evidence line references. It groups assistant streaming records by the exact pair of `message.id` and `requestId` (falling back to event UUID), deduplicates identical content blocks, and joins results by `tool_use_id`. Usage repeated on split blocks is counted once per request, using the maximum observed value for each field as streaming usage advances. Equal text in separate native requests remains separate activity.
 

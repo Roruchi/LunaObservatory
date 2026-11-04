@@ -38,7 +38,7 @@ export function loadScanPacket(scanPath: string): LoadedScan {
   const scoreById = new Map(existingScores.map((score) => [score.sessionId, score]));
   const scores = sessions.map((session) => {
     const existing = scoreById.get(session.sessionId);
-    return existing?.scoringVersion === 3 ? existing : scoreSession({ ...session, lifecycleStatus: session.lifecycleStatus ?? "unknown" });
+    return existing?.scoringVersion === 4 ? existing : scoreSession({ ...session, lifecycleStatus: session.lifecycleStatus ?? "unknown" });
   });
   return {
     sourceScanPath: path.dirname(indexDir),
@@ -337,6 +337,9 @@ function roleSelections(scores: InefficiencyScore[], perGroupLimit: number): Arr
   };
   const activeFamilies = new Set(scores.filter((score) => score.lifecycleStatus === "in_progress").map(familyFor));
   const completedScores = scores.filter(
+    (score): score is InefficiencyScore & { outcomeScore: number; inefficiencyScore: number } =>
+      score.outcomeScore != null && score.inefficiencyScore != null
+  ).filter(
     (score) => score.lifecycleStatus !== "in_progress" && !activeFamilies.has(familyFor(score))
   );
 

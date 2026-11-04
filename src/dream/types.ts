@@ -80,6 +80,7 @@ export type VerificationCheck = {
 };
 
 export type DreamChangeClassification = {
+  executionScope?: string;
   changeId: string;
   actionIndex: number;
   changeType: DreamChangeType;
@@ -123,8 +124,8 @@ export type DreamSession = {
   role?: DreamSelectionRole;
   selectionReason?: string;
   classification?: string;
-  inefficiencyScore?: number;
-  outcomeScore?: number;
+  inefficiencyScore?: number | null;
+  outcomeScore?: number | null;
   reasonCodes: ReasonCode[];
   metrics: Partial<SessionMetrics>;
   declaredIntents: string[];
@@ -149,8 +150,8 @@ export type DreamPacket = {
   omittedSessions: Array<{
     sessionId: string;
     classification?: string;
-    inefficiencyScore?: number;
-    outcomeScore?: number;
+    inefficiencyScore?: number | null;
+    outcomeScore?: number | null;
   }>;
 };
 

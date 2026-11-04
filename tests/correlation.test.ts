@@ -23,6 +23,16 @@ describe("verifiable Firstmate correlation", () => {
     expect(identity.attemptId).toEqual({ availability: "known", value: result.attemptId, refs: ["fictional-correlation-ref"] });
     expect(identity.model.availability).toBe("unknown");
   });
+  it("uses retained native spawn identity without mining later instructions", () => {
+    const item = session();
+    const task = { ...records()[0], nativeSessionId: item.nativeSessionId! };
+    expect(correlateSession(item, [task], observed()).status).toBe("matched");
+    expect(correlateSession(item, [task], observed()).candidates[0].evidence).toContain("native_session_id");
+    expect(correlateSession(item, [{ ...task, nativeSessionId: "different-session" }]).status).toBe("unmatched");
+    expect(correlateSession(item, [{ ...task, attemptId: null }], observed()).status).toBe("ambiguous");
+    expect(correlateSession({ ...item, nativeSessionId: null }, [task]).status).toBe("unmatched");
+    expect(correlateSession(item, [{ ...task, harness: "codex" }]).status).toBe("unmatched");
+  });
   it("returns ambiguous for overlapping retries rather than ranking a winner", () => {
     const tasks = records(); tasks.push({ ...tasks[0], attemptId: "fictional-nebula-attempt-b", spawnGeneration: "fictional-generation-b" });
     const result = correlateSession(session(), tasks);
@@ -126,6 +136,14 @@ describe("verifiable Firstmate correlation", () => {
       expect(stdout).toContain("Correlated 1 session(s)");
       expect(fs.readFileSync(out, "utf8")).not.toContain("Build a fictional star map");
       expect(result.taskRecordsDigest).toMatch(/^[a-f0-9]{64}$/);
+      const cards = path.join(directory, "cards.md");
+      const cardStdout = execFileSync(process.execPath, [path.join(dist, "cli.js"), "report-card", "--logs", trace, "--tasks", taskFile, "--out", cards], { encoding: "utf8" });
+      expect(cardStdout).toContain("Worker report cards:");
+      const cardText = fs.readFileSync(cards, "utf8");
+      expect(cardText).toContain("synthetic-session-a");
+      expect(cardText).toContain("Unscored / low confidence");
+      expect(cardText).not.toContain("npm test");
+      expect(cardText).not.toContain("Build a fictional star map");
       const logs = path.join(directory, "logs");
       const childFile = path.join(logs, "parent", "subagents", "child.jsonl");
       fs.mkdirSync(path.dirname(childFile), { recursive: true });

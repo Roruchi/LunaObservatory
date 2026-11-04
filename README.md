@@ -58,7 +58,7 @@ Dream validation must not inspect the live repository, run git, run tests, call 
 
 Packet preparation groups eligible sessions as efficient successes, inefficient successes, or failed/risky outcomes. It prioritizes recent evidence, spreads representatives across normalized repository identities, and selects at most one risk-prioritized representative from each parent/child agent family. The frozen packet and report retain each selected session's end date so this choice is auditable. Sessions still marked in progress, including completed children of an active parent family, are not selected for Dream validation; aborted runs remain available to the failed/risky group.
 
-Dream first segments sessions into task windows, then classifies each attempted change as `repository_code`, `repository_docs`, `external_state`, `local_state`, `automation_memory`, `generated_artifact`, `read_only`, or `unknown`. A missing-verification finding is eligible only when a task contains a successful state change, that change requires verification, and no fresh matching check appears after the final relevant change. Read-only work is never treated as missing repository verification; documentation, external-state, generated-artifact, and automation-memory work use their own proportionate checks.
+Dream first segments sessions into task windows, then classifies each attempted change using the [change types](src/dream/types.ts). A missing-verification finding is eligible only when a task contains a successful state change, that change requires verification, and no fresh matching check appears after the final relevant change. Read-only work is never treated as missing repository verification; documentation, external-state, generated-artifact, and automation-memory work use their own proportionate checks.
 
 Dream scores use `insufficient` when the frozen packet cannot support a category. In particular, unknown instruction status is not counted as compliance, and low-confidence task segmentation or change classification is routed to human review instead of becoming a high-confidence verification finding. Findings keep observations, interpretations, alternative explanations, recommended actions, apply targets, and evidence references separate.
 
@@ -70,7 +70,7 @@ Scan derives metrics from events present in each trace:
 
 - Session identity and lifecycle: Codex child and subagent runs keep their own session ID, while the parent session ID and agent path are retained separately when available. Copied parent history is removed from forked child traces before metrics are calculated. Task-start, task-complete, and abort events produce `in_progress`, `completed`, `aborted`, or `unknown` lifecycle states.
 - Task-normalized effort: tool requests and output tokens are reported per observed task as well as per session. This avoids treating a long multi-task session as directly equivalent to a single-task run.
-- Verification closure: after the last successful detected edit, recognized test, build, lint, type-check, validation, and project-check commands are grouped by exact script and working directory. The final states of every fresh lane produce `passed`, `failed`, `missing`, or `not_applicable` closure.
+- Verification closure: recognized checks after successful detected edits produce `passed`, `failed`, `missing`, or `not_applicable` closure. See [command evidence rules](docs/session-correlation.md#command-evidence) for scope, freshness and lane identity.
 - Failure and recovery behavior: repeated-failure metrics count retries of the same canonical failing command, rather than adding unrelated failures together. Dream can distinguish an unresolved failed verification lane from a later pass in that lane.
 - Redundant work: exact repeated read, search, glob, or command calls are counted only while the detected edit state is unchanged. Failed calls are excluded from this redundancy metric.
 
@@ -131,7 +131,7 @@ LunaObs does not copy raw `encryptedContent` or `reasoningOpaque` into reports. 
 
 LunaObs is still a small v0 evidence analyzer, not a task benchmark or semantic judge.
 
-- Outcome scores combine observable lifecycle, edits, final-answer presence, and verification closure. They are prioritization signals, not proof of task completion or code quality.
+- Outcome scores are prioritization signals, not proof of task completion or code quality. See [session scoring limits](docs/session-correlation.md#per-worker-report-cards) for evidence requirements, unscored sessions and cache migration.
 - Per-task metrics use observed task-start events or normalized turns. They do not account for task difficulty, so comparisons across unrelated tasks and repositories remain directional.
 - Verification recognition is deliberately conservative and command-based. Compound orchestration calls are expanded when their nested tools are visible, but a single compound result may still lack per-operation status detail. LunaObs cannot determine whether a test suite is adequate, whether a manual check happened, or whether an external system accepted the result.
 - Redundancy detection recognizes exact canonical tool calls within an unchanged edit state. It can miss semantically equivalent calls, and an intentional fresh read may still need human interpretation.
@@ -142,3 +142,7 @@ LunaObs is still a small v0 evidence analyzer, not a task benchmark or semantic 
 ## Session-to-attempt correlation
 
 `lunaobs correlate --logs /fictional/traces --tasks /fictional/task-records.json --out /fictional/correlation.json` joins local traces to caller-supplied typed Firstmate records. It emits matched, ambiguous or unmatched identities with evidence kinds and digests; it does not score sessions. See [correlation rules and limits](docs/session-correlation.md) and the fully fictional `tests/fixtures/correlation-tasks.json` example.
+
+### Worker report cards
+
+`lunaobs report-card --logs /path/to/traces --tasks /path/to/task-records.json --out /private/worker-cards.md` writes a private evidence card for each worker session and diagnostic parent associated with the supplied tasks. Cards include harness/model, observed duration, tools, verification, outcome limitations, plain inefficiency reasons and correlation confidence. Missing acceptance evidence remains **Unscored / low confidence**; final answers alone do not establish quality. See [recording attempt identities and report-card limits](docs/session-correlation.md#durable-spawn-records).

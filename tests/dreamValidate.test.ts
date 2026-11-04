@@ -46,8 +46,12 @@ function session(overrides: Partial<DreamSession>): DreamSession {
     ...overrides
   };
   if (!overrides.tasks) {
+    // These synthetic checks ran in the same explicitly recorded repository as the edit.
+    const executionScope = result.repoRoot;
     const verificationChecks = result.verificationChecks.map((check, index) => ({
       ...check,
+      target: check.target ?? (executionScope ? `repo:${executionScope}` : undefined),
+      lane: check.lane ?? (executionScope && check.command ? `${executionScope}:${check.command}` : undefined),
       actionIndex: check.actionIndex ?? index + 2,
       fresh: check.fresh ?? true
     }));
@@ -63,7 +67,8 @@ function session(overrides: Partial<DreamSession>): DreamSession {
             changeId: `${result.sessionId}:task:1:change:1`,
             actionIndex: 1,
             changeType: "product_code",
-            target: "src/app.ts",
+            target: executionScope ? path.win32.join(executionScope, "src", "app.ts") : undefined,
+            executionScope,
             stateChanging: true,
             verificationRequired: true,
             acceptableVerificationTypes: ["test", "build", "lint", "typecheck", "diff_check"],
@@ -227,6 +232,29 @@ describe("dream validation", () => {
     expect(report.detailsMarkdown).toContain("recovered-session");
     expect(report.html).toContain("Recommended action:");
   });
+
+  it.each(["missing edit scope", "missing check target", "foreign check scope"])(
+    "does not infer recovery from %s",
+    (missingEvidence) => {
+      const captured = session({
+        verificationChecks: [
+          { command: "npm test", status: "failed" },
+          { command: "npm test", status: "passed" }
+        ]
+      });
+      const task = captured.tasks![0];
+      if (missingEvidence === "missing edit scope") task.changes[0].executionScope = undefined;
+      for (const check of task.verificationChecks) {
+        if (missingEvidence === "missing check target") check.target = undefined;
+        if (missingEvidence === "foreign check scope") check.target = "repo:C:\\Repo\\Other";
+      }
+
+      const report = validateDreamPacket(packet([captured]));
+
+      expect(report.markdown).toContain("Required verification is missing after the final relevant change");
+      expect(report.markdown).not.toContain("Verification had failed attempts that were later recovered");
+    }
+  );
 
   it("keeps unknown instruction evidence unscored and avoids double-negation false positives", () => {
     const report = validateDreamPacket(
