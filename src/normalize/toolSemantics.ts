@@ -353,34 +353,19 @@ export function toolCommand(tool: NormalizedToolCall): string | undefined {
   if (!isCommandTool(tool)) return undefined;
   const args = tool.arguments;
   if (typeof args === "string") {
-    try { return commandArgument(JSON.parse(args)); } catch { /* Native shell strings are also valid. */ }
+    try { return argumentString(JSON.parse(args), ["command", "cmd"]); } catch { /* Native shell strings are also valid. */ }
     return embeddedProperty(args, "command") ?? embeddedProperty(args, "cmd") ?? args;
   }
-  return commandArgument(args);
+  return argumentString(args, ["command", "cmd"]);
 }
 
-function commandArgument(args: unknown): string | undefined {
-  if (typeof args === "string") {
-    try { return commandArgument(JSON.parse(args)); } catch { return undefined; }
+function argumentString(args: unknown, keys: string[]): string | undefined {
+  const record = commandArgumentRecord(args);
+  if (!record) return undefined;
+  for (const key of keys) {
+    if (typeof record[key] === "string") return record[key];
   }
-  if (!args || typeof args !== "object") return undefined;
-  const record = args as Record<string, unknown>;
-  if (typeof record.command === "string") return record.command;
-  if (typeof record.cmd === "string") return record.cmd;
-  // Native wrappers can retain a second arguments envelope.
-  if (record.arguments !== args) return commandArgument(record.arguments);
-  return undefined;
-}
-
-function toolWorkdir(tool: NormalizedToolCall): string | undefined {
-  const args = tool.arguments;
-  if (!args || typeof args !== "object") return undefined;
-  const record = args as Record<string, unknown>;
-  if (typeof record.workdir === "string") return record.workdir;
-  const nested = record.arguments;
-  if (nested && typeof nested === "object" && typeof (nested as Record<string, unknown>).workdir === "string") {
-    return (nested as Record<string, unknown>).workdir as string;
-  }
+  if (record.arguments !== args) return argumentString(record.arguments, keys);
   return undefined;
 }
 
@@ -394,7 +379,7 @@ export function resolveExecutionPath(value: unknown, base?: string): string | un
 }
 
 export function executionDirectory(tool: NormalizedToolCall): string | undefined {
-  let context = resolveExecutionPath(toolWorkdir(tool), resolveExecutionPath(tool.executionCwd));
+  let context = resolveExecutionPath(argumentString(tool.arguments, ["workdir"]), resolveExecutionPath(tool.executionCwd));
   let command = (toolCommand(tool) ?? "").trim().replace(/^rtk\s+(?:proxy\s+)?/i, "");
   const prefix = /^(?:cd|set-location)\s+(?:"([^"]+)"|'([^']+)'|([^\s;|&]+))\s*(?:&&|;)\s*/i;
   let match: RegExpExecArray | null;

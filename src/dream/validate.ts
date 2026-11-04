@@ -17,7 +17,7 @@ import type {
   InstructionCheck
 } from "./types.js";
 import type { VerificationClosure } from "../normalize/types.js";
-import { repositoryVerificationMatches } from "./analyze.js";
+import { verificationTargetsMatch } from "./analyze.js";
 import { buildDreamDecisionReport } from "./decisionReport.js";
 
 function packetRef(session: DreamSession, metric: string, summary: string): DreamEvidenceRef {
@@ -231,17 +231,8 @@ function normalizedTarget(target?: string): string | undefined {
   return target?.replace(/\\/g, "/").replace(/["']/g, "").replace(/\/$/, "").toLowerCase();
 }
 
-function targetMatches(change: DreamChangeClassification, check: DreamTaskWindow["verificationChecks"][number]): boolean {
-  if (check.target?.startsWith("repo:")) return repositoryVerificationMatches(change, check);
-  if (!change.target || !check.target) return false;
-  const changeTarget = normalizedTarget(change.target);
-  const checkTarget = normalizedTarget(check.target);
-  if (!changeTarget || !checkTarget) return false;
-  return changeTarget === checkTarget;
-}
-
 function changeGroupKey(change: DreamChangeClassification): string {
-  if (["product_code", "tests", "documentation", "repository_metadata"].includes(change.changeType)) return `${change.changeType}:${normalizedTarget(change.executionScope) ?? "unknown-scope"}`;
+  if (["product_code", "tests", "documentation", "repository_metadata"].includes(change.changeType)) return `${change.changeType}:${normalizedTarget(change.executionScope) ?? "unknown-scope"}:${normalizedTarget(change.target) ?? "unknown-target"}`;
   return `${change.changeType}:${normalizedTarget(change.target) ?? "unknown-target"}`;
 }
 
@@ -265,7 +256,7 @@ function assessTaskVerification(task: DreamTaskWindow): TaskVerificationAssessme
     const checks = task.verificationChecks
       .filter((check) => (check.actionIndex ?? Number.MAX_SAFE_INTEGER) > lastChange && check.fresh !== false)
       .filter((check) => accepted.has(check.verificationType ?? legacyVerificationType(check.command)))
-      .filter((check) => changes.some((change) => targetMatches(change, check)))
+      .filter((check) => changes.some((change) => verificationTargetsMatch(change, check)))
       .sort((left, right) => (left.actionIndex ?? 0) - (right.actionIndex ?? 0));
     if (!checks.length) return { status: "missing", changes, matchingChecks: [] };
     const latestByLane = new Map<string, typeof checks[number]>();

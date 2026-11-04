@@ -619,16 +619,14 @@ function verificationStatus(action: OrderedAction, type: DreamVerificationType):
   return "passed";
 }
 
-function repoChange(change: DreamChangeClassification): boolean {
-  return ["product_code", "tests", "documentation", "repository_metadata"].includes(change.changeType) && Boolean(change.target);
-}
-
-function targetsMatch(change: DreamChangeClassification, check: VerificationCheck): boolean {
-  if (repoChange(change) && check.target?.startsWith("repo:")) return repositoryVerificationMatches(change, check);
-  if (!change.target || !check.target) return false;
-  if (change.target === check.target) return true;
+export function verificationTargetsMatch(change: DreamChangeClassification, check: VerificationCheck): boolean {
+  if (check.target?.startsWith("repo:")) return repositoryVerificationMatches(change, check);
+  const changeTarget = canonicalTarget(change.target);
+  const checkTarget = canonicalTarget(check.target);
+  if (!changeTarget || !checkTarget) return false;
+  if (changeTarget === checkTarget) return true;
   if (change.changeType === "local_file_organization") {
-    return change.target.startsWith(`${check.target}/`) || check.target.startsWith(`${change.target}/`);
+    return changeTarget.startsWith(`${checkTarget}/`) || checkTarget.startsWith(`${changeTarget}/`);
   }
   return false;
 }
@@ -667,7 +665,7 @@ function classifyVerificationChecks(
         change.stateChanging &&
         change.verificationRequired === true &&
         Boolean(check.verificationType && change.acceptableVerificationTypes.includes(check.verificationType)) &&
-        targetsMatch(change, check)
+        verificationTargetsMatch(change, check)
     );
     const lastChange = relevant.reduce((latest, change) => Math.max(latest, change.actionIndex), -1);
     check.fresh = lastChange >= 0 && (check.actionIndex ?? -1) > lastChange;

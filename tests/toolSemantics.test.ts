@@ -343,3 +343,22 @@ describe("resolved execution identity", () => {
     expect(redundantToolStats([read, { ...read, toolCallId: "other-read", executionCwd: "/repo/b" }]).duplicate).toBe(0);
   });
 });
+
+
+describe("command argument envelopes", () => {
+  it.each(["command", "cmd"])("decodes workdir alongside %s in every supported envelope", field => {
+    for (const workdir of ["/repo/b", "../b", ".", "$UNKNOWN"]) {
+      const args = { [field]: "npm test", workdir };
+      for (const envelope of [args, JSON.stringify(args), { arguments: args }, { arguments: JSON.stringify(args) }, JSON.stringify({ arguments: { arguments: JSON.stringify(args) } })]) {
+        const call: NormalizedToolCall = { toolCallId: "envelope", name: "shell_command", arguments: envelope,
+          executionCwd: "/repo/a", executionRoot: "/repo/a", status: "completed" };
+        const directory = workdir === "." ? "/repo/a" : workdir === "$UNKNOWN" ? undefined : "/repo/b";
+        expect(toolCommand(call)).toBe("npm test");
+        expect(executionDirectory(call)).toBe(directory);
+        expect(executionScope(call)).toBe(directory);
+        expect(verificationLaneKey(call)).toBe(`${directory ?? "unknown-workdir"}|npm:test|npm test`);
+        expect(canonicalToolSignature(call)).toBe(`shell_command:${verificationLaneKey(call)}`);
+      }
+    }
+  });
+});

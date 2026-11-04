@@ -5,7 +5,7 @@ import { writeJsonl } from "../src/fs/jsonl.js";
 import { parseSessionFile } from "../src/normalize/parser.js";
 import { analyzeDreamTasks } from "../src/dream/analyze.js";
 import { normalizeEventsToSession } from "../src/normalize/sessions.js";
-import type { RawLogEvent } from "../src/normalize/types.js";
+import type { NormalizedSession, RawLogEvent } from "../src/normalize/types.js";
 import { scoreSession } from "../src/scoring/score.js";
 import { prepareDreamPacket } from "../src/dream/prepare.js";
 import { validateDreamPacket } from "../src/dream/validate.js";
@@ -313,5 +313,89 @@ describe("execution cwd and native worktree scope", () => {
     expect(analyzeDreamTasks(session)[0].verificationChecks[0].fresh).toBe(false);
     check.executionCwd = undefined;
     expect(analyzeDreamTasks(session)[0].verificationChecks[0].target).toBeUndefined();
+  });
+});
+
+
+type CapturedCall = { name: string; args: unknown; output: unknown };
+function captureVerificationCalls(calls: CapturedCall[]) {
+  const records: Array<[string, unknown]> = [
+    ["session_meta", { id: "coverage-worker", cwd: "/repo/a" }],
+    ["turn_context", { turn_id: "one", cwd: "/repo/a" }],
+    ["response_item", { type: "message", role: "user", content: [{ type: "input_text", text: "Update and verify the files." }] }]
+  ];
+  for (const [index, call] of calls.entries()) records.push(
+    ["response_item", { type: "function_call", call_id: `call-${index}`, name: call.name, arguments: JSON.stringify(call.args) }],
+    ["response_item", { type: "function_call_output", call_id: `call-${index}`, output: call.output }]
+  );
+  const session = normalizeEventsToSession(nativeEvents(records), "codex", "native.jsonl");
+  session.repoMatch = "matched";
+  session.lifecycleStatus = "completed";
+  return session;
+}
+
+function frozenVerification(session: NormalizedSession) {
+  const root = fs.mkdtempSync(path.resolve("tests/.dream-coverage-"));
+  try {
+    writeJsonl(path.join(root, "sessions.jsonl"), [session]);
+    writeJsonl(path.join(root, "inefficiency-scores.jsonl"), [scoreSession(session)]);
+    const packet = prepareDreamPacket(root, 1);
+    expect(packet.selectedSessions).toHaveLength(1);
+    return { packet, report: validateDreamPacket(packet) };
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+}
+
+describe("verification coverage boundaries", () => {
+  it.each(["command", "cmd"])("rejects foreign Copilot JSON-string workdir for %s", field => {
+    const args = JSON.stringify({ arguments: JSON.stringify({ [field]: "npm test", workdir: "/repo/b" }) });
+    const session = normalizeEventsToSession(nativeEvents([
+      ["session.start", { context: { cwd: "/repo/a" } }],
+      ["tool.execution_start", { turnId: "one", toolCallId: "edit", toolName: "apply_patch", arguments: "*** Begin Patch\n*** Update File: map.ts\n*** End Patch" }],
+      ["tool.execution_complete", { turnId: "one", toolCallId: "edit", success: true, output: "Done" }],
+      ["tool.execution_start", { turnId: "one", toolCallId: "check", toolName: "shell_command", arguments: args }],
+      ["tool.execution_complete", { turnId: "one", toolCallId: "check", success: true, output: "passed" }]
+    ]), "copilot", "native.jsonl");
+    session.userIntent = { text: "Fix map.ts and verify." };
+    session.repoMatch = "matched";
+    session.lifecycleStatus = "completed";
+    const { packet, report } = frozenVerification(session);
+    expect(packet.selectedSessions[0].tasks![0].verificationChecks[0]).toMatchObject({ target: "repo:/repo/b", fresh: false, status: "passed" });
+    expect(report.scores.find(score => score.category === "Verification quality")?.score).toBe(0);
+  });
+
+  it.each([
+    { files: ["docs/a.md", "docs/b.md"], build: "npm run docs:build" },
+    { files: ["package.json", "tsconfig.json"], build: "npm run build" }
+  ])("requires coverage of every changed target in $files", ({ files, build }) => {
+    const edit = (file: string): CapturedCall => ({ name: "apply_patch", args: `*** Begin Patch\n*** Update File: ${file}\n*** End Patch`, output: "Done" });
+    const read = (file: string): CapturedCall => ({ name: "view", args: { path: file }, output: "file contents" });
+    const check: CapturedCall = { name: "exec_command", args: { cmd: build }, output: { exit_code: 0, output: "built" } };
+    for (const [calls, expected] of [
+      [[edit(files[0]), edit(files[1]), read(files[0])], 3],
+      [[edit(files[0]), edit(files[1]), read(files[0]), read(files[1])], 5],
+      [[edit(files[0]), read(files[0]), edit(files[1]), read(files[1])], 5],
+      [[edit(files[0]), edit(files[1]), check], 5],
+      [[edit(files[0]), read(files[0]), edit(files[0]), edit(files[1]), read(files[1])], 3],
+      [[edit(files[0]), edit(files[1]), { ...check, args: { cmd: build, workdir: "/repo/b" } }], 0]
+    ] as Array<[CapturedCall[], number]>) {
+      const { report } = frozenVerification(captureVerificationCalls(calls));
+      expect(report.scores.find(score => score.category === "Verification quality")?.score, JSON.stringify(calls)).toBe(expected);
+    }
+  });
+
+  it.each([
+    { target: "/tmp/output/result.bin", inspected: "/tmp/output", matches: true },
+    { target: "/tmp/output", inspected: "/tmp/output/nested", matches: true },
+    { target: "/tmp/output/result.bin", inspected: "/tmp/output2", matches: false },
+    { target: "/tmp/output2/result.bin", inspected: "/tmp/output", matches: false }
+  ])("shares local directory inspection matching for $target and $inspected", ({ target, inspected, matches }) => {
+    const { packet, report } = frozenVerification(captureVerificationCalls([
+      { name: "exec_command", args: { cmd: `cp /tmp/input.bin ${target}` }, output: { exit_code: 0, output: "copied" } },
+      { name: "exec_command", args: { cmd: `ls ${inspected}` }, output: { exit_code: 0, output: "result.bin" } }
+    ]));
+    const task = packet.selectedSessions[0].tasks![0];
+    expect(task.changes[0].changeType).toBe("local_file_organization");
+    expect(task.verificationChecks[0].fresh).toBe(matches);
+    expect(report.scores.find(score => score.category === "Verification quality")?.score).toBe(matches ? 5 : 0);
   });
 });
