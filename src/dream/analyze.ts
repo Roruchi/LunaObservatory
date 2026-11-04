@@ -2,6 +2,7 @@ import {
   expandToolCalls,
   executionDirectory,
   editTargets,
+  commandCheckType,
   verificationCommand,
   executionScope,
   executionScopesMatch,
@@ -347,10 +348,10 @@ function shellMutation(command: string): ShellMutation | undefined {
 
 function shellReadTarget(command: string): string | undefined {
   const variables = shellVariables(command);
+  const read = /^\s*(Get-Content|Select-String|Test-Path|Get-ChildItem|Get-Item|Resolve-Path|cat|type|ls)\b/i.exec(command);
+  if (!read) return undefined;
   const named = namedShellTargets(command, variables);
   if (named.length) return named.at(-1);
-  const read = /\b(Get-Content|Select-String|Test-Path|Get-ChildItem|Get-Item|Resolve-Path|cat|type|ls)\b/i.exec(command);
-  if (!read) return undefined;
   const segment = command.slice(read.index).split(/[;|\r\n]/, 1)[0];
   return pathLikeTokens(segment, variables).at(-1);
 }
@@ -544,15 +545,10 @@ function verificationType(action: OrderedAction): { type: DreamVerificationType;
   const { tool } = action;
   const name = baseToolName(tool.name);
   const command = verificationCommand(tool);
-  const normalized = command?.replace(/\\/g, "/").toLowerCase() ?? "";
   const directTargets = pathValues(argumentRecord(tool));
   const directory = executionDirectory(tool);
   const scope = executionScope(tool);
   const repositoryTarget = scope ? `repo:${scope}` : undefined;
-
-  if (/\bgit\b[^\r\n;|]*\b(?:diff|status)\b/.test(normalized) || /\bdiff\s+--check\b/.test(normalized)) {
-    return { type: "diff_check", target: repositoryTarget };
-  }
 
   // PowerShell's Test-Path is an observation, not a repository test suite.
   // Resolve read targets before applying the broad command-name matchers below.
@@ -568,18 +564,8 @@ function verificationType(action: OrderedAction): { type: DreamVerificationType;
     return { type: "read_back", target: canonical };
   }
 
-  if (/\b(?:typecheck|type-check|tsc|mypy)\b/.test(normalized)) return { type: "typecheck", target: repositoryTarget };
-  if (/\b(?:test|vitest|pytest|jest|cargo\s+test|go\s+test|dotnet\s+test|gut)\b/.test(normalized)) {
-    return { type: "test", target: repositoryTarget };
-  }
-  if (/\b(?:lint|eslint|ruff|cspell)\b/.test(normalized)) return { type: "lint", target: repositoryTarget };
-  if (
-    /\b(?:pandoc|mkdocs|sphinx-build|render_docx|export_whitepaper|build[_:-]?(?:docs?|document|whitepaper)|docs?:build)\b/.test(normalized) ||
-    (/\b(?:build|render|export)\b/.test(normalized) && /\b(?:docs?|document|docx|pdf|markdown|whitepaper)\b/.test(normalized))
-  ) {
-    return { type: "document_build", target: repositoryTarget };
-  }
-  if (/\b(?:build|validate|check)\b/.test(normalized)) return { type: "build", target: repositoryTarget };
+  const checkType = commandCheckType(tool);
+  if (checkType) return { type: checkType, target: repositoryTarget };
 
   if (isViewTool(tool)) {
     const target = filesystemTarget(directTargets[0], directory);

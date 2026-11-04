@@ -401,3 +401,46 @@ describe("orchestration is not shell text", () => {
     expect(toolCommand(quoted)).toBe(quoted.arguments);
   });
 });
+
+
+describe("approved common command recognition", () => {
+  it.each(["rg -n pytest README.md", "grep 'npm test' README.md", "echo tsc", 'echo "npm run build"', "gh search code pytest", "git log --grep=pytest"])("does not certify search or display arguments: %s", cmd => {
+    const session = capture([edit, wrapped(`text(await tools.exec_command(${JSON.stringify({ cmd })}));`, [envelope(0)])]);
+    session.lifecycleStatus = "completed";
+    expect(session.metrics.commandCalls).toBe(1);
+    expect(session.metrics.verificationEvents).toBe(0);
+    expect(session.metrics.verificationClosure).toBe("missing");
+    expect(scoreSession(session).outcomeScore).toBe(50);
+  });
+
+  it.each(["npm test", "rtk npm test", "bash -c 'npm test'", "sh -c 'tsc --noEmit'", "env CI=1 npm test", "rtk proxy env CI=1 bash -c 'npm run lint'", "git diff --check"])("retains common check invocations: %s", cmd => {
+    const session = capture([edit, { name: "exec_command", args: { cmd }, output: envelope(0) }]);
+    expect(session.metrics.verificationEvents).toBe(1);
+    expect(session.metrics.verificationClosure).toBe("passed");
+  });
+
+  it.each([
+    '{cmd:"npm test",workdir}', '{cmd:"npm test",...options}', '{...{workdir:"/repo/b"},cmd:"npm test"}',
+    '{cmd:"npm test",workdir:"/repo/a",...options}', '{cmd,"workdir":"/repo/a"}'
+  ])("keeps unsupported argument structures unknown: %s", args => {
+    const session = capture([edit, wrapped(`const workdir = "/repo/b"; text(await tools.exec_command(${args}));`, [envelope(0)])]);
+    const command = expandToolCalls(session.turns.flatMap(turn => turn.toolCalls)).find(tool => tool.name === "exec_command")!;
+    expect(toolCommand(command)).toBeUndefined();
+    expect(executionDirectory(command)).toBeUndefined();
+    expect(session.metrics.verificationClosure).toBe("missing");
+  });
+
+  it("does not infer polling identity from spread arguments", () => {
+    const session = capture([edit, wrapped('const r = await tools.exec_command({cmd:"npm test"}); text(r); text(await tools.write_stdin({...options,session_id:r.session_id}));', [envelope(null, 101), envelope(0)])]);
+    expect(session.metrics.verificationClosure).toBe("missing");
+  });
+});
+
+
+it("credits the common bounded static worker patch binding", () => {
+  const patch = "*** Begin Patch\n*** Update File: map.ts\n@@\n-old\n+new\n*** End Patch";
+  const session = capture([wrapped(`const patch = ${JSON.stringify(patch)}; await tools.apply_patch(patch); text(await tools.exec_command({cmd:"npm test"}));`, [envelope(0)])]);
+  session.lifecycleStatus = "completed";
+  expect(session.metrics.verificationClosure).toBe("passed");
+  expect(scoreSession(session).outcomeScore).toBe(90);
+});

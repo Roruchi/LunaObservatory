@@ -9,6 +9,8 @@ import {
   executionDirectory,
   executionScope,
   editExecutionScope,
+  editTargets,
+  commandCheckType,
   expandToolCalls,
   toolCommand,
   canonicalToolSignature,
@@ -366,7 +368,7 @@ describe("command argument envelopes", () => {
 
 
 describe("wrapped command context", () => {
-  it.each(["bash -lc", "sh -c", "rtk proxy bash -lc", "rtk proxy sh -c", "/bin/bash -c"])("resolves static %s directories", shell => {
+  it.each(["bash -lc", "sh -c", "rtk proxy bash -lc", "rtk proxy sh -c", "/bin/bash -c", "env CI=1 bash -c"])("resolves static %s directories", shell => {
     const foreign = { ...tool("exec_command", "completed", { cmd: `${shell} 'cd /repo/b && npm test'` }), toolCallId: "wrapped-foreign" };
     expect(executionDirectory(foreign)).toBe("/repo/b");
     expect(executionScope(foreign)).toBe("/repo/b");
@@ -380,7 +382,6 @@ describe("wrapped command context", () => {
     "rtk proxy bash -lc 'cd $DIR && npm test'",
     "rtk proxy bash -lc 'cd /repo/$DIR && npm test'",
     "rtk proxy bash -lc 'cd `pwd` && npm test'",
-    "env bash -lc 'cd /repo/b && npm test'",
     "bash script.sh npm test",
     "rtk proxy bash -lc 'cd /repo/a/* && npm test'",
     "rtk proxy bash -lc 'cd - && npm test'",
@@ -420,4 +421,38 @@ it("does not reset a failure episode for foreign or unresolved edit targets", ()
   const edit = tool("write_file", "completed", { paths: ["map.ts", "src/other.ts"] });
   expect(editExecutionScope(edit)).toBe("/repo/a");
   expect(repeatedFailureStats([failure, edit, retry]).repeated).toBe(0);
+});
+
+
+describe("bounded worker patch binding", () => {
+  const patch = "*** Begin Patch\n*** Update File: map.ts\n@@\n-old\n+new\n*** End Patch";
+  const targets = (script: string) => editTargets(expandToolCalls([tool("exec", "completed", script)])[0]);
+  it("recognizes the single static const binding without borrowing other literals", () => {
+    expect(targets(`const patch = ${JSON.stringify(patch)}; await tools.apply_patch(patch);`)).toEqual(["map.ts"]);
+    expect(targets(`// worker patch\nconst patch = ${JSON.stringify(patch)}; await tools.apply_patch(patch);`)).toEqual(["map.ts"]);
+  });
+  it.each([
+    'const patch = dynamic; await tools.apply_patch(patch);',
+    `const patch = ${JSON.stringify(patch)} + extra; await tools.apply_patch(patch);`,
+    `const other = ${JSON.stringify(patch)}; await tools.apply_patch(patch);`,
+    `let patch = ${JSON.stringify(patch)}; await tools.apply_patch(patch);`,
+    `const patch = ${JSON.stringify(patch)}; patch = other; await tools.apply_patch(patch);`,
+    `const patch = ${JSON.stringify(patch)}; { const patch = other; await tools.apply_patch(patch); }`
+  ])("leaves ambiguous or dynamic edits unknown", script => {
+    const edits = expandToolCalls([tool("exec", "completed", script)]).filter(isEditTool);
+    expect(edits).toHaveLength(1);
+    expect(editTargets(edits[0])).toEqual([]);
+  });
+  it.each(["write_file", "view"])("does not read literal targets through unsupported %s arguments", name => {
+    const operation = expandToolCalls([tool("exec", "completed", `await tools.${name}({path:"map.ts",...options});`)])[0];
+    expect(editExecutionScope(operation)).toBeUndefined();
+  });
+});
+
+it.each([
+  ["rg -n pytest README.md", undefined], ["echo 'npm test'", undefined], ["npm run build", "build"],
+  ["env CI=1 npm run lint", "lint"], ["bash -c 'tsc --noEmit'", "typecheck"],
+  ["sh -c 'bash -c npm-test'", undefined]
+])("classifies only common check command positions: %s", (cmd, expected) => {
+  expect(commandCheckType(tool("exec_command", "completed", { cmd }))).toBe(expected);
 });

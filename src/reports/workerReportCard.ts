@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import { discoverSources } from "../fs/discovery.js";
 import { createSessionParser } from "../normalize/parser.js";
+import { expandToolCalls, isCommandTool, toolCommand, isEditTool, editTargets, executionDirectory } from "../normalize/toolSemantics.js";
 import type { NormalizedSession } from "../normalize/types.js";
 import { correlateTraceDirectory, taskRecordsSchema, type Correlation, type TaskRecord } from "../correlation/index.js";
 import type { RequestedSource } from "../sources/types.js";
@@ -77,6 +78,12 @@ export function generateWorkerReportCards(sessions: NormalizedSession[], records
       const metrics = session.metrics;
       const score = scoreSession(session);
       const tools = Object.entries(metrics.toolCallsByName).map(([name, count]) => `${safe(name)}: ${count}`).join(", ") || "none recorded";
+      const operations = expandToolCalls(session.turns.flatMap(turn => turn.toolCalls));
+      const commands = operations.filter(isCommandTool);
+      const knownCommands = commands.filter(tool => Boolean(toolCommand(tool)?.trim())).length;
+      const knownContexts = commands.filter(tool => executionDirectory(tool) !== undefined).length;
+      const edits = operations.filter(isEditTool);
+      const knownTargets = edits.filter(tool => { const targets = editTargets(tool); return targets.length > 0 && targets.every(target => Boolean(target?.trim())); }).length;
       const models = Object.keys(metrics.models).map(safe).join(", ") || "unknown";
       const attempt = join?.status === "matched" ? safe(join.attemptId ?? "unknown") : "unknown (not verified)";
       lines.push(`### Worker: ${safe(session.nativeSessionId ?? session.sessionId)}`, "",
@@ -91,6 +98,9 @@ export function generateWorkerReportCards(sessions: NormalizedSession[], records
         `| Duration | ${duration(session)}; ${safe(session.startedAt ?? "unknown")} → ${safe(session.endedAt ?? "unknown")} |`,
         `| Tools | ${metrics.toolRequests} native requests; ${tools} |`,
         `| Edits / commands | ${metrics.editCalls} successful direct/expanded edits; ${metrics.commandCalls} recognized command operations; shell-driven edits may be unobserved |`,
+        `| Command extraction | ${knownCommands} known; ${commands.length - knownCommands} unknown |`,
+        `| Command execution context | ${knownContexts} known; ${commands.length - knownContexts} unknown |`,
+        `| Edit target extraction | ${knownTargets} known; ${edits.length - knownTargets} unknown |`,
         `| Verification | ${metrics.verificationEvents} recognized operations; ${metrics.verificationPassed} recorded successes; ${metrics.verificationFailed} failures; post-edit closure: ${safe(metrics.verificationClosure)} |`,
         `| Outcome | **Unscored / low confidence**: native lifecycle ${safe(session.lifecycleStatus)}; final answer ${session.finalAnswer?.text ? "present" : "absent"}; accepted work not assessed |`,
         `| Inefficiency | **Unscored / low confidence**: ${metrics.toolRequests ? "trace signals only; comparable effort and necessity unknown" : "no tool evidence; absence of flags does not establish efficiency"} |`,

@@ -103,3 +103,19 @@ it.each(["user.message", "hook.start", "hook.end", "tool.execution_start", "tool
     expect(report).not.toContain("no compatible worker session found");
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+
+it("reports extraction and context coverage without command or patch text", () => {
+  const session = parseSessionFile(path.resolve("tests/fixtures/claude-streaming.jsonl"), "claude").session;
+  session.turns[0].toolCalls.push({ toolCallId: "unknown-evidence", name: "exec", status: "completed",
+    arguments: 'text("PRIVATE TRANSCRIPT"); text(await tools.exec_command({cmd:dynamicCommand})); await tools.apply_patch(dynamicPatch);' });
+  session.metrics = calculateMetrics(session);
+  const card = generateWorkerReportCards([session], [task], [correlateSession(session, [task])]);
+  expect(card).toContain("| Command extraction | 1 known; 1 unknown |");
+  expect(card).toContain("| Command execution context | 1 known; 1 unknown |");
+  expect(card).toContain("| Edit target extraction | 1 known; 1 unknown |");
+  expect(card).toContain("unknown (not verified)");
+  expect(card).not.toContain("PRIVATE TRANSCRIPT");
+  expect(card).not.toContain("dynamicPatch");
+  expect(card).not.toContain("dynamicCommand");
+});

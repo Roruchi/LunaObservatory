@@ -82,7 +82,53 @@ function literalEnd(value: string, start: number): number {
   return value.length;
 }
 
+function maskedSource(value: string): string {
+  let result = "";
+  for (let index = 0; index < value.length;) {
+    if ('"\'`'.includes(value[index])) {
+      const end = literalEnd(value, index);
+      result += '""' + " ".repeat(Math.max(0, end - index - 2));
+      index = end;
+    } else if (value.startsWith("//", index) || value.startsWith("/*", index)) {
+      const block = value.startsWith("/*", index);
+      const end = block ? value.indexOf("*/", index + 2) : value.indexOf("\n", index + 2);
+      const stop = end < 0 ? value.length : end + (block ? 2 : 0);
+      result += " ".repeat(stop - index);
+      index = stop;
+    } else result += value[index++];
+  }
+  return result;
+}
+
+function supportedArguments(source: string): boolean {
+  const masked = maskedSource(source);
+  const call = /^tools\.\w+\s*\(\s*/.exec(masked);
+  if (!call || masked[call[0].length] !== "{" || !/\}\s*\)$/.test(masked) || /\.\.\./.test(masked)) return false;
+  const keys = new Set<string>();
+  let depth = 0;
+  let keyExpected = false;
+  for (let index = call[0].length; index < masked.length - 1; index++) {
+    const char = masked[index];
+    if (depth === 1 && keyExpected && !/\s/.test(char) && char !== "}") {
+      const property = /^(?:[a-zA-Z_$][\w$]*|"")\s*:/.exec(masked.slice(index));
+      if (!property) return false;
+      const raw = source.slice(index, index + property[0].length - 1).trim();
+      const key = /^["']/.test(raw) ? literalValue(raw) : raw;
+      if (!key || keys.has(key)) return false;
+      keys.add(key);
+      index += property[0].length - 1;
+      keyExpected = false;
+      continue;
+    }
+    if ("{[(".includes(char)) { depth++; if (depth === 1) keyExpected = true; }
+    if ("}])".includes(char)) depth--;
+    if (depth === 1 && char === ",") keyExpected = true;
+  }
+  return depth === 0;
+}
+
 function embeddedProperty(value: string, property: string): string | null | undefined {
+  if (/^tools\./.test(value) && !supportedArguments(value)) return null;
   const key = new RegExp(`^(?:${property}|"${property}"|'${property}')\\s*:\\s*`, "i");
   let depth = 0;
   for (let index = 0; index < value.length;) {
@@ -144,6 +190,21 @@ function embeddedPatch(value: string): string | undefined {
   if (value.slice(end).trim() !== ")") return undefined;
   const patch = literalValue(value.slice(call[0].length, end));
   return patch?.includes("*** Begin Patch") ? patch : undefined;
+}
+
+function boundPatch(script: string, call: ScriptCall): string | undefined {
+  const argument = /^tools\.apply_patch\(\s*([a-zA-Z_]\w*)\s*\)$/.exec(call.source)?.[1];
+  if (!argument) return undefined;
+  const masked = maskedSource(script);
+  if ([...masked.matchAll(new RegExp(`\\b${argument}\\b`, "g"))].length !== 2) return undefined;
+  const declarations = [...script.matchAll(new RegExp(`(?:^|;|\\n)\\s*const\\s+${argument}\\s*=\\s*("(?:\\\\.|[^"\\\\])*")\\s*;`, "g"))];
+  if (declarations.length !== 1 || declarations[0].index! >= call.start) return undefined;
+  const declarationStart = script.indexOf("const", declarations[0].index!);
+  if (masked.slice(declarationStart, declarationStart + 5) !== "const") return undefined;
+  const depth = (end: number) => [...masked.slice(0, end)].reduce((count, char) => count + (char === "{" ? 1 : char === "}" ? -1 : 0), 0);
+  if (depth(declarations[0].index!) !== 0 || depth(call.start) !== 0) return undefined;
+  const patch = parseQuotedString(declarations[0][1]);
+  return patch?.startsWith("*** Begin Patch") ? patch : undefined;
 }
 
 export function orchestrationScript(tool: NormalizedToolCall): string | undefined {
@@ -301,10 +362,10 @@ function nestedOperations(tool: NormalizedToolCall): NormalizedToolCall[] {
     } else if (polling) {
       args = { session_id: embeddedProperty(callSource, "session_id") };
       const variable = /[,{]\s*session_id\s*:\s*(\w+)\.session_id\s*[,}]/.exec(callSource)?.[1];
-      const binding = variable ? layout?.bindings.get(variable) : undefined;
+      const binding = variable && supportedArguments(callSource) ? layout?.bindings.get(variable) : undefined;
       if (binding?.length === 1 && binding[0] < index) pollForToolCallId = `${tool.toolCallId}:nested:${binding[0] + 1}`;
     } else if (isDirectEdit(name)) {
-      if (baseToolName(name) === "apply_patch") args = embeddedPatch(callSource) ?? callSource;
+      if (baseToolName(name) === "apply_patch") args = embeddedPatch(callSource) ?? boundPatch(script, matches[index]) ?? callSource;
       else {
         const targets: Record<string, string | null> = {};
         for (const key of ["path", "file_path", "filePath", "file", "filename", "uri", "target", "destination", "output", "paths", "files", "targets"]) {
@@ -392,9 +453,19 @@ function commandContext(tool: NormalizedToolCall): { command?: string; directory
   let command = (toolCommand(tool) ?? "").trim().replace(/^rtk\s+(?:proxy\s+)?/i, "");
   const prefix = /^(?:cd|set-location)\s+(?:"([^"]+)"|'([^']+)'|([^\s;|&]+))\s*(?:&&|;)\s*/i;
   let match: RegExpExecArray | null;
+  let shells = 0;
+  let environments = 0;
   while (true) {
+    if (/^env\s/.test(command)) {
+      if (environments++) return {};
+      const environment = /^env\s+(?:[A-Za-z_]\w*=(?:"[^"]*"|'[^']*'|[^\s]+)\s+)*/.exec(command)!;
+      command = command.slice(environment[0].length).replace(/^rtk\s+(?:proxy\s+)?/i, "");
+      if (/^-/.test(command)) return {};
+      continue;
+    }
     match = /^(?:\/(?:usr\/)?bin\/)?(?:bash|sh)\s+-(?:lc|cl|c)\s+(?:'([^']*)'|"([^"]*)")\s*$/i.exec(command);
     if (match) {
+      if (shells++) return {};
       command = (match[1] ?? match[2]).trim().replace(/^rtk\s+(?:proxy\s+)?/i, "");
       continue;
     }
@@ -488,21 +559,40 @@ export function isCommandTool(tool: NormalizedToolCall): boolean {
   return !orchestrationScript(tool) && isDirectCommand(tool.name);
 }
 
-export function looksLikeVerificationTool(tool: NormalizedToolCall): boolean {
-  if (tool.name === "report_intent" || isEditTool(tool)) return false;
+export type CommandCheckType = "test" | "build" | "lint" | "typecheck" | "document_build" | "diff_check";
+
+export function commandCheckType(tool: NormalizedToolCall): CommandCheckType | undefined {
+  if (isEditTool(tool)) return undefined;
   const command = verificationCommand(tool);
-  if (!command) return false;
-  const normalized = command.replace(/\\/g, "/").toLowerCase();
-  return [
-    /(?:^|[;&|]\s*|\s)(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|build|lint|check|validate|typecheck)(?:[:_-][\w-]+)*\b/,
-    /\b(?:vitest|pytest|jest|cargo\s+test|go\s+test|dotnet\s+test|mvn\s+test|gradle\w*\s+test|eslint|ruff|mypy)\b/,
-    /(?:^|\s)tsc(?:\s|$)/,
-    /\bnode\s+--check\b/,
-    /\bgit\b[^\r\n;|]*\bdiff\s+--check\b/,
-    /(?:^|\s)[^\s;|]*(?:test|validate|lint|check)(?:[-_][\w-]+)?\.(?:ps1|sh|js|mjs|cjs|ts|py)(?:\s|$)/,
-    /\btools\/godot\.ps1\b[^\r\n;|]*\b(?:parse|boot|test|export|check-android-env)\b/,
-    /\bgodot(?:\.exe)?\b[^\r\n;|]*\b--headless\b/
-  ].some((pattern) => pattern.test(normalized));
+  if (!command) return undefined;
+  const tokens = command.match(/"[^"]*"|'[^']*'|[^\s]+/g) ?? [];
+  if (tokens.some(token => !/^["']/.test(token) && /[;&|<>`$]/.test(token))) return undefined;
+  const words = tokens.map(token => token.replace(/^["']|["']$/g, "").replace(/\\/g, "/").toLowerCase());
+  let executable = words.shift()?.split("/").at(-1)?.replace(/\.exe$/, "");
+  if (executable === "npx") executable = words.shift();
+  let action = executable ?? "";
+  if (["npm", "pnpm", "yarn", "bun"].includes(action)) action = words[0] === "run" ? words[1] ?? "" : words[0] ?? "";
+  else if (["node", "python", "python3", "pwsh", "powershell"].includes(action)) {
+    if (action === "node" && words[0] === "--check") return "build";
+    if (action === "node" && words[0] === "--test") return "test";
+    if (["-e", "--eval", "-c"].includes(words[0])) return undefined;
+    action = words.find(word => !word.startsWith("-"))?.split("/").at(-1) ?? "";
+  } else if (action === "git") {
+    const args = words[0] === "-c" ? words.slice(2) : words;
+    return args[0] === "diff" && args.includes("--check") ? "diff_check" : undefined;
+  } else if (["cargo", "go", "dotnet", "mvn", "gradle", "gradlew"].includes(action)) return words[0] === "test" ? "test" : words[0] === "build" ? "build" : undefined;
+  if (/^(?:pandoc|mkdocs|sphinx-build|render_docx|export_whitepaper|docs?:build|build[-_:]?(?:docs?|document|whitepaper))(?:\.|$|[-_:])/.test(action)) return "document_build";
+  if (/^(?:typecheck|type-check|tsc|mypy)(?:$|[-_:.])/.test(action)) return "typecheck";
+  if (/^(?:test|vitest|pytest|jest|gut)(?:$|[-_:.])/.test(action)) return "test";
+  if (/^(?:lint|eslint|ruff|cspell)(?:$|[-_:.])/.test(action)) return "lint";
+  if (/^(?:build|validate|check)(?:$|[-_:.])/.test(action)) return "build";
+  if (action === "godot.ps1" && ["parse", "boot", "test", "export", "check-android-env"].some(value => words.includes(value))) return "build";
+  if (action === "godot" && words.includes("--headless")) return "build";
+  return undefined;
+}
+
+export function looksLikeVerificationTool(tool: NormalizedToolCall): boolean {
+  return commandCheckType(tool) !== undefined;
 }
 
 export function canonicalCommand(command: string): string {

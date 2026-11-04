@@ -449,3 +449,24 @@ it("does not turn unsupported orchestration into frozen Dream verification", () 
   expect(session.metrics.verificationEvents).toBe(0);
   expect(report.scores.find(score => score.category === "Verification quality")?.score).toBe(0);
 });
+
+
+it.each(["rg -n pytest README.md", "grep 'npm test' README.md", "echo tsc", 'echo "cat docs/a.md"'])("does not turn command arguments into frozen verification: %s", cmd => {
+  const session = captureVerificationCalls([
+    { name: "apply_patch", args: "*** Begin Patch\n*** Update File: docs/a.md\n*** End Patch", output: "Done" },
+    { name: "exec_command", args: { cmd }, output: { exit_code: 0, output: "matching text" } }
+  ]);
+  const { packet, report } = frozenVerification(session);
+  expect(packet.selectedSessions[0].tasks![0].verificationChecks).toEqual([]);
+  expect(report.scores.find(score => score.category === "Verification quality")?.score).toBe(0);
+});
+
+it("keeps unsupported read argument structures unknown", () => {
+  const session = captureVerificationCalls([
+    { name: "apply_patch", args: "*** Begin Patch\n*** Update File: docs/a.md\n*** End Patch", output: "Done" },
+    { name: "exec", args: 'text(await tools.view({path:"docs/a.md",...options}));', output: "file contents" }
+  ]);
+  const { packet, report } = frozenVerification(session);
+  expect(packet.selectedSessions[0].tasks![0].verificationChecks[0].target).toBeUndefined();
+  expect(report.scores.find(score => score.category === "Verification quality")?.score).toBe(0);
+});
