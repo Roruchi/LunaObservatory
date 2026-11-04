@@ -659,8 +659,8 @@ export function normalizeEventsToSession(
         if (toolCallId) {
           const toolTurn = findTurnByToolCall(turns, [toolCallId]) ?? turn;
           const output = toolOutputText(data.output);
-          const results = commandResults(data.output);
           const existing = toolTurn.toolMap.get(toolCallId);
+          const results = commandResults(data.output, existing, true);
           const isOrchestration = Boolean(existing && orchestrationScript(existing));
           const editFailed = Boolean(existing && isEditTool(existing)) &&
             /\b(?:apply_patch verification failed|failed to find expected|invalid context|patch failed|could not apply patch)\b/i.test(output);
@@ -777,7 +777,7 @@ export function normalizeEventsToSession(
       const existing = turn.toolMap.get(toolCallId);
       const existingArguments = existing?.arguments;
       const output = toolOutputText(data.result ?? data.output);
-      const results = commandResults(data.result ?? data.output);
+      const results = commandResults(data.result ?? data.output, existing);
       const resultStatus = existing && isCommandTool(existing) && !orchestrationScript(existing) && results.length
         ? commandResultStatus(results) : "completed";
       addOrUpdateTool(turn, {

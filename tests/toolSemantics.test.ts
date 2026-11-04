@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import { scoreSession } from "../src/scoring/score.js";
 import { parseSessionFile } from "../src/normalize/parser.js";
 import {
+  commandResults,
   expandToolCalls,
   toolCommand,
   canonicalToolSignature,
@@ -22,6 +23,10 @@ function tool(name: string, status: NormalizedToolCall["status"], args?: unknown
   return { toolCallId: id, name, status, arguments: args };
 }
 
+function recorded(call: NormalizedToolCall, output: unknown): NormalizedToolCall {
+  return { ...call, commandResults: commandResults(output, call, true) };
+}
+
 describe("tool semantics", () => {
   it("recognizes real Copilot vocabulary and keeps verification lanes distinct", () => {
     const unit = tool("run_in_terminal", "completed", { command: "npm run test:unit", workdir: "C:\\Repo\\A" }, "unit");
@@ -37,8 +42,8 @@ describe("tool semantics", () => {
 
   it("expands current Codex orchestration into ordered edit and command operations", () => {
     const script =
-      'const patch = "*** Begin Patch\\n*** Update File: src/x.ts\\n-old\\n+new\\n*** End Patch"; await tools.apply_patch(patch); await tools.shell_command({command:"npm run test:unit",workdir:"C:\\\\Repo\\\\A"});';
-    const outer = { ...tool("exec", "completed", script, "outer"), outputText: "Exit code: 0" };
+      'const patch = "*** Begin Patch\\n*** Update File: src/x.ts\\n-old\\n+new\\n*** End Patch"; await tools.apply_patch(patch); text(await tools.shell_command({command:"npm run test:unit",workdir:"C:\\\\Repo\\\\A"}));';
+    const outer = recorded(tool("exec", "completed", script, "outer"), "Exit code: 0");
     const operations = expandToolCalls([outer]);
     expect(operations.map((operation) => operation.name)).toEqual(["apply_patch", "shell_command"]);
     expect(isEditTool(operations[0])).toBe(true);
@@ -67,7 +72,7 @@ describe("tool semantics", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "lunaobs-exec-"));
     const fixture = path.join(root, "exec.jsonl");
     const script =
-      'const patch = "*** Begin Patch\\n*** Update File: src/x.ts\\n-old\\n+new\\n*** End Patch"; await tools.apply_patch(patch); await tools.shell_command({command:"npm test",workdir:"C:\\\\Repo\\\\A"});';
+      'const patch = "*** Begin Patch\\n*** Update File: src/x.ts\\n-old\\n+new\\n*** End Patch"; await tools.apply_patch(patch); text(await tools.shell_command({command:"npm test",workdir:"C:\\\\Repo\\\\A"}));';
     const events = [
       { timestamp: "2026-07-14T11:00:00.000Z", type: "session_meta", payload: { id: "exec-session" } },
       { timestamp: "2026-07-14T11:00:00.100Z", type: "turn_context", payload: { turn_id: "turn" } },
@@ -158,15 +163,15 @@ describe("native command argument regressions", () => {
         const id = `call-${index}`;
         if (source === "codex") events.push(
           { type: "response_item", timestamp: stamp, payload: { type: call.name === "exec" ? "custom_tool_call" : "function_call", call_id: id, name: call.name, ...(call.name === "exec" ? { input: call.args } : { arguments: JSON.stringify(call.args) }) } },
-          { type: "response_item", timestamp: stamp, payload: { type: "function_call_output", call_id: id, output: [{ type: "input_text", text: "Script completed" }, { type: "input_text", text: call.name === "exec" ? "Exit code: 0\nExit code: 0" : "Exit code: 0" }] } }
+          { type: "response_item", timestamp: stamp, payload: { type: "function_call_output", call_id: id, output: [{ type: "input_text", text: "Script completed" }, { type: "input_text", text: call.name === "exec" ? JSON.stringify([{ exit_code: 0, output: "" }, { exit_code: 0, output: "" }]) : "Exit code: 0" }] } }
         );
         else if (source === "claude") events.push(
           { type: "assistant", uuid: `${id}-request`, sessionId: "fictional-cmd", timestamp: stamp, message: { id, model: "fictional-model", content: [{ type: "tool_use", id, name: call.name, input: call.args }] } },
-          { type: "user", uuid: `${id}-result`, sessionId: "fictional-cmd", timestamp: stamp, message: { content: [{ type: "tool_result", tool_use_id: id, content: call.name === "exec" ? "Exit code: 0\nExit code: 0" : "Exit code: 0", is_error: false }] } }
+          { type: "user", uuid: `${id}-result`, sessionId: "fictional-cmd", timestamp: stamp, message: { content: [{ type: "tool_result", tool_use_id: id, content: call.name === "exec" ? JSON.stringify([{ exit_code: 0, output: "" }, { exit_code: 0, output: "" }]) : "Exit code: 0", is_error: false }] } }
         );
         else events.push(
           { id: `${id}-request`, type: "tool.execution_start", timestamp: stamp, data: { turnId: "turn", toolCallId: id, toolName: call.name, arguments: call.args } },
-          { id: `${id}-result`, type: "tool.execution_complete", timestamp: stamp, data: { turnId: "turn", toolCallId: id, toolName: call.name, success: true, result: { content: call.name === "exec" ? "Exit code: 0\nExit code: 0" : "Exit code: 0" } } }
+          { id: `${id}-result`, type: "tool.execution_complete", timestamp: stamp, data: { turnId: "turn", toolCallId: id, toolName: call.name, success: true, result: { content: call.name === "exec" ? JSON.stringify([{ exit_code: 0, output: "" }, { exit_code: 0, output: "" }]) : "Exit code: 0" } } }
         );
       });
       fs.writeFileSync(fixture, events.map(event => JSON.stringify(event)).join("\n"));
@@ -204,32 +209,32 @@ describe("native command argument regressions", () => {
 describe("command completion evidence", () => {
   it("requires output evidence even for one nested command", () => {
     const edit = tool("apply_patch", "completed", "patch");
-    const wrapper = tool("exec", "completed", 'await tools.exec_command({cmd:"npm test"});');
+    const wrapper = tool("exec", "completed", 'text(await tools.exec_command({cmd:"npm test"}));');
     expect(verificationClosureForTools([edit, wrapper])).toBe("missing");
-    expect(verificationClosureForTools([edit, { ...wrapper, outputText: "Exit code: 0" }])).toBe("passed");
-    expect(verificationClosureForTools([edit, { ...wrapper, outputText: '{"exit_code":1}' }])).toBe("failed");
+    expect(verificationClosureForTools([edit, recorded(wrapper, "Exit code: 0")])).toBe("passed");
+    expect(verificationClosureForTools([edit, recorded(wrapper, '{"exit_code":1}')])).toBe("failed");
   });
 
   it("keeps output-only envelopes unresolved instead of reading stdout as metadata", () => {
     const edit = tool("apply_patch", "completed", "patch");
-    const wrapper = tool("exec", "completed", 'await tools.exec_command({cmd:"npm test"});');
+    const wrapper = tool("exec", "completed", 'text(await tools.exec_command({cmd:"npm test"}));');
     for (const output of ['{"exit_code":0}', '{"exit_code":1}', 'Exit code: 0']) {
-      expect(verificationClosureForTools([edit, { ...wrapper, outputText: JSON.stringify({ output }) }])).toBe("missing");
+      expect(verificationClosureForTools([edit, recorded(wrapper, JSON.stringify({ output }))])).toBe("missing");
     }
   });
 
   it("does not count stdout as additional nested command results", () => {
     const edit = tool("apply_patch", "completed", "patch");
-    const wrapper = tool("exec", "completed", 'await tools.exec_command({cmd:"npm test"}); await tools.exec_command({cmd:"npm run build"});');
+    const wrapper = tool("exec", "completed", 'text(await tools.exec_command({cmd:"npm test"})); text(await tools.exec_command({cmd:"npm run build"}));');
     for (const outputText of [
       JSON.stringify({ exit_code: 0, output: '{"exit_code":0}' }),
       "Exit code: 0\nOutput:\nExit code: 0"
     ]) {
-      expect(verificationClosureForTools([edit, { ...wrapper, outputText }])).toBe("missing");
+      expect(verificationClosureForTools([edit, recorded(wrapper, outputText)])).toBe("missing");
     }
-    expect(verificationClosureForTools([edit, { ...wrapper, outputText: JSON.stringify([
+    expect(verificationClosureForTools([edit, recorded(wrapper, JSON.stringify([
       { exit_code: 0, output: '{"exit_code":1}' }, { exit_code: 0, output: '{"session_id":123}' }
-    ]) }])).toBe("passed");
+    ]))])).toBe("passed");
   });
 
   it.each(["codex", "copilot"] as const)("preserves structured completion evidence for %s", source => {
@@ -252,11 +257,12 @@ describe("command completion evidence", () => {
           ["Process exited with code 0\nFinal output:\n{\"exit_code\":1}", "passed"],
           ["Process running with session ID 123", "missing"]
         ] as const) {
-          for (const output of [result, JSON.stringify(result), [{ type: "text", text: typeof result === "string" ? result : JSON.stringify(result) }]]) {
+          for (const output of [...(typeof result === "string" ? [result] : [result, JSON.stringify(result)]), [{ type: "input_text", text: typeof result === "string" ? result : JSON.stringify(result) }]]) {
+            const observed = !nested && source === "copilot" && (output !== result || typeof result === "string") ? "passed" : expected;
             const events: unknown[] = [];
             for (const [id, name, args, response] of [
               ["edit", "apply_patch", "patch", "Done"],
-              ["check", nested ? "exec" : "exec_command", nested ? 'await tools.exec_command({cmd:"npm test"});' : { cmd: "npm test" }, output]
+              ["check", nested ? "exec" : "exec_command", nested ? 'text(await tools.exec_command({cmd:"npm test"}));' : { cmd: "npm test" }, output]
             ] as const) {
               if (source === "codex") events.push(
                 { type: "response_item", payload: { type: "function_call", call_id: id, name, arguments: JSON.stringify(args) } },
@@ -269,9 +275,9 @@ describe("command completion evidence", () => {
             }
             fs.writeFileSync(fixture, events.map(event => JSON.stringify({ ...event as object, timestamp: "2026-01-01T10:00:00Z" })).join("\n"));
             const { session } = parseSessionFile(fixture, source);
-            expect(session.metrics.verificationClosure).toBe(expected);
-            expect(session.metrics.verificationPassed).toBe(expected === "passed" ? 1 : 0);
-            expect(scoreSession(session).outcomeScore).toBe(expected === "passed" ? 80 : expected === "failed" ? 30 : 55);
+            expect(session.metrics.verificationClosure).toBe(observed);
+            expect(session.metrics.verificationPassed).toBe(observed === "passed" ? 1 : 0);
+            expect(scoreSession(session).outcomeScore).toBe(observed === "passed" ? 80 : observed === "failed" ? 30 : 55);
           }
         }
       }

@@ -1,4 +1,4 @@
-import type { NormalizedToolCall, VerificationClosure } from "./types.js";
+import type { CommandResult, NormalizedToolCall, VerificationClosure } from "./types.js";
 
 const viewToolNames = new Set(["view", "read_file", "read_text_file", "get_file", "view_image"]);
 const globToolNames = new Set(["glob", "list_files", "list_directory", "list_dir", "file_search", "rg_files"]);
@@ -90,6 +90,10 @@ function embeddedProperty(value: string, property: string): string | undefined {
       const match = key.exec(value.slice(index));
       if (match) {
         const start = index + match[0].length;
+        if (property === "session_id") {
+          const number = /^\d+(?=\s*[,}])/.exec(value.slice(start));
+          if (number) return number[0];
+        }
         if (!'"\'`'.includes(value[start] ?? " ")) return undefined;
         const end = literalEnd(value, start);
         // A literal followed by concatenation or interpolation is not static.
@@ -108,8 +112,10 @@ function embeddedProperty(value: string, property: string): string | undefined {
 }
 
 /** Locate bounded call arguments; strings/comments never introduce tool calls. */
-function scriptCalls(script: string): { name: string; source: string }[] {
-  const calls: { name: string; source: string }[] = [];
+type ScriptCall = { name: string; source: string; start: number; end: number };
+
+function scriptCalls(script: string): ScriptCall[] {
+  const calls: ScriptCall[] = [];
   for (let index = 0; index < script.length;) {
     if ('"\'`'.includes(script[index])) { index = literalEnd(script, index); continue; }
     if (script.startsWith("//", index)) { const end = script.indexOf("\n", index); index = end < 0 ? script.length : end + 1; continue; }
@@ -125,7 +131,7 @@ function scriptCalls(script: string): { name: string; source: string }[] {
       if (script[index] === ")") depth--;
       index++;
     }
-    calls.push({ name: match[1], source: script.slice(start, index) });
+    calls.push({ name: match[1], source: script.slice(start, index), start, end: index });
   }
   return calls;
 }
@@ -170,72 +176,175 @@ function isSemanticOperationName(name: string): boolean {
   return isDirectView(name) || isDirectGlob(name) || isDirectSearch(name) || isDirectEdit(name) || isDirectCommand(name);
 }
 
-export function commandResults(value: unknown): NonNullable<NormalizedToolCall["commandResults"]> {
-  if (Array.isArray(value)) return value.flatMap(commandResults);
-  if (value && typeof value === "object") {
-    const record = value as Record<string, unknown>;
-    if ("exit_code" in record || "session_id" in record) {
-      if (typeof record.exit_code === "number") return [record.exit_code === 0 ? "completed" : "failed"];
-      return ["requested"];
+function scriptPrints(script: string, calls: ScriptCall[]) {
+  let skeleton = "";
+  for (let index = 0; index < script.length;) {
+    const callIndex = calls.findIndex(call => call.start === index);
+    if (callIndex >= 0) { skeleton += `CALL_${callIndex}`; index = calls[callIndex].end; continue; }
+    if ('"\'`'.includes(script[index])) {
+      const end = literalEnd(script, index);
+      if (script[index] === "`" && script.slice(index, end).includes("${")) return undefined;
+      skeleton += '""'; index = end; continue;
     }
-    return ["text", "value", "result", "content"].flatMap(key => commandResults(record[key]));
+    if (script.startsWith("//", index)) { const end = script.indexOf("\n", index); index = end < 0 ? script.length : end + 1; continue; }
+    if (script.startsWith("/*", index)) { const end = script.indexOf("*/", index + 2); index = end < 0 ? script.length : end + 2; continue; }
+    skeleton += script[index++];
   }
-  if (typeof value !== "string") return [];
-  try { return commandResults(JSON.parse(value)); } catch {}
-  const header = value.split(/^(?:Final output|Output):[^\S\r\n]*$/im)[0];
-  return header.split(/\r?\n/).flatMap(line => {
-    try { return commandResults(JSON.parse(line)); } catch {}
-    const exit = /^(?:Exit code:|Process exited with code)\s*(-?\d+)\s*$/i.exec(line);
-    if (exit) return [Number(exit[1]) === 0 ? "completed" as const : "failed" as const];
-    return /^(?:Script running with cell ID|Process running with session ID)\b/i.test(line) ? ["requested" as const] : [];
-  });
+  const bindings = new Map<string, number[]>();
+  const prints: number[] = [];
+  while ((skeleton = skeleton.trim().replace(/^;+/, "").trim())) {
+    let match: RegExpExecArray | null;
+    if ((match = /^const\s+(\w+)\s*=\s*await\s+Promise\.all(?:Settled)?\(\[([\s\S]*?)\]\)\s*;?/.exec(skeleton))) {
+      if (!/^(?:\s*CALL_\d+\s*,?)*$/.test(match[2]) || bindings.has(match[1])) return undefined;
+      bindings.set(match[1], [...match[2].matchAll(/CALL_(\d+)/g)].map(item => Number(item[1])));
+    } else if ((match = /^const\s+(\w+)\s*=\s*(?:await\s+)?CALL_(\d+)\s*;?/.exec(skeleton))) {
+      if (bindings.has(match[1])) return undefined;
+      bindings.set(match[1], [Number(match[2])]);
+    } else if ((match = /^text\(\s*(?:await\s+)?CALL_(\d+)\s*\)\s*;?/.exec(skeleton))) {
+      prints.push(Number(match[1]));
+    } else if ((match = /^text\(\s*(\w+)\s*\)\s*;?/.exec(skeleton))) {
+      const binding = bindings.get(match[1]);
+      if (!binding) return undefined;
+      prints.push(...binding);
+    } else if ((match = /^for\s*\(const\s+(\w+)\s+of\s+(\w+)\)\s*(?:\{\s*)?text\(\1\)\s*;?\s*\}?/.exec(skeleton))) {
+      const binding = bindings.get(match[2]);
+      if (!binding) return undefined;
+      prints.push(...binding);
+    } else if (!(match = /^(?:(?:await\s+)?CALL_\d+|const\s+\w+\s*=\s*"")\s*;?/.exec(skeleton))) return undefined;
+    skeleton = skeleton.slice(match[0].length);
+  }
+  return { prints, bindings };
 }
 
-export function commandResultStatus(results: NonNullable<NormalizedToolCall["commandResults"]>): NormalizedToolCall["status"] {
-  if (results.includes("failed")) return "failed";
-  if (!results.length || results.includes("requested")) return "requested";
-  return "completed";
+function nativeCommandResult(value: unknown, allowText: boolean, decodeJson = true): CommandResult | undefined {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const record = value as Record<string, unknown>;
+    if (record.status === "fulfilled") return nativeCommandResult(record.value, allowText);
+    if (record.status === "rejected") return undefined;
+    if ("exit_code" in record || "session_id" in record) {
+      const sessionId = typeof record.session_id === "number" || typeof record.session_id === "string" ? String(record.session_id) : undefined;
+      const status = typeof record.exit_code === "number" && Number.isInteger(record.exit_code)
+        ? record.exit_code === 0 ? "completed" : "failed" : "requested";
+      return { status, sessionId };
+    }
+    if (allowText && Array.isArray(record.content)) return nativeCommandResult(record.content, true, false);
+  }
+  if (!allowText) return undefined;
+  if (Array.isArray(value)) {
+    const texts = value.filter(item => item && typeof item === "object" && (item.type === "text" || item.type === "input_text"))
+      .map(item => item.text).filter((text): text is string => typeof text === "string");
+    return nativeCommandResult(texts.join("\n"), true, decodeJson);
+  }
+  if (typeof value !== "string") return undefined;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (decodeJson && typeof parsed !== "string") return nativeCommandResult(parsed, true);
+  } catch {}
+  const header = value.split(/^(?:Final output|Output):[^\S\r\n]*$/im)[0];
+  const exit = /^(?:Exit code:|Process exited with code)\s*(-?\d+)\s*$/im.exec(header);
+  const sessionId = /^Process running with session ID\s+(\d+)\s*$/im.exec(header)?.[1];
+  return exit ? { status: Number(exit[1]) === 0 ? "completed" : "failed", sessionId }
+    : sessionId ? { status: "requested", sessionId } : undefined;
+}
+
+function printedValues(value: unknown): unknown[] {
+  if (Array.isArray(value)) return value.flatMap(printedValues);
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    if ("exit_code" in record || "session_id" in record) return [record];
+    if (record.type === "text" || record.type === "input_text") return printedValues(record.text ?? record.value);
+    if (Array.isArray(record.content) || typeof record.content === "string") return printedValues(record.content);
+    return [record];
+  }
+  if (typeof value !== "string" || /^Script completed\s*$/.test(value)) return [];
+  try { const parsed: unknown = JSON.parse(value); return Array.isArray(parsed) ? parsed : [parsed]; } catch {}
+  const lines = value.replace(/^Script completed\s*\n/, "").trim().split(/\r?\n/);
+  try { return lines.map(line => JSON.parse(line) as unknown); } catch { return [value]; }
+}
+
+export function commandResults(value: unknown, tool: NormalizedToolCall | undefined, allowText = false): CommandResult[] {
+  const script = tool && orchestrationScript(tool);
+  if (!script) {
+    const result = nativeCommandResult(value, allowText);
+    return result ? [result] : [];
+  }
+  const layout = scriptPrints(script, scriptCalls(script));
+  if (!layout?.prints.length) return [];
+  const values = printedValues(value);
+  if (values.length !== layout.prints.length) return [];
+  return values.map((item, index) => ({ ...(nativeCommandResult(item, true) ?? { status: "requested" as const }), operationIndex: layout.prints[index] }));
+}
+
+export function commandResultStatus(results: CommandResult[]): NormalizedToolCall["status"] {
+  return results.at(-1)?.status ?? "requested";
 }
 
 function nestedOperations(tool: NormalizedToolCall): NormalizedToolCall[] {
   const script = orchestrationScript(tool);
-  if (!script) return [tool];
+  if (!script) return [{ ...tool }];
   const matches = scriptCalls(script);
-  const nestedCommandCount = matches.filter((match) => isDirectCommand(match.name)).length;
-  const results = tool.commandResults ?? commandResults(tool.outputText);
-  const wrapperFailed = tool.status === "failed" || results.includes("failed");
-  // A wrapper finishing does not prove that every nested command finished.
-  const partial = results.includes("requested") || results.length < nestedCommandCount;
+  const layout = scriptPrints(script, matches);
   const operations: NormalizedToolCall[] = [];
   for (let index = 0; index < matches.length; index += 1) {
     const name = matches[index].name;
-    if (!isSemanticOperationName(name)) continue;
+    const polling = baseToolName(name) === "write_stdin";
+    if (!isSemanticOperationName(name) && !polling) continue;
     const callSource = matches[index].source;
     let args: unknown = callSource;
+    let pollForToolCallId: string | undefined;
     if (isDirectCommand(name)) {
       args = {
         command: embeddedProperty(callSource, "command") ?? embeddedProperty(callSource, "cmd"),
         workdir: embeddedProperty(callSource, "workdir")
       };
+    } else if (polling) {
+      args = { session_id: embeddedProperty(callSource, "session_id") };
+      const variable = /[,{]\s*session_id\s*:\s*(\w+)\.session_id\s*[,}]/.exec(callSource)?.[1];
+      const binding = variable ? layout?.bindings.get(variable) : undefined;
+      if (binding?.length === 1 && binding[0] < index) pollForToolCallId = `${tool.toolCallId}:nested:${binding[0] + 1}`;
     } else if (isDirectEdit(name)) {
       args = embeddedPatch(callSource) ?? embeddedPatch(script) ?? callSource;
     } else {
       const path = embeddedProperty(callSource, "path") ?? embeddedProperty(callSource, "file") ?? embeddedProperty(callSource, "uri");
       args = path ? { path } : callSource;
     }
+    const results = tool.commandResults?.filter(result => result.operationIndex === index) ?? [];
     operations.push({
       ...tool,
       toolCallId: `${tool.toolCallId}:nested:${index + 1}`,
+      originToolCallId: tool.toolCallId,
+      pollForToolCallId,
       name,
       arguments: args,
-      status: isDirectCommand(name) && partial ? "requested" : isDirectCommand(name) && wrapperFailed ? (nestedCommandCount === 1 ? "failed" : "requested") : tool.status
+      commandResults: results,
+      status: isDirectCommand(name) || polling ? commandResultStatus(results) : tool.status
     });
   }
-  return operations.length ? operations : [tool];
+  return operations.length ? operations : [{ ...tool }];
 }
 
 export function expandToolCalls(tools: NormalizedToolCall[]): NormalizedToolCall[] {
-  return tools.flatMap(nestedOperations);
+  const operations = tools.flatMap(nestedOperations);
+  const commands = new Map<string, NormalizedToolCall>();
+  const byId = new Map<string, NormalizedToolCall>();
+  for (const tool of operations) {
+    byId.set(tool.toolCallId, tool);
+    const result = tool.commandResults?.at(-1);
+    if (isDirectCommand(tool.name) && result?.sessionId) commands.set(result.sessionId, tool);
+    if (baseToolName(tool.name) !== "write_stdin" || !result) continue;
+    const args = commandArgumentRecord(tool.arguments);
+    const sessionId = args?.session_id === undefined ? undefined : String(args.session_id);
+    const target = tool.pollForToolCallId ? byId.get(tool.pollForToolCallId) : sessionId ? commands.get(sessionId) : undefined;
+    const targetSession = target?.commandResults?.at(-1)?.sessionId;
+    if (!target || !targetSession || result.sessionId && result.sessionId !== targetSession) continue;
+    target.status = result.status;
+  }
+  return operations;
+}
+
+function commandArgumentRecord(args: unknown): Record<string, unknown> | undefined {
+  if (typeof args === "string") { try { return commandArgumentRecord(JSON.parse(args)); } catch { return undefined; } }
+  return args && typeof args === "object" ? args as Record<string, unknown> : undefined;
 }
 
 export function toolCommand(tool: NormalizedToolCall): string | undefined {

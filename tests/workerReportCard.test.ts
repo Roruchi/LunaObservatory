@@ -84,3 +84,22 @@ it.each(["codex", "copilot"] as const)("uses shared %s identity for default all-
     }
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+
+it.each(["user.message", "hook.start", "hook.end", "tool.execution_start", "tool.execution_end", "tool.execution_complete", "session.shutdown"])("infers Copilot from partition-only %s events", family => {
+  const root = fs.mkdtempSync(path.resolve("tests/.partition-identity-"));
+  try {
+    const file = path.join(root, "partition-1.jsonl");
+    const stamp = "2026-01-01T10:00:00Z";
+    const data = { sessionId: "fictional-partition", content: "Task id: fictional-nebula", toolCallId: "call", toolName: "view", arguments: { path: "fictional.ts" }, hookInvocationId: "hook", success: true };
+    fs.writeFileSync(file, JSON.stringify({ type: family, timestamp: stamp, data }));
+    expect(parseSessionFile(file, "unknown").session.source).toBe("copilot");
+    const taskFile = path.join(root, "tasks.json");
+    fs.writeFileSync(taskFile, JSON.stringify([{ ...task, harness: "copilot", nativeSessionId: data.sessionId }]));
+    const report = reportCardsFromTraces(root, taskFile);
+    expect(report).toContain("### Worker: fictional-partition");
+    expect(report).toContain("| Harness / model | copilot /");
+    expect(report).not.toContain("normalized trace unavailable");
+    expect(report).not.toContain("no compatible worker session found");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

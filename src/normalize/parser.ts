@@ -24,7 +24,7 @@ export function createSessionParser(files: { file: string; source: SourceName }[
     const result = readJsonl(file);
     const inferredSource = source !== "unknown" ? source
       : result.events.some(event => event.type === "session_meta") ? "codex"
-      : result.events.some(event => event.type.startsWith("assistant.")) ? "copilot" : "unknown";
+      : result.events.some(event => /^(?:assistant\.|user\.message$|hook\.|tool\.execution_|session\.)/.test(event.type)) ? "copilot" : "unknown";
     return {
       session: normalizeEventsToSession(result.events, inferredSource, file, result.parseErrors),
       eventsParsed: result.events.length,

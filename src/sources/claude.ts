@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { commandResults, orchestrationScript } from "../normalize/toolSemantics.js";
 import { createHash } from "node:crypto";
 import { calculateMetrics, reported, unavailable } from "../normalize/metrics.js";
 import type { EvidenceRef, NormalizedAssistantMessage, NormalizedSession, NormalizedToolCall, NormalizedTurn, RawLogEvent } from "../normalize/types.js";
@@ -329,6 +330,7 @@ export function parseClaudeSessionFile(file: string, corpus = createClaudeCorpus
         tools.set(id, tool); active.toolCalls.push(tool); unknowns.add("orphan_tool_result");
       }
       tool.outputText = text(block.content);
+      if (orchestrationScript(tool)) tool.commandResults = commandResults(block.content, tool);
       tool.executionEndedAt = time;
       tool.evidence = [...(tool.evidence ?? []), ref(row, line, "message.content.tool_result")];
       const result = obj(row.toolUseResult);

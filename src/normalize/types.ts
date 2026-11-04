@@ -106,6 +106,12 @@ export type NormalizedAssistantMessage = {
   evidence?: EvidenceRef[];
 };
 
+export type CommandResult = {
+  status: "completed" | "failed" | "requested";
+  sessionId?: string;
+  operationIndex?: number;
+};
+
 export type NormalizedToolCall = {
   exitCode?: number;
   toolCallId: string;
@@ -116,7 +122,9 @@ export type NormalizedToolCall = {
   executionStartedAt?: string;
   executionEndedAt?: string;
   outputText?: string;
-  commandResults?: ("completed" | "failed" | "requested")[];
+  commandResults?: CommandResult[];
+  originToolCallId?: string;
+  pollForToolCallId?: string;
   status: "requested" | "started" | "completed" | "failed" | "unknown";
   evidence?: EvidenceRef[];
 };

@@ -234,10 +234,15 @@ function segmentTasks(session: NormalizedSession): TaskDraft[] {
 function orderedActions(session: NormalizedSession): Map<NormalizedTurn, OrderedAction[]> {
   const byTurn = new Map<NormalizedTurn, OrderedAction[]>();
   let actionIndex = 0;
+  const expandedByCall = new Map<string, NormalizedToolCall[]>();
+  for (const tool of expandToolCalls(session.turns.flatMap(turn => turn.toolCalls))) {
+    const key = tool.originToolCallId ?? tool.toolCallId;
+    expandedByCall.set(key, [...expandedByCall.get(key) ?? [], tool]);
+  }
   for (const turn of session.turns) {
     const actions: OrderedAction[] = [];
     for (const original of turn.toolCalls) {
-      for (const tool of expandToolCalls([original])) {
+      for (const tool of expandedByCall.get(original.toolCallId) ?? []) {
         actions.push({ actionIndex: actionIndex++, turn, tool });
       }
     }
