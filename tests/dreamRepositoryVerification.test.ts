@@ -411,8 +411,12 @@ it("uses wrapped execution context consistently in session metrics and frozen Dr
     expect(session.metrics.verificationClosure).toBe(matching ? exit === 0 ? "passed" : "failed" : "missing");
     const { packet, report } = frozenVerification(session);
     const check = packet.selectedSessions[0].tasks![0].verificationChecks[0];
-    expect(check.target).toBe(target);
-    expect(check.fresh).toBe(matching);
+    if (target === undefined) {
+      expect(check).toBeUndefined();
+    } else {
+      expect(check.target).toBe(target);
+      expect(check.fresh).toBe(matching);
+    }
     expect(report.scores.find(score => score.category === "Verification quality")?.score).toBe(matching && exit === 0 ? 5 : 0);
   }
 });

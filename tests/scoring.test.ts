@@ -161,6 +161,7 @@ describe("scoring", () => {
 
   it("classifies a verified high-churn success as expensive rather than efficient", () => {
     const session = baseSession({
+      repoRoot: "/fictional/repo",
       lifecycleStatus: "completed",
       finalAnswer: { text: "Implemented and verified." },
       turns: [
@@ -178,8 +179,8 @@ describe("scoring", () => {
             }
           ],
           toolCalls: [
-            { toolCallId: "edit", name: "apply_patch", status: "completed" },
-            { toolCallId: "test", name: "shell_command", arguments: { command: "npm test" }, status: "completed" }
+            { toolCallId: "edit", name: "apply_patch", arguments: "*** Begin Patch\n*** Update File: map.ts\n*** End Patch", executionCwd: "/fictional/repo", status: "completed" },
+            { toolCallId: "test", name: "shell_command", arguments: { command: "npm test" }, executionCwd: "/fictional/repo", status: "completed" }
           ],
           hooks: []
         }

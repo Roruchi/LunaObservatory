@@ -220,8 +220,9 @@ prompts, secrets and private session content out of public packets and reports.
 
 The second slice adds [Claude Code ingestion](claude-adapter.md) and
 [trace-to-task/attempt correlation](session-correlation.md) alongside this module.
-Final-state check freshness, curated evidence adapters, live Firstmate integration
-and dashboard visualisation remain later work needing separate approval.
+[Final-state check freshness](session-correlation.md#command-evidence) is shared by
+Scan and Dream. Curated evidence adapters, live Firstmate integration and dashboard
+visualisation remain later work needing separate approval.
 Real-session evaluation and independent adjudication are not implemented.
 
 ## Prior-art credit
