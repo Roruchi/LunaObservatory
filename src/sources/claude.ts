@@ -88,13 +88,51 @@ function orderCopiedRows(rows: NativeRow[], copies: Transcript[]): NativeRow[] {
       previous = id;
     }
   }
-  const remaining = new Map([...rows].sort((a, b) => time(a) - time(b)).map(row => [key(row), row]));
+  const ranked = [...rows].sort((a, b) => time(a) - time(b));
+  const ranks = new Map(ranked.map((row, index) => [key(row), index]));
+  const emitted = new Set<number>();
+  const ready: number[] = [];
+  const enqueue = (rank: number) => {
+    let index = ready.length;
+    ready.push(rank);
+    while (index > 0) {
+      const parent = Math.floor((index - 1) / 2);
+      if (ready[parent] <= rank) break;
+      ready[index] = ready[parent];
+      index = parent;
+    }
+    ready[index] = rank;
+  };
+  for (const [id, rank] of ranks) if (incoming.get(id) === 0) enqueue(rank);
   const ordered: NativeRow[] = [];
-  while (remaining.size) {
-    const id = [...remaining.keys()].find(id => incoming.get(id) === 0) ?? remaining.keys().next().value!;
-    ordered.push(remaining.get(id)!);
-    remaining.delete(id);
-    for (const next of successors.get(id)!) incoming.set(next, incoming.get(next)! - 1);
+  let fallback = 0;
+  while (ordered.length < ranked.length) {
+    let rank = ready[0];
+    const last = ready.pop();
+    if (ready.length && last !== undefined) {
+      let index = 0;
+      while (index * 2 + 1 < ready.length) {
+        let child = index * 2 + 1;
+        if (child + 1 < ready.length && ready[child + 1] < ready[child]) child += 1;
+        if (last <= ready[child]) break;
+        ready[index] = ready[child];
+        index = child;
+      }
+      ready[index] = last;
+    }
+    if (rank === undefined) {
+      while (emitted.has(fallback)) fallback += 1;
+      rank = fallback;
+    }
+    emitted.add(rank);
+    const row = ranked[rank];
+    ordered.push(row);
+    for (const next of successors.get(key(row))!) {
+      const degree = incoming.get(next)! - 1;
+      incoming.set(next, degree);
+      const nextRank = ranks.get(next)!;
+      if (degree === 0 && !emitted.has(nextRank)) enqueue(nextRank);
+    }
   }
   return ordered;
 }

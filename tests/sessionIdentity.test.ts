@@ -122,6 +122,48 @@ describe("session identity boundaries", () => {
       expect(session.finalAnswer?.text).toBe("Answer 2");
     }
   });
+  it("reconciles 50,000 synthetic records with an overlapping suffix", () => {
+    const count = 50_000;
+    const records = Array.from({ length: count }, (_, index) => ({
+      type: "assistant", sessionId: "fictional-large-overlap", uuid: `large-event-${index}`, requestId: `large-request-${index}`,
+      timestamp: "2026-01-01T10:00:00Z",
+      message: { id: `large-message-${index}`, model: "fictional-model", content: [{ type: "text", text: `Answer ${index}` }], usage: { input_tokens: 1, output_tokens: 1 } }
+    }));
+    const suffix = path.join(directory, "large-a.jsonl"); const complete = path.join(directory, "large-b.jsonl");
+    write(suffix, records.slice(count / 2)); write(complete, records);
+    const start = performance.now();
+    const session = createSessionParser([suffix, complete].map(file => ({ file, source: "claude" })))(suffix, "claude").session;
+    const elapsed = performance.now() - start;
+    expect(session.metrics.modelRequests).toBe(count);
+    expect(session.metrics.inputTokens.value).toBe(count);
+    expect(session.metrics.outputTokens.value).toBe(count);
+    expect(session.turns.flatMap(turn => turn.assistantMessages).map(message => message.messageId)).toEqual(records.map(row => row.message.id));
+    expect(session.finalAnswer?.text).toBe(`Answer ${count - 1}`);
+    expect(session.nativeSessionId).toBe("fictional-large-overlap");
+    console.log(`Synthetic overlapping transcript: ${count} records in ${Math.round(elapsed)}ms`);
+  }, 20_000);
+  it("selects the earliest eligible rank as overlapping chains become ready", () => {
+    const chains = [[6, 0, 4], [3, 1], [7, 2], [5, 8]];
+    const files = chains.map((chain, index) => {
+      const file = path.join(directory, `ready-${index}.jsonl`);
+      write(file, chain.map(value => ({ type: "assistant", sessionId: "fictional-ready", uuid: `ready-${value}`, requestId: `ready-request-${value}`, timestamp: `2026-01-01T10:00:0${value}Z`, message: { id: `ready-message-${value}`, content: [{ type: "text", text: `Answer ${value}` }] } })));
+      return file;
+    });
+    for (const order of [files, [...files].reverse()]) {
+      const session = createSessionParser(order.map(file => ({ file, source: "claude" })))(files[0], "claude").session;
+      expect(session.turns.flatMap(turn => turn.assistantMessages).map(message => message.text)).toEqual([3, 1, 5, 6, 0, 4, 7, 2, 8].map(value => `Answer ${value}`));
+    }
+  });
+  it("retains deterministic cycle fallback and resumes eligible ordering", () => {
+    const records = [0, 1, 2, 3].map(index => ({ type: "assistant", sessionId: "fictional-cycle", uuid: `cycle-${index}`, requestId: `cycle-request-${index}`, timestamp: `2026-01-01T10:00:0${index}Z`, message: { id: `cycle-message-${index}`, content: [{ type: "text", text: `Answer ${index}` }] } }));
+    const a = path.join(directory, "cycle-a.jsonl"); const b = path.join(directory, "cycle-b.jsonl");
+    write(a, records); write(b, [records[2], records[1]]);
+    for (const files of [[a, b], [b, a]]) {
+      const session = createSessionParser(files.map(file => ({ file, source: "claude" })))(a, "claude").session;
+      expect(session.turns.flatMap(turn => turn.assistantMessages).map(message => message.text)).toEqual(["Answer 0", "Answer 1", "Answer 2", "Answer 3"]);
+      expect(session.metrics.modelRequests).toBe(4);
+    }
+  });
   it("keeps unidentified observations at the same line in different copies separate", () => {
     const files = [4, 6].map((value, index) => {
       const file = path.join(directory, `unidentified-${index}.jsonl`);
