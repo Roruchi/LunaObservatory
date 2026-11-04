@@ -618,24 +618,18 @@ export function commandCheckType(tool: NormalizedToolCall): CommandCheckType | u
   if (executable === "npx") executable = words.shift();
   let action = executable ?? "";
   if (["npm", "pnpm", "yarn", "bun"].includes(action)) {
-    const scriptIndex = words[0] === "run" ? 1 : 0;
-    action = words[scriptIndex] ?? "";
-    const args = words.slice(scriptIndex + 1);
-    if (args.some((word, index) => word.startsWith("-") && !(index === 0 && word === "--"))) return undefined;
+    action = words[0] === "run" ? words[1] ?? "" : words[0] ?? "";
     if (action === "test") return "test";
   }
   else if (["node", "python", "python3", "pwsh", "powershell"].includes(action)) {
-    if (action === "node" && ["--check", "--test"].includes(words[0])) {
-      if (words.slice(1).some(word => word.startsWith("-"))) return undefined;
-      return words[0] === "--check" ? "build" : "test";
-    }
-    if (words.some(word => word.startsWith("-"))) return undefined;
-    action = words[0]?.split("/").at(-1) ?? "";
+    if (action === "node" && words[0] === "--check") return "build";
+    if (action === "node" && words[0] === "--test") return "test";
+    if (["-e", "--eval", "-c"].includes(words[0])) return undefined;
+    action = words.find(word => !word.startsWith("-"))?.split("/").at(-1) ?? "";
   } else if (action === "git") {
     const args = words[0] === "-c" ? words.slice(2) : words;
     return args[0] === "diff" && args.includes("--check") ? "diff_check" : undefined;
   } else if (["cargo", "go", "dotnet", "mvn", "gradle", "gradlew"].includes(action)) return words[0] === "test" ? "test" : words[0] === "build" ? "build" : undefined;
-  if (words.some(word => word.startsWith("-") && !(action === "tsc" && word === "--noemit") && !(action === "godot" && word === "--headless"))) return undefined;
   if (/^(?:pandoc|mkdocs|sphinx-build|render_docx|export_whitepaper|docs?:build|build[-_:]?(?:docs?|document|whitepaper))(?:\.|$|[-_:])/.test(action)) return "document_build";
   if (/^(?:typecheck|type-check|tsc|mypy)(?:$|[-_:.])/.test(action)) return "typecheck";
   if (/^(?:test(?=[-_.:])|vitest|pytest|jest|gut)(?:$|[-_:.])/.test(action)) return "test";

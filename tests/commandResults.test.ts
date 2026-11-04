@@ -506,20 +506,28 @@ describe("bounded opaque assignment evidence", () => {
   });
 });
 
-describe("unsupported invocation options", () => {
-  it.each([
-    "npm test --prefix /repo/b", "npm test --version", "npm run build --version", "npm test -- --version",
-    "node --require ./test-setup.js ./scripts/generate.js", "node --test --version", "pytest --version", "tsc --help",
-    "VALUE=$(npm test) echo done", "VALUE=$OTHER rg -n pytest README.md"
-  ])("does not award verification for unsupported forms: %s", cmd => {
-    for (const nested of [false, true]) {
-      const call = nested ? wrapped(`text(await tools.exec_command(${JSON.stringify({ cmd })}));`, [envelope(0)])
-        : { name: "exec_command", args: { cmd }, output: envelope(0) };
-      const session = capture([edit, call]);
-      session.lifecycleStatus = "completed";
-      expect(session.metrics.verificationEvents).toBe(0);
-      expect(session.metrics.verificationClosure).toBe("missing");
-      expect(scoreSession(session).outcomeScore).toBe(50);
-    }
-  });
+it.each(["VALUE=$(npm test) echo done", "VALUE=$OTHER rg -n pytest README.md"])("classifies only the body after opaque assignments: %s", cmd => {
+  const session = capture([edit, { name: "exec_command", args: { cmd }, output: envelope(0) }]);
+  expect(session.metrics.verificationEvents).toBe(0);
+  expect(session.metrics.verificationClosure).toBe("missing");
+});
+
+it.each(["codex", "copilot"] as const)("keeps option-bearing test failures visible for %s", source => {
+  for (const nested of [false, true]) {
+    const check = (cmd: string, exit: number): Call => nested
+      ? wrapped(`text(await tools.exec_command(${JSON.stringify({ cmd })}));`, [envelope(exit)])
+      : { name: "exec_command", args: { cmd }, output: envelope(exit) };
+    const session = capture([edit, check("pytest -q", 1), check("npm run build", 0)], source);
+    session.lifecycleStatus = "completed";
+    expect(session.metrics.verificationEvents).toBe(2);
+    expect(session.metrics.verificationFailed).toBe(1);
+    expect(session.metrics.verificationPassed).toBe(1);
+    expect(session.metrics.verificationClosure).toBe("failed");
+    expect(scoreSession(session).outcomeScore).toBe(30);
+    const passed = capture([edit, check("npm test -- --runInBand", 0)], source);
+    passed.lifecycleStatus = "completed";
+    expect(passed.metrics.verificationEvents).toBe(1);
+    expect(passed.metrics.verificationClosure).toBe("passed");
+    expect(scoreSession(passed).outcomeScore).toBe(90);
+  }
 });

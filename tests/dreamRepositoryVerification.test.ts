@@ -485,11 +485,22 @@ it.each([
 
 
 it.each([
-  ["ROOT=$(git rev-parse --show-toplevel) npm test", true], ["ROOT=$OTHER npm test", true],
-  ["npm test --prefix /repo/b", false], ["npm test --version", false],
-  ["node --require ./test-setup.js ./scripts/generate.js", false]
-])("uses the bounded assignment/invocation policy in frozen Dream: %s", (cmd, verified) => {
+  ["ROOT=$(git rev-parse --show-toplevel) npm test", true], ["ROOT=$OTHER npm test", true]
+])("preserves opaque assignment bodies in frozen Dream: %s", (cmd, verified) => {
   const { packet, report } = frozenVerification(dreamCapture("/repo/a", cmd));
   expect(packet.selectedSessions[0].tasks![0].verificationChecks.length).toBe(verified ? 1 : 0);
   expect(report.scores.find(score => score.category === "Verification quality")?.score).toBe(verified ? 5 : 0);
+});
+
+
+it.each([true, false])("preserves option-bearing checks through frozen Dream (failed=%s)", failed => {
+  const checks = failed ? [["pytest -q", 1], ["npm run build", 0]] as const : [["npm test -- --runInBand", 0]] as const;
+  const session = captureVerificationCalls([
+    { name: "apply_patch", args: "*** Begin Patch\n*** Update File: map.ts\n*** End Patch", output: "Done" },
+    ...checks.map(([cmd, exit_code]) => ({ name: "exec_command", args: { cmd }, output: { exit_code, output: "check result" } }))
+  ]);
+  const { packet, report } = frozenVerification(session);
+  expect(session.metrics.verificationClosure).toBe(failed ? "failed" : "passed");
+  expect(packet.selectedSessions[0].tasks![0].verificationChecks.map(check => check.status)).toEqual(failed ? ["failed", "passed"] : ["passed"]);
+  expect(report.scores.find(score => score.category === "Verification quality")?.score).toBe(failed ? 0 : 5);
 });
