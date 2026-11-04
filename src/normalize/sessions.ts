@@ -151,6 +151,7 @@ function addOrUpdateTool(turn: MutableTurn, tool: NormalizedToolCall): Normalize
     Object.assign(existing, {
       ...tool,
       arguments: tool.arguments ?? existing.arguments,
+      executionCwd: tool.executionCwd ?? existing.executionCwd,
       evidence: [...(existing.evidence ?? []), ...(tool.evidence ?? [])]
     });
     return existing;
@@ -413,6 +414,7 @@ export function normalizeEventsToSession(
   let parentSessionId: string | undefined;
   let agentPath: string | undefined;
   let sessionCwd: string | undefined;
+  const turnCwds = new Map<string, string>();
   let sessionModel: string | undefined;
   let currentTurnId = "unknown";
 
@@ -421,6 +423,11 @@ export function normalizeEventsToSession(
     const turnId = codexTurnId(data) ?? stringValue(data.turnId) ?? currentTurnId;
     const interactionId = stringValue(data.interactionId);
     if (interactionId) interactions.add(interactionId);
+
+    if (event.type === "session.start") {
+      const context = data.context && typeof data.context === "object" ? data.context as Record<string, unknown> : {};
+      sessionCwd = stringValue(context.cwd) ?? stringValue(data.cwd);
+    }
 
     if (event.type === "session_meta") {
       const parent = stringValue(data.parent_thread_id) ?? stringValue(data.session_id);
@@ -436,7 +443,9 @@ export function normalizeEventsToSession(
       currentTurnId = contextTurnId;
       const turn = getTurn(turns, contextTurnId);
       touchTurnTime(turn, event.timestamp);
-      addSyntheticCwdHook(turn, event, stringValue(data.cwd) ?? sessionCwd);
+      const cwd = stringValue(data.cwd) ?? sessionCwd;
+      if (cwd) turnCwds.set(contextTurnId, cwd);
+      addSyntheticCwdHook(turn, event, cwd);
       const model = stringValue(data.model) ?? sessionModel;
       if (model) turnModels.set(contextTurnId, model);
       continue;
@@ -649,6 +658,7 @@ export function normalizeEventsToSession(
             toolCallId,
             name: toolName,
             arguments: parsedArgs,
+            executionCwd: turnCwds.get(responseTurnId) ?? sessionCwd,
             requestedAt: event.timestamp,
             status: "requested",
             evidence: [
@@ -740,6 +750,7 @@ export function normalizeEventsToSession(
           toolCallId,
           name: toolName,
           arguments: request.arguments,
+          executionCwd: stringValue(data.cwd) ?? sessionCwd,
           intentionSummary: stringValue(request.intentionSummary),
           requestedAt: event.timestamp,
           status: "requested",
@@ -764,6 +775,7 @@ export function normalizeEventsToSession(
         toolCallId,
         name: toolName,
         arguments: data.arguments,
+        executionCwd: stringValue(data.cwd) ?? sessionCwd,
         executionStartedAt: event.timestamp,
         status: "started",
         evidence: [
@@ -831,6 +843,7 @@ export function normalizeEventsToSession(
           toolCallId,
           name: toolName,
           arguments: parsedArgs,
+          executionCwd: stringValue(input.cwd),
           status: "unknown",
           evidence: [
             evidence(event, "data.input.toolCalls", `tool=${toolName}`),

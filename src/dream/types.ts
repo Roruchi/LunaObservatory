@@ -80,6 +80,7 @@ export type VerificationCheck = {
 };
 
 export type DreamChangeClassification = {
+  executionScope?: string;
   changeId: string;
   actionIndex: number;
   changeType: DreamChangeType;

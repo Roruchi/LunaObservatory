@@ -13,6 +13,7 @@ let toolId = 0;
 function tool(name: string, argumentsValue: unknown, status: NormalizedToolCall["status"] = "completed", outputText?: string): NormalizedToolCall {
   return {
     toolCallId: `${name}-${toolId++}`,
+    executionCwd: "C:\\Repo\\Example",
     name,
     arguments: argumentsValue,
     status,
@@ -74,7 +75,7 @@ describe("dream task analysis", () => {
             tool(
               "apply_patch",
               "*** Begin Patch\n*** Update File: C:\\Users\\roelv\\.codex\\automations\\luna-os-v2-issue-worker\\memory.md\n*** End Patch",
-              "completed",
+              "failed",
               "apply_patch verification failed: Failed to find expected lines"
             ),
             tool(

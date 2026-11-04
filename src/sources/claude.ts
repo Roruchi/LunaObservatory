@@ -314,7 +314,7 @@ export function parseClaudeSessionFile(file: string, corpus = createClaudeCorpus
             const args = obj(block.input);
             const aliases: Record<string, string> = { Read: "view", MultiEdit: "edit", NotebookEdit: "edit" };
             const tool: NormalizedToolCall = { toolCallId: id, name: aliases[name] ?? name, arguments: typeof block.input === "string" ? block.input : { ...args, ...(str(args.file_path) ? { path: args.file_path } : {}) },
-              requestedAt: time, status: "requested", evidence: [ref(row, line, "message.content.tool_use")] };
+              executionCwd: str(row.cwd), requestedAt: time, status: "requested", evidence: [ref(row, line, "message.content.tool_use")] };
             tools.set(id, tool); active.toolCalls.push(tool);
           }
         } else if (block.type !== "tool_use") unknowns.add(`unsupported_content:${String(block.type)}`);

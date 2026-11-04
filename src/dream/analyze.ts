@@ -378,34 +378,21 @@ function canonicalTarget(target: string | undefined): string | undefined {
   return normalized || undefined;
 }
 
-function repoName(session: NormalizedSession): string | undefined {
-  const normalized = canonicalTarget(session.repoRoot);
-  return normalized?.split("/").at(-1);
-}
-
-function repoTarget(session: Pick<NormalizedSession, "repoRoot">): string | undefined {
-  const root = canonicalTarget(session.repoRoot);
-  return root ? `repo:${root}` : undefined;
-}
-
-export function repositoryVerificationMatches(change: DreamChangeClassification, check: VerificationCheck, repoRoot?: string): boolean {
-  const root = canonicalTarget(repoRoot);
+export function repositoryVerificationMatches(change: DreamChangeClassification, check: VerificationCheck): boolean {
+  const scope = canonicalTarget(change.executionScope);
   const target = canonicalTarget(change.target);
-  if (!root || !target || check.target !== repoTarget({ repoRoot })) return false;
+  const checkScope = check.target?.startsWith("repo:") ? canonicalTarget(check.target.slice(5)) : undefined;
+  if (!scope || !target || !checkScope) return false;
   if (!["product_code", "tests", "documentation", "repository_metadata"].includes(change.changeType)) return false;
-  return !path.posix.isAbsolute(target) && !path.win32.isAbsolute(target) && !/^[$%~]/.test(target)
-    ? !path.posix.normalize(target).startsWith("../")
-    : target === root || target.startsWith(`${root}/`);
+  return (target === scope || target.startsWith(`${scope}/`)) &&
+    (checkScope === scope || checkScope.startsWith(`${scope}/`));
 }
 
-function isRepoPath(target: string, session: NormalizedSession): boolean {
+function isRepoPath(target: string, executionScope?: string): boolean {
   const normalized = canonicalTarget(target);
   if (!normalized) return false;
-  if (!path.win32.isAbsolute(target) && !path.posix.isAbsolute(target) && !/^[$%~]/.test(target)) return true;
-  const root = canonicalTarget(session.repoRoot);
-  if (root && (normalized === root || normalized.startsWith(`${root}/`))) return true;
-  const name = repoName(session);
-  return Boolean(name && new RegExp(`/worktrees/[^/]+/${name}(?:/|$)`, "i").test(normalized));
+  const scope = canonicalTarget(executionScope);
+  return Boolean(scope && (normalized === scope || normalized.startsWith(`${scope}/`)));
 }
 
 function fileName(target: string): string {
@@ -416,7 +403,7 @@ function generatedAssetPath(target: string): boolean {
   return /\.(?:png|jpe?g|gif|webp|bmp|ico|svg|mp3|wav|flac|ogg|mp4|webm|pdf|docx|pptx|xlsx)$/i.test(target);
 }
 
-function classifyTarget(target: string | undefined, session: NormalizedSession, operation?: ShellMutation["operation"]): {
+function classifyTarget(target: string | undefined, executionScope: string | undefined, operation?: ShellMutation["operation"]): {
   type: DreamChangeType;
   confidence: DreamConfidence;
   reason: string;
@@ -428,7 +415,7 @@ function classifyTarget(target: string | undefined, session: NormalizedSession, 
   if (normalized && generatedAssetPath(normalized)) {
     return { type: "generated_asset", confidence: "high", reason: "target has a generated-asset file type" };
   }
-  if (target && isRepoPath(target, session)) {
+  if (target && isRepoPath(target, executionScope)) {
     const name = fileName(target);
     if (/(?:^|\/)(?:tests?|specs?|__tests__|fixtures)(?:\/|$)|\.(?:test|spec)\.[^.]+$/i.test(normalized ?? target)) {
       return { type: "tests", confidence: "high", reason: "target is a repository test or fixture" };
@@ -520,18 +507,22 @@ function classifyChanges(session: NormalizedSession, taskId: string, actions: Or
     const semantic = mutationKind(action);
     if (!semantic.mutation) continue;
     const outcome = effectiveOutcome(action.tool);
+    const executionScope = executionDirectory(action.tool);
     const rawTargets = semantic.targets.length ? semantic.targets : [undefined];
     rawTargets.forEach((rawTarget, targetIndex) => {
+      const target = rawTarget === undefined ? undefined : semantic.forcedType === "external_system"
+        ? canonicalTarget(rawTarget) : resolveExecutionPath(rawTarget, executionScope);
       const classified = semantic.forcedType
         ? { type: semantic.forcedType, confidence: semantic.confidence ?? "medium", reason: semantic.reason ?? "tool semantics" }
-        : classifyTarget(rawTarget, session, semantic.shell?.operation);
+        : classifyTarget(target ?? canonicalTarget(rawTarget), executionScope, semantic.shell?.operation);
       const policy = DREAM_CHANGE_POLICY[classified.type];
       const refs = toDreamRefs(session.sessionId, action.tool.evidence, `${taskId}:change:${action.actionIndex}:${targetIndex}`);
       changes.push({
         changeId: `${taskId}:change:${action.actionIndex}:${targetIndex + 1}`,
         actionIndex: action.actionIndex,
         changeType: classified.type,
-        target: canonicalTarget(rawTarget),
+        target: target ?? canonicalTarget(rawTarget),
+        executionScope,
         stateChanging: outcome === "passed",
         verificationRequired: policy.verificationRequired,
         acceptableVerificationTypes: [...policy.acceptableVerificationTypes],
@@ -552,42 +543,43 @@ function classifyChanges(session: NormalizedSession, taskId: string, actions: Or
   return changes;
 }
 
-function commandRepoTarget(tool: NormalizedToolCall, session: NormalizedSession): string | undefined {
-  const root = canonicalTarget(session.repoRoot);
+function resolveExecutionPath(value: unknown, base?: string): string | undefined {
+  if (value === undefined) return base;
+  if (typeof value !== "string") return undefined;
+  const target = canonicalTarget(value);
+  if (!target || /^[$%~]/.test(target)) return undefined;
+  if (path.posix.isAbsolute(target) || path.win32.isAbsolute(target)) return path.posix.normalize(target);
+  return base ? path.posix.normalize(`${base}/${target}`) : undefined;
+}
+
+function executionDirectory(tool: NormalizedToolCall): string | undefined {
   const record = argumentRecord(tool);
   const nested = record?.arguments as Record<string, unknown> | undefined;
-  const workdir = record?.workdir ?? nested?.workdir;
-  const resolve = (value: unknown, base?: string): string | undefined => {
-    if (typeof value !== "string") return base;
-    const target = canonicalTarget(value);
-    if (!target || /^[$%~]/.test(target)) return undefined;
-    if (path.posix.isAbsolute(target) || path.win32.isAbsolute(target)) return path.posix.normalize(target);
-    return base ? path.posix.normalize(`${base}/${target}`) : undefined;
-  };
-  let context = resolve(workdir, root);
-  let command = (toolCommand(tool) ?? "").trim();
+  let context = resolveExecutionPath(record?.workdir ?? nested?.workdir, resolveExecutionPath(tool.executionCwd));
+  let command = (toolCommand(tool) ?? "").trim().replace(/^rtk\s+(?:proxy\s+)?/i, "");
   const prefix = /^(?:cd|set-location)\s+(?:"([^"]+)"|'([^']+)'|([^\s;|&]+))\s*(?:&&|;)\s*/i;
   let match: RegExpExecArray | null;
   while ((match = prefix.exec(command))) {
-    context = resolve(match[1] ?? match[2] ?? match[3], context);
-    command = command.slice(match[0].length);
+    context = resolveExecutionPath(match[1] ?? match[2] ?? match[3], context);
+    command = command.slice(match[0].length).replace(/^rtk\s+(?:proxy\s+)?/i, "");
   }
   if (/(?:^|[;&]\s*)(?:cd|set-location)\s/i.test(command)) return undefined;
   match = /^git\s+-C\s+(?:"([^"]+)"|'([^']+)'|([^\s;|&]+))/i.exec(command);
-  if (match) context = resolve(match[1] ?? match[2] ?? match[3], context);
-  if (!context) return undefined;
-  return root && (context === root || context.startsWith(`${root}/`)) ? repoTarget(session) : `repo:${context}`;
+  if (match) context = resolveExecutionPath(match[1] ?? match[2] ?? match[3], context);
+  return context;
 }
 
-function verificationType(action: OrderedAction, session: NormalizedSession): { type: DreamVerificationType; target?: string } | undefined {
+function verificationType(action: OrderedAction): { type: DreamVerificationType; target?: string } | undefined {
   const { tool } = action;
   const name = baseToolName(tool.name);
   const command = toolCommand(tool);
   const normalized = command?.replace(/\\/g, "/").toLowerCase() ?? "";
   const directTargets = pathValues(argumentRecord(tool));
+  const directory = executionDirectory(tool);
+  const repositoryTarget = directory ? `repo:${directory}` : undefined;
 
   if (/\bgit\b[^\r\n;|]*\b(?:diff|status)\b/.test(normalized) || /\bdiff\s+--check\b/.test(normalized)) {
-    return { type: "diff_check", target: commandRepoTarget(tool, session) };
+    return { type: "diff_check", target: repositoryTarget };
   }
 
   // PowerShell's Test-Path is an observation, not a repository test suite.
@@ -604,18 +596,18 @@ function verificationType(action: OrderedAction, session: NormalizedSession): { 
     return { type: "read_back", target: canonical };
   }
 
-  if (/\b(?:typecheck|type-check|tsc|mypy)\b/.test(normalized)) return { type: "typecheck", target: commandRepoTarget(tool, session) };
+  if (/\b(?:typecheck|type-check|tsc|mypy)\b/.test(normalized)) return { type: "typecheck", target: repositoryTarget };
   if (/\b(?:test|vitest|pytest|jest|cargo\s+test|go\s+test|dotnet\s+test|gut)\b/.test(normalized)) {
-    return { type: "test", target: commandRepoTarget(tool, session) };
+    return { type: "test", target: repositoryTarget };
   }
-  if (/\b(?:lint|eslint|ruff|cspell)\b/.test(normalized)) return { type: "lint", target: commandRepoTarget(tool, session) };
+  if (/\b(?:lint|eslint|ruff|cspell)\b/.test(normalized)) return { type: "lint", target: repositoryTarget };
   if (
     /\b(?:pandoc|mkdocs|sphinx-build|render_docx|export_whitepaper|build[_:-]?(?:docs?|document|whitepaper)|docs?:build)\b/.test(normalized) ||
     (/\b(?:build|render|export)\b/.test(normalized) && /\b(?:docs?|document|docx|pdf|markdown|whitepaper)\b/.test(normalized))
   ) {
-    return { type: "document_build", target: commandRepoTarget(tool, session) };
+    return { type: "document_build", target: repositoryTarget };
   }
-  if (/\b(?:build|validate|check)\b/.test(normalized)) return { type: "build", target: commandRepoTarget(tool, session) };
+  if (/\b(?:build|validate|check)\b/.test(normalized)) return { type: "build", target: repositoryTarget };
 
   if (isViewTool(tool)) {
     const target = canonicalTarget(directTargets[0]);
@@ -647,8 +639,8 @@ function repoChange(change: DreamChangeClassification): boolean {
   return ["product_code", "tests", "documentation", "repository_metadata"].includes(change.changeType) && Boolean(change.target);
 }
 
-function targetsMatch(change: DreamChangeClassification, check: VerificationCheck, session: NormalizedSession): boolean {
-  if (repoChange(change)) return repositoryVerificationMatches(change, check, session.repoRoot);
+function targetsMatch(change: DreamChangeClassification, check: VerificationCheck): boolean {
+  if (repoChange(change)) return repositoryVerificationMatches(change, check);
   if (!change.target || !check.target) return false;
   if (change.target === check.target) return true;
   if (change.changeType === "local_file_organization") {
@@ -666,7 +658,7 @@ function classifyVerificationChecks(
   const checks: VerificationCheck[] = [];
   for (const action of actions) {
     if (mutationKind(action).mutation) continue;
-    const semantic = verificationType(action, session);
+    const semantic = verificationType(action);
     if (!semantic) continue;
     const refs = toDreamRefs(session.sessionId, action.tool.evidence, `${taskId}:verification:${action.actionIndex}`);
     checks.push({
@@ -691,7 +683,7 @@ function classifyVerificationChecks(
         change.stateChanging &&
         change.verificationRequired === true &&
         Boolean(check.verificationType && change.acceptableVerificationTypes.includes(check.verificationType)) &&
-        targetsMatch(change, check, session)
+        targetsMatch(change, check)
     );
     const lastChange = relevant.reduce((latest, change) => Math.max(latest, change.actionIndex), -1);
     check.fresh = lastChange >= 0 && (check.actionIndex ?? -1) > lastChange;

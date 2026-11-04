@@ -88,6 +88,7 @@ function dreamCapture(root: string | undefined, command: string, workdir?: strin
   });
   add("response_item", { type: "function_call_output", call_id: "wrapper", turn_id: "one", output: JSON.stringify({ exit_code: exitCode, output: stdout }) });
   const session = normalizeEventsToSession(events, "codex", "fictional.jsonl");
+  session.repoRoot = root;
   session.repoMatch = "matched";
   session.lifecycleStatus = "completed";
   return session;
@@ -116,12 +117,12 @@ describe("Dream authoritative outcomes and repository scope", () => {
     ] as const) {
       const task = analyzeDreamTasks(dreamCapture(root, cmd, workdir))[0];
       expect(task.verificationChecks[0].fresh, `${root}: ${cmd} in ${workdir}`).toBe(matches);
-      if (matches) expect(task.verificationChecks[0].target).toBe("repo:/repo/a");
+      if (matches) expect(task.verificationChecks[0].target).toBe(workdir === "packages/ui" ? "repo:/repo/a/packages/ui" : "repo:/repo/a");
     }
   });
 
-  it("uses git -C when scoping diff verification", () => {
-    const task = analyzeDreamTasks(dreamCapture("/repo/a", "git -C /repo/b diff --check"))[0];
+  it.each(["", "rtk ", "rtk proxy "])("uses %sgit -C when scoping diff verification", prefix => {
+    const task = analyzeDreamTasks(dreamCapture("/repo/a", `${prefix}git -C /repo/b diff --check`))[0];
     expect(task.verificationChecks[0]).toMatchObject({ target: "repo:/repo/b", fresh: false });
   });
 
@@ -143,4 +144,108 @@ describe("Dream authoritative outcomes and repository scope", () => {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+});
+
+
+describe("Dream native execution location", () => {
+  it.each(["/linked/worktree/a", "/home/user/.codex/worktrees/deleted/a"])("keeps matching checks in %s after repository grouping", cwd => {
+    const session = dreamCapture(cwd, "rtk npm test");
+    session.repoRoot = "/repo/a";
+    const task = analyzeDreamTasks(session)[0];
+    expect(session.turns.flatMap(turn => turn.toolCalls)[0].executionCwd).toBe(cwd);
+    expect(task.changes[0]).toMatchObject({ target: `${cwd}/map.ts`, executionScope: cwd, changeType: "product_code", stateChanging: true });
+    expect(task.verificationChecks[0]).toMatchObject({ target: `repo:${cwd}`, fresh: true, status: "passed" });
+  });
+
+  it("does not infer execution location from a grouped root", () => {
+    const session = dreamCapture(undefined, "npm test");
+    session.repoRoot = "/repo/a";
+    const task = analyzeDreamTasks(session)[0];
+    expect(task.changes[0].executionScope).toBeUndefined();
+    expect(task.verificationChecks[0].target).toBeUndefined();
+    expect(task.verificationChecks[0].fresh).toBe(false);
+  });
+
+  it("does not credit the main checkout for worktree edits", () => {
+    const session = dreamCapture("/home/user/.codex/worktrees/deleted/a", "rtk proxy git -C /repo/a diff --check");
+    session.repoRoot = "/repo/a";
+    expect(analyzeDreamTasks(session)[0].verificationChecks[0].fresh).toBe(false);
+  });
+
+  it.each(["/linked/worktree/a", "/home/user/.codex/worktrees/deleted/a"])("validates frozen matching worktree evidence in %s", cwd => {
+    const root = fs.mkdtempSync(path.resolve("tests/.dream-native-"));
+    try {
+      const session = dreamCapture(cwd, "rtk proxy npm test");
+      session.repoRoot = "/repo/a";
+      writeJsonl(path.join(root, "sessions.jsonl"), [session]);
+      writeJsonl(path.join(root, "inefficiency-scores.jsonl"), [scoreSession(session)]);
+      const packet = prepareDreamPacket(root, 1);
+      expect(packet.selectedSessions).toHaveLength(1);
+      expect(validateDreamPacket(packet).scores.find(score => score.category === "Verification quality")?.score).toBe(5);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+
+function nativeEvents(records: Array<[string, unknown]>): RawLogEvent[] {
+  return records.map(([type, data], index) => ({
+    id: `native-${index}`, type, data, sourceFile: "native.jsonl", lineNumber: index + 1,
+    timestamp: new Date(Date.UTC(2026, 0, 1, 10, 0, index)).toISOString()
+  }));
+}
+
+describe("native cwd provenance", () => {
+  it.each(["/linked/a", "/repo/b"])("uses each Codex action context, including %s", checkCwd => {
+    const session = normalizeEventsToSession(nativeEvents([
+      ["session_meta", { id: "native-worker", cwd: "/repo/main" }],
+      ["turn_context", { turn_id: "one", cwd: "/linked/a" }],
+      ["response_item", { type: "message", role: "user", content: [{ type: "input_text", text: "Fix map.ts" }] }],
+      ["response_item", { type: "function_call", call_id: "edit", name: "apply_patch", arguments: JSON.stringify("*** Begin Patch\n*** Update File: map.ts\n@@\n-old\n+new\n*** End Patch") }],
+      ["response_item", { type: "function_call_output", call_id: "edit", output: "Success" }],
+      ["turn_context", { turn_id: "one", cwd: checkCwd }],
+      ["response_item", { type: "function_call", call_id: "check", name: "exec_command", arguments: JSON.stringify({ cmd: "npm test" }) }],
+      ["response_item", { type: "function_call_output", call_id: "check", output: { exit_code: 0, output: "Exit code: 1" } }]
+    ]), "codex", "native.jsonl");
+    session.repoRoot = "/repo/main";
+    const tools = session.turns.flatMap(turn => turn.toolCalls);
+    expect(tools.map(tool => tool.executionCwd)).toEqual(["/linked/a", checkCwd]);
+    const task = analyzeDreamTasks(session)[0];
+    expect(task.changes[0]).toMatchObject({ target: "/linked/a/map.ts", executionScope: "/linked/a", stateChanging: true });
+    expect(task.verificationChecks[0]).toMatchObject({ target: `repo:${checkCwd}`, status: "passed", fresh: checkCwd === "/linked/a" });
+  });
+
+  it.each(["session", "start", "hook"])("retains Copilot %s cwd on tool completion", contextSource => {
+    const events: Array<[string, unknown]> = [];
+    if (contextSource === "session") events.push(["session.start", { context: { cwd: "/linked/a" } }]);
+    events.push(["assistant.message", { turnId: "one", toolRequests: [{ toolCallId: "check", name: "shell_command", arguments: { command: "npm test" } }] }]);
+    events.push(["tool.execution_start", { turnId: "one", toolCallId: "check", toolName: "shell_command", arguments: { command: "npm test" }, ...(contextSource === "start" ? { cwd: "/linked/a" } : {}) }]);
+    if (contextSource === "hook") events.push(["hook.start", { turnId: "one", hookInvocationId: "hook", input: { cwd: "/linked/a", toolCalls: [{ id: "check", name: "shell_command", args: JSON.stringify({ command: "npm test" }) }] } }]);
+    events.push(["tool.execution_complete", { turnId: "one", toolCallId: "check", success: true, output: "passed" }]);
+    const session = normalizeEventsToSession(nativeEvents(events), "copilot", "native.jsonl");
+    const tool = session.turns.flatMap(turn => turn.toolCalls)[0];
+    expect(tool.executionCwd).toBe("/linked/a");
+    expect(analyzeDreamTasks(session)[0].verificationChecks[0]).toMatchObject({ target: "repo:/linked/a", status: "passed" });
+  });
+
+  it("retains Claude tool-use cwd after grouping", () => {
+    const { session } = parseSessionFile(path.resolve("tests/fixtures/claude-streaming.jsonl"), "claude");
+    session.repoRoot = "/repo/main";
+    expect(session.turns.flatMap(turn => turn.toolCalls).every(tool => tool.executionCwd === "/fictional/worktrees/nebula")).toBe(true);
+    expect(analyzeDreamTasks(session)[0].verificationChecks[0]).toMatchObject({ target: "repo:/fictional/worktrees/nebula", fresh: true, status: "passed" });
+  });
+});
+
+
+it("does not let one execution scope satisfy a sibling scope during frozen validation", () => {
+  const root = fs.mkdtempSync(path.resolve("tests/.dream-siblings-"));
+  try {
+    const session = dreamCapture("/repo/a", "npm test");
+    writeJsonl(path.join(root, "sessions.jsonl"), [session]);
+    writeJsonl(path.join(root, "inefficiency-scores.jsonl"), [scoreSession(session)]);
+    const packet = prepareDreamPacket(root, 1);
+    const task = packet.selectedSessions[0].tasks![0];
+    const sibling = analyzeDreamTasks(dreamCapture("/repo/b", "npm test"))[0];
+    task.changes.push({ ...sibling.changes[0], changeId: "sibling-change", actionIndex: 2 });
+    expect(validateDreamPacket(packet).scores.find(score => score.category === "Verification quality")?.score).toBe(3);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
