@@ -131,7 +131,7 @@ LunaObs does not copy raw `encryptedContent` or `reasoningOpaque` into reports. 
 
 LunaObs is still a small v0 evidence analyzer, not a task benchmark or semantic judge.
 
-- Outcome scores combine observable lifecycle, edits, final-answer presence, and verification closure. They are prioritization signals, not proof of task completion or code quality.
+- Outcome scores are prioritization signals, not proof of task completion or code quality. See [session scoring limits](docs/session-correlation.md#per-worker-report-cards) for evidence requirements, unscored sessions and cache migration.
 - Per-task metrics use observed task-start events or normalized turns. They do not account for task difficulty, so comparisons across unrelated tasks and repositories remain directional.
 - Verification recognition is deliberately conservative and command-based. Compound orchestration calls are expanded when their nested tools are visible, but a single compound result may still lack per-operation status detail. LunaObs cannot determine whether a test suite is adequate, whether a manual check happened, or whether an external system accepted the result.
 - Redundancy detection recognizes exact canonical tool calls within an unchanged edit state. It can miss semantically equivalent calls, and an intentional fresh read may still need human interpretation.

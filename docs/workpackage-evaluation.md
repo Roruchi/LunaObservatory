@@ -6,8 +6,9 @@ across unrelated roles, task classes or difficulty levels. All examples and fixt
 here are fully synthetic. No real sessions were evaluated and no data collection
 was added.
 
-This module is independent of Scan and Dream. Existing `outcomeScore` remains a
-trace heuristic; existing `inefficiencyScore` still has **0 = best, 100 = worst**.
+This module is independent of Scan and Dream. Scan score availability follows the
+[session scoring limits](session-correlation.md#per-worker-report-cards); numeric
+`inefficiencyScore` values still have **0 = best, 100 = worst**.
 The new `workpackageEvaluation/1` record has its own dimensions with 100 = best.
 The module performs no I/O, network requests, model calls, randomness or clock reads.
 
