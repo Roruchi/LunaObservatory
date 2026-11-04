@@ -8,6 +8,7 @@ import {
   commandResults,
   executionDirectory,
   executionScope,
+  editExecutionScope,
   expandToolCalls,
   toolCommand,
   canonicalToolSignature,
@@ -44,7 +45,7 @@ describe("tool semantics", () => {
 
   it("expands current Codex orchestration into ordered edit and command operations", () => {
     const script =
-      'const patch = "*** Begin Patch\\n*** Update File: src/x.ts\\n-old\\n+new\\n*** End Patch"; await tools.apply_patch(patch); text(await tools.shell_command({command:"npm run test:unit",workdir:"C:\\\\Repo\\\\A"}));';
+      'await tools.apply_patch("*** Begin Patch\\n*** Update File: src/x.ts\\n*** End Patch"); text(await tools.shell_command({command:"npm run test:unit",workdir:"C:\\\\Repo\\\\A"}));';
     const outer = { ...recorded(tool("exec", "completed", script, "outer"), "Exit code: 0"), executionCwd: "C:/Repo/A", executionRoot: "C:/Repo/A" };
     const operations = expandToolCalls([outer]);
     expect(operations.map((operation) => operation.name)).toEqual(["apply_patch", "shell_command"]);
@@ -54,7 +55,7 @@ describe("tool semantics", () => {
   });
 
   it("requires every final post-edit verification lane to finish", () => {
-    const edit = { ...tool("apply_patch", "completed", "*** Begin Patch\n*** End Patch", "edit"), executionCwd: "C:/Repo/A", executionRoot: "C:/Repo/A" };
+    const edit = { ...tool("apply_patch", "completed", "*** Begin Patch\n*** Update File: map.ts\n*** End Patch", "edit"), executionCwd: "C:/Repo/A", executionRoot: "C:/Repo/A" };
     const test = tool("shell_command", "completed", { command: "npm test", workdir: "C:\\Repo\\A" }, "test");
     const requestedBuild = tool("shell_command", "requested", { command: "npm run build", workdir: "C:\\Repo\\A" }, "build");
     expect(verificationClosureForTools([edit, test, requestedBuild])).toBe("missing");
@@ -64,8 +65,8 @@ describe("tool semantics", () => {
 
   it("resets same-command failure episodes only after a successful state change", () => {
     const failure = (id: string) => tool("shell_command", "failed", { command: "npm test", workdir: "C:\\Repo\\A" }, id);
-    const failedEdit = tool("apply_patch", "failed", "patch", "failed-edit");
-    const completedEdit = { ...tool("apply_patch", "completed", "patch", "completed-edit"), executionCwd: "C:/Repo/A", executionRoot: "C:/Repo/A" };
+    const failedEdit = tool("apply_patch", "failed", "*** Begin Patch\n*** Update File: map.ts\n*** End Patch", "failed-edit");
+    const completedEdit = { ...tool("apply_patch", "completed", "*** Begin Patch\n*** Update File: map.ts\n*** End Patch", "completed-edit"), executionCwd: "C:/Repo/A", executionRoot: "C:/Repo/A" };
     expect(repeatedFailureStats([failure("1"), failure("2"), failedEdit, failure("3")]).repeated).toBe(2);
     expect(repeatedFailureStats([failure("1"), failure("2"), completedEdit, failure("3")]).repeated).toBe(1);
   });
@@ -74,7 +75,7 @@ describe("tool semantics", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "lunaobs-exec-"));
     const fixture = path.join(root, "exec.jsonl");
     const script =
-      'const patch = "*** Begin Patch\\n*** Update File: src/x.ts\\n-old\\n+new\\n*** End Patch"; await tools.apply_patch(patch); text(await tools.shell_command({command:"npm test",workdir:"C:\\\\Repo\\\\A"}));';
+      'await tools.apply_patch("*** Begin Patch\\n*** Update File: src/x.ts\\n*** End Patch"); text(await tools.shell_command({command:"npm test",workdir:"C:\\\\Repo\\\\A"}));';
     const events = [
       { timestamp: "2026-07-14T11:00:00.000Z", type: "session_meta", payload: { id: "exec-session", cwd: "C:/Repo/A" } },
       { timestamp: "2026-07-14T11:00:00.100Z", type: "turn_context", payload: { turn_id: "turn" } },
@@ -94,7 +95,7 @@ describe("tool semantics", () => {
 
   it("does not assign one compound-wrapper failure to every nested command", () => {
     const script =
-      'await tools.apply_patch("*** Begin Patch\\n*** End Patch"); await tools.shell_command({command:"npm test",workdir:"C:\\\\Repo\\\\A"}); await tools.shell_command({command:"npm run build",workdir:"C:\\\\Repo\\\\A"});';
+      'await tools.apply_patch("*** Begin Patch\\n*** Update File: map.ts\\n*** End Patch"); await tools.shell_command({command:"npm test",workdir:"C:\\\\Repo\\\\A"}); await tools.shell_command({command:"npm run build",workdir:"C:\\\\Repo\\\\A"});';
     const outer = {
       ...tool("exec", "completed", script, "compound"),
       outputText: "Script completed\nExit code: 1\nOne nested command failed"
@@ -155,7 +156,7 @@ describe("native command argument regressions", () => {
     try {
       const fixture = path.join(root, "events.jsonl");
       const calls = [
-        { name: "apply_patch", args: "*** Begin Patch\n*** End Patch" },
+        { name: "apply_patch", args: "*** Begin Patch\n*** Update File: map.ts\n*** End Patch" },
         { name: source === "claude" ? "Bash" : source === "copilot" ? "run_in_terminal" : "exec_command", args: { cmd: "npm test", workdir: "/fictional/repo" } },
         { name: "exec", args: 'const results = await Promise.allSettled([tools.exec_command({cmd:"npm run build",workdir:"/fictional/repo"}), tools.exec_command({cmd:"npm run lint",workdir:"/fictional/repo"})]); for (const result of results) text(result);' }
       ];
@@ -197,7 +198,7 @@ describe("native command argument regressions", () => {
   });
 
   it("does not promote partial or multi-command failed results into passing verification", () => {
-    const edit = tool("apply_patch", "completed", "patch");
+    const edit = tool("apply_patch", "completed", "*** Begin Patch\n*** Update File: map.ts\n*** End Patch");
     const script = 'await tools.exec_command({cmd:"npm test"}); await tools.exec_command({cmd:"npm run build"});';
     for (const outputText of ['{"exit_code":null,"session_id":123}', '{"exit_code":0}', '{"session_id":123}', 'Script running with cell ID 123', '{"exit_code":1,"output":"failed"}']) {
       const outer = { ...tool("exec", "completed", script), outputText };
@@ -210,7 +211,7 @@ describe("native command argument regressions", () => {
 
 describe("command completion evidence", () => {
   it("requires output evidence even for one nested command", () => {
-    const edit = tool("apply_patch", "completed", "patch");
+    const edit = tool("apply_patch", "completed", "*** Begin Patch\n*** Update File: map.ts\n*** End Patch");
     const wrapper = tool("exec", "completed", 'text(await tools.exec_command({cmd:"npm test"}));');
     expect(verificationClosureForTools([edit, wrapper])).toBe("missing");
     expect(verificationClosureForTools([edit, recorded(wrapper, "Exit code: 0")])).toBe("passed");
@@ -218,7 +219,7 @@ describe("command completion evidence", () => {
   });
 
   it("keeps output-only envelopes unresolved instead of reading stdout as metadata", () => {
-    const edit = tool("apply_patch", "completed", "patch");
+    const edit = tool("apply_patch", "completed", "*** Begin Patch\n*** Update File: map.ts\n*** End Patch");
     const wrapper = tool("exec", "completed", 'text(await tools.exec_command({cmd:"npm test"}));');
     for (const output of ['{"exit_code":0}', '{"exit_code":1}', 'Exit code: 0']) {
       expect(verificationClosureForTools([edit, recorded(wrapper, JSON.stringify({ output }))])).toBe("missing");
@@ -226,7 +227,7 @@ describe("command completion evidence", () => {
   });
 
   it("does not count stdout as additional nested command results", () => {
-    const edit = tool("apply_patch", "completed", "patch");
+    const edit = tool("apply_patch", "completed", "*** Begin Patch\n*** Update File: map.ts\n*** End Patch");
     const wrapper = tool("exec", "completed", 'text(await tools.exec_command({cmd:"npm test"})); text(await tools.exec_command({cmd:"npm run build"}));');
     for (const outputText of [
       JSON.stringify({ exit_code: 0, output: '{"exit_code":0}' }),
@@ -263,7 +264,7 @@ describe("command completion evidence", () => {
             const observed = !nested && source === "copilot" && (output !== result || typeof result === "string") ? "passed" : expected;
             const events: unknown[] = [source === "codex" ? { type: "session_meta", payload: { cwd: "/repo/a" } } : { type: "session.start", data: { context: { cwd: "/repo/a" } } }];
             for (const [id, name, args, response] of [
-              ["edit", "apply_patch", "patch", "Done"],
+              ["edit", "apply_patch", "*** Begin Patch\n*** Update File: map.ts\n*** End Patch", "Done"],
               ["check", nested ? "exec" : "exec_command", nested ? 'text(await tools.exec_command({cmd:"npm test"}));' : { cmd: "npm test" }, output]
             ] as const) {
               if (source === "codex") events.push(
@@ -304,7 +305,7 @@ describe("resolved execution identity", () => {
   });
 
   it("uses resolved native cwd for closure, recovery, failure episodes, and duplicates", () => {
-    const edit = tool("apply_patch", "completed", "patch", "edit");
+    const edit = tool("apply_patch", "completed", "*** Begin Patch\n*** Update File: map.ts\n*** End Patch", "edit");
     const failure = command("failed-root", "/repo/a", "failed");
     const childPass = command("passed-child", "/repo/a/packages/ui");
     const rootPass = command("passed-root", "/repo/a");
@@ -401,8 +402,22 @@ describe("wrapped command context", () => {
 it("resets failure episodes only after edits in the same known scope", () => {
   const failed = tool("exec_command", "failed", { cmd: "npm test" }, "failure-a");
   const retry = { ...failed, toolCallId: "retry-a" };
-  const edit = tool("apply_patch", "completed", "patch", "edit-a");
+  const edit = tool("apply_patch", "completed", "*** Begin Patch\n*** Update File: map.ts\n*** End Patch", "edit-a");
   expect(repeatedFailureStats([failed, edit, retry]).repeated).toBe(0);
   expect(repeatedFailureStats([failed, { ...edit, executionCwd: "/repo/b" }, retry]).repeated).toBe(1);
   expect(repeatedFailureStats([failed, { ...edit, executionCwd: undefined }, retry]).repeated).toBe(1);
+});
+
+
+it("does not reset a failure episode for foreign or unresolved edit targets", () => {
+  const failure = tool("exec_command", "failed", { cmd: "npm test" }, "failed");
+  const retry = { ...failure, toolCallId: "retry" };
+  for (const args of [{ path: "/repo/b/map.ts" }, { paths: ["map.ts", "/repo/b/map.ts"] }, { path: null }, {}]) {
+    const edit = tool("write_file", "completed", args, "foreign-edit");
+    expect(editExecutionScope(edit)).toBeUndefined();
+    expect(repeatedFailureStats([failure, edit, retry]).repeated).toBe(1);
+  }
+  const edit = tool("write_file", "completed", { paths: ["map.ts", "src/other.ts"] });
+  expect(editExecutionScope(edit)).toBe("/repo/a");
+  expect(repeatedFailureStats([failure, edit, retry]).repeated).toBe(0);
 });

@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { normalizeEventsToSession } from "../src/normalize/sessions.js";
+import { expandToolCalls, executionDirectory, verificationLaneKey, looksLikeVerificationTool } from "../src/normalize/toolSemantics.js";
 import { scoreSession } from "../src/scoring/score.js";
 import type { RawLogEvent } from "../src/normalize/types.js";
 
 type Call = { name: string; args: unknown; output: unknown; turn?: string; cwd?: string };
-const edit: Call = { name: "apply_patch", args: "patch", output: "Done" };
+const edit: Call = { name: "apply_patch", args: "*** Begin Patch\n*** Update File: map.ts\n*** End Patch", output: "Done" };
 const envelope = (exit_code: number | null, session_id?: number, output = "") => ({ exit_code, session_id, output });
 const wrapped = (script: string, results: unknown[]): Call => ({ name: "exec", args: script, output: JSON.stringify(results) });
 
@@ -85,7 +86,7 @@ describe("Codex wrapper failure headers", () => {
     [{ type: "text", text: header }],
     [{ type: "input_text", text: "" }, { type: "input_text", text: header }]
   ];
-  const patch = 'await tools.apply_patch("*** Begin Patch\\n*** End Patch");';
+  const patch = 'await tools.apply_patch("*** Begin Patch\\n*** Update File: map.ts\\n*** End Patch");';
 
   it.each(["Script failed: patch rejected", "Script timed out", "Script terminated", "Tool call failed"])("retains %s in string and native content-block shapes", header => {
     for (const output of shapes(header)) {
@@ -283,4 +284,71 @@ describe("scoped session verification", () => {
       expect(scoreSession(session).outcomeScore).toBe(matching ? exit === 0 ? 90 : 30 : 50);
     }
   });
+});
+
+
+describe("unresolved context and changed-target evidence", () => {
+  it.each(["codex", "copilot"] as const)("keeps present dynamic nested workdirs unknown for %s", source => {
+    for (const expression of ["wd", '"/repo/" + suffix', "`/repo/${suffix}`", "null", "42"]) {
+      const session = capture([edit, wrapped(`const wd = "/repo/b"; const suffix = "b"; text(await tools.exec_command({cmd:"npm test",workdir:${expression}}));`, [envelope(0)])], source);
+      session.lifecycleStatus = "completed";
+      const command = expandToolCalls(session.turns.flatMap(turn => turn.toolCalls)).find(tool => tool.name === "exec_command")!;
+      expect(executionDirectory(command)).toBeUndefined();
+      expect(session.metrics.verificationClosure).toBe("missing");
+      expect(scoreSession(session).outcomeScore).toBe(50);
+    }
+    const omitted = capture([edit, wrapped('text(await tools.exec_command({cmd:"npm test"}));', [envelope(0)])], source);
+    expect(omitted.metrics.verificationClosure).toBe("passed");
+  });
+
+  it.each(["codex", "copilot"] as const)("does not verify foreign, mixed, or unknown %s edit targets", source => {
+    for (const [name, args] of [
+      ["write_file", { path: "/repo/b/map.ts" }],
+      ["edit_file", { paths: ["map.ts", "/repo/b/other.ts"] }],
+      ["Write", { file_path: "/repo/b/map.ts" }],
+      ["Edit", { file_path: "/repo/b/map.ts" }],
+      ["edit", { edits: [{ path: "map.ts" }, { path: null }] }],
+      ["write_file", { path: "$FILE" }],
+      ["write_file", { uri: "file:///repo/b/map.ts" }],
+      ["write_file", {}],
+      ["apply_patch", "*** Begin Patch\n*** Update File: map.ts\n*** Update File: /repo/b/other.ts\n*** End Patch"],
+      ["apply_patch", "*** Begin Patch\n*** Update File: map.ts\n*** Move to: /repo/b/map.ts\n*** End Patch"],
+      ["apply_patch", "unstructured edit"]
+    ] as const) {
+      const session = capture([{ name, args, output: "Done" }, { name: "exec_command", args: { cmd: "npm test" }, output: envelope(0) }], source);
+      session.lifecycleStatus = "completed";
+      expect(session.metrics.verificationClosure, JSON.stringify([source, name, args])).toBe("missing");
+      expect(scoreSession(session).outcomeScore).toBe(50);
+    }
+    const genuine = capture([{ name: "write_file", args: { paths: ["map.ts", "/repo/a/other.ts"] }, output: "Done" }, { name: "exec_command", args: { cmd: "npm test" }, output: envelope(0) }], source);
+    expect(genuine.metrics.verificationClosure).toBe("passed");
+  });
+
+  it("does not borrow a sibling patch literal for an unresolved patch call", () => {
+    const session = capture([wrapped('const other = "*** Begin Patch\\n*** Update File: map.ts\\n*** End Patch"; await tools.apply_patch(dynamicPatch); text(await tools.exec_command({cmd:"npm test"}));', [envelope(0)])]);
+    expect(session.metrics.verificationClosure).toBe("missing");
+  });
+
+  it.each(["npm test", "pnpm test", "yarn test", "bun test", "tsc --noEmit"])("recognizes quoted wrapped %s consistently", cmd => {
+    for (const shell of ["bash -lc", "rtk proxy sh -c"]) for (const exit of [0, 1]) {
+      const session = capture([edit, { name: "exec_command", args: { cmd: `${shell} '${cmd}'` }, output: envelope(exit) }]);
+      const command = expandToolCalls(session.turns.flatMap(turn => turn.toolCalls)).find(tool => tool.name === "exec_command")!;
+      expect(looksLikeVerificationTool(command)).toBe(true);
+      expect(verificationLaneKey(command)).toBe(verificationLaneKey({ ...command, arguments: { cmd } }));
+      expect(session.metrics.verificationEvents).toBe(1);
+      expect(session.metrics.verificationPassed).toBe(exit === 0 ? 1 : 0);
+      expect(session.metrics.verificationFailed).toBe(exit === 1 ? 1 : 0);
+      expect(session.metrics.verificationClosure).toBe(exit === 0 ? "passed" : "failed");
+    }
+  });
+});
+
+
+it("preserves unresolved nested edit target expressions", () => {
+  for (const target of ["file", '"map.ts" + suffix', "`map${suffix}.ts`"]) {
+    const session = capture([wrapped(`await tools.write_file({path:${target},content:"changed"}); text(await tools.exec_command({cmd:"npm test"}));`, [envelope(0)])]);
+    expect(session.metrics.verificationClosure).toBe("missing");
+  }
+  const genuine = capture([wrapped('await tools.write_file({path:"map.ts",content:"changed"}); text(await tools.exec_command({cmd:"npm test"}));', [envelope(0)])]);
+  expect(genuine.metrics.verificationClosure).toBe("passed");
 });

@@ -82,7 +82,7 @@ function literalEnd(value: string, start: number): number {
   return value.length;
 }
 
-function embeddedProperty(value: string, property: string): string | undefined {
+function embeddedProperty(value: string, property: string): string | null | undefined {
   const key = new RegExp(`^(?:${property}|"${property}"|'${property}')\\s*:\\s*`, "i");
   let depth = 0;
   for (let index = 0; index < value.length;) {
@@ -95,11 +95,11 @@ function embeddedProperty(value: string, property: string): string | undefined {
           const number = /^\d+(?=\s*[,}])/.exec(value.slice(start));
           if (number) return number[0];
         }
-        if (!'"\'`'.includes(value[start] ?? " ")) return undefined;
+        if (!'"\'`'.includes(value[start] ?? " ")) return null;
         const end = literalEnd(value, start);
         // A literal followed by concatenation or interpolation is not static.
-        if (!/^[,}]/.test(value.slice(end).trimStart())) return undefined;
-        return literalValue(value.slice(start, end));
+        if (!/^[,}]/.test(value.slice(end).trimStart())) return null;
+        return literalValue(value.slice(start, end)) ?? null;
       }
     }
     if ('"\'`'.includes(value[index])) { index = literalEnd(value, index); continue; }
@@ -138,12 +138,12 @@ function scriptCalls(script: string): ScriptCall[] {
 }
 
 function embeddedPatch(value: string): string | undefined {
-  for (const match of value.matchAll(/("(?:\\.|[^"\\])*")/g)) {
-    const decoded = parseQuotedString(match[1]);
-    if (decoded?.includes("*** Begin Patch")) return decoded;
-  }
-  const template = /`([\s\S]*?\*\*\* Begin Patch[\s\S]*?\*\*\* End Patch[\s\S]*?)`/.exec(value);
-  return template?.[1].replace(/\\n/g, "\n").replace(/\\r/g, "\r");
+  const call = /^tools\.[\w]+\s*\(\s*/.exec(value);
+  if (!call || !'"\'`'.includes(value[call[0].length] ?? " ")) return undefined;
+  const end = literalEnd(value, call[0].length);
+  if (value.slice(end).trim() !== ")") return undefined;
+  const patch = literalValue(value.slice(call[0].length, end));
+  return patch?.includes("*** Begin Patch") ? patch : undefined;
 }
 
 export function orchestrationScript(tool: NormalizedToolCall): string | undefined {
@@ -304,7 +304,15 @@ function nestedOperations(tool: NormalizedToolCall): NormalizedToolCall[] {
       const binding = variable ? layout?.bindings.get(variable) : undefined;
       if (binding?.length === 1 && binding[0] < index) pollForToolCallId = `${tool.toolCallId}:nested:${binding[0] + 1}`;
     } else if (isDirectEdit(name)) {
-      args = embeddedPatch(callSource) ?? embeddedPatch(script) ?? callSource;
+      if (baseToolName(name) === "apply_patch") args = embeddedPatch(callSource) ?? callSource;
+      else {
+        const targets: Record<string, string | null> = {};
+        for (const key of ["path", "file_path", "filePath", "file", "filename", "uri", "target", "destination", "output", "paths", "files", "targets"]) {
+          const value = embeddedProperty(callSource, key);
+          if (value !== undefined) targets[key] = value;
+        }
+        args = targets;
+      }
     } else {
       const path = embeddedProperty(callSource, "path") ?? embeddedProperty(callSource, "file") ?? embeddedProperty(callSource, "uri");
       args = path ? { path } : callSource;
@@ -353,17 +361,18 @@ export function toolCommand(tool: NormalizedToolCall): string | undefined {
   if (!isCommandTool(tool)) return undefined;
   const args = tool.arguments;
   if (typeof args === "string") {
-    try { return argumentString(JSON.parse(args), ["command", "cmd"]); } catch { /* Native shell strings are also valid. */ }
+    try { return argumentString(JSON.parse(args), ["command", "cmd"]) ?? undefined; } catch { /* Native shell strings are also valid. */ }
     return embeddedProperty(args, "command") ?? embeddedProperty(args, "cmd") ?? args;
   }
-  return argumentString(args, ["command", "cmd"]);
+  return argumentString(args, ["command", "cmd"]) ?? undefined;
 }
 
-function argumentString(args: unknown, keys: string[]): string | undefined {
+function argumentString(args: unknown, keys: string[]): string | null | undefined {
   const record = commandArgumentRecord(args);
   if (!record) return undefined;
   for (const key of keys) {
-    if (typeof record[key] === "string") return record[key];
+    if (record[key] === undefined) continue;
+    return typeof record[key] === "string" ? record[key] : null;
   }
   if (record.arguments !== args) return argumentString(record.arguments, keys);
   return undefined;
@@ -373,45 +382,85 @@ export function resolveExecutionPath(value: unknown, base?: string): string | un
   if (value === undefined) return base;
   if (typeof value !== "string") return undefined;
   const target = value.trim().replace(/^["']|["']$/g, "").replace(/\\/g, "/").toLowerCase();
-  if (!target || /^[$%~]/.test(target)) return undefined;
+  if (!target || /^[$%~]/.test(target) || /^[a-z][\w+.-]*:\/\//i.test(target)) return undefined;
   if (path.posix.isAbsolute(target) || path.win32.isAbsolute(target)) return path.posix.normalize(target).replace(/\/$/, "");
   return base ? path.posix.normalize(`${base}/${target}`).replace(/\/$/, "") : undefined;
 }
 
-export function executionDirectory(tool: NormalizedToolCall): string | undefined {
+function commandContext(tool: NormalizedToolCall): { command?: string; directory?: string } {
   let context = resolveExecutionPath(argumentString(tool.arguments, ["workdir"]), resolveExecutionPath(tool.executionCwd));
   let command = (toolCommand(tool) ?? "").trim().replace(/^rtk\s+(?:proxy\s+)?/i, "");
   const prefix = /^(?:cd|set-location)\s+(?:"([^"]+)"|'([^']+)'|([^\s;|&]+))\s*(?:&&|;)\s*/i;
   let match: RegExpExecArray | null;
   while (true) {
-    if (/[$`]/.test(command)) return undefined;
     match = /^(?:\/(?:usr\/)?bin\/)?(?:bash|sh)\s+-(?:lc|cl|c)\s+(?:'([^']*)'|"([^"]*)")\s*$/i.exec(command);
     if (match) {
       command = (match[1] ?? match[2]).trim().replace(/^rtk\s+(?:proxy\s+)?/i, "");
       continue;
     }
+    if (/[$`]/.test(command)) return { command };
     match = prefix.exec(command);
     if (!match) break;
     const directory = match[1] ?? match[2] ?? match[3];
-    if (directory === "-" || /[*?{}]/.test(directory)) return undefined;
+    if (directory === "-" || /[*?{}]/.test(directory)) return { command };
     context = resolveExecutionPath(directory, context);
     command = command.slice(match[0].length).replace(/^rtk\s+(?:proxy\s+)?/i, "");
   }
-  if (/(?:^|[\s;&|])(?:\/(?:usr\/)?bin\/)?(?:bash|sh|zsh|pwsh|powershell|cmd)(?:\s|$)/i.test(command)) return undefined;
-  if (/\b(?:cd|set-location|pushd|popd|source|eval)\s/i.test(command)) return undefined;
+  if (/(?:^|[\s;&|])(?:\/(?:usr\/)?bin\/)?(?:bash|sh|zsh|pwsh|powershell|cmd)(?:\s|$)/i.test(command)) return {};
+  if (/\b(?:cd|set-location|pushd|popd|source|eval)\s/i.test(command)) return {};
   match = /^git\s+-C\s+(?:"([^"]+)"|'([^']+)'|([^\s;|&]+))/i.exec(command);
   if (match) {
     const directory = match[1] ?? match[2] ?? match[3];
-    if (/[*?{}]/.test(directory)) return undefined;
+    if (/[*?{}]/.test(directory)) return { command };
     context = resolveExecutionPath(directory, context);
   }
-  return context;
+  return { command, directory: context };
+}
+
+export function executionDirectory(tool: NormalizedToolCall): string | undefined {
+  return commandContext(tool).directory;
+}
+
+export function verificationCommand(tool: NormalizedToolCall): string | undefined {
+  return commandContext(tool).command;
 }
 
 export function executionScope(tool: NormalizedToolCall): string | undefined {
   const directory = executionDirectory(tool);
   const root = resolveExecutionPath(tool.executionRoot);
   return directory && root && (directory === root || directory.startsWith(`${root}/`)) ? root : directory;
+}
+
+export function editTargets(tool: NormalizedToolCall): Array<string | undefined> {
+  const args = tool.arguments;
+  if (baseToolName(tool.name) === "apply_patch" && typeof args === "string") {
+    return [...new Set([...args.matchAll(/^\*\*\* (?:(?:Add|Update|Delete) File|Move to):\s*(.+)$/gm)].map(match => match[1].trim()))];
+  }
+  const targets: Array<string | undefined> = [];
+  const visit = (value: unknown): void => {
+    if (!value || typeof value !== "object") return;
+    if (Array.isArray(value)) { value.forEach(visit); return; }
+    for (const [key, item] of Object.entries(value)) {
+      if (/^(?:path|file|filePath|file_path|filename|uri|target|destination|output)$/i.test(key)) targets.push(typeof item === "string" ? item : undefined);
+      else if (/^(?:paths|files|targets)$/i.test(key)) targets.push(...(Array.isArray(item) ? item.map(target => typeof target === "string" ? target : undefined) : [undefined]));
+      else if (key === "arguments") visit(commandArgumentRecord(item));
+      else visit(item);
+    }
+  };
+  visit(commandArgumentRecord(args));
+  return [...new Set(targets)];
+}
+
+export function editExecutionScope(tool: NormalizedToolCall): string | undefined {
+  const scope = executionScope(tool);
+  const directory = executionDirectory(tool);
+  const targets = editTargets(tool);
+  if (!scope || !targets.length) return undefined;
+  return targets.every(target => {
+    if (!target) return false;
+    const resolved = resolveExecutionPath(target, directory);
+    return resolved && (resolved === scope || resolved.startsWith(`${scope}/`));
+  }) ? scope : undefined;
 }
 
 export function executionScopesMatch(left: string | undefined, right: string | undefined): boolean {
@@ -442,7 +491,7 @@ export function isCommandTool(tool: NormalizedToolCall): boolean {
 
 export function looksLikeVerificationTool(tool: NormalizedToolCall): boolean {
   if (tool.name === "report_intent" || isEditTool(tool)) return false;
-  const command = toolCommand(tool);
+  const command = verificationCommand(tool);
   if (!command) return false;
   const normalized = command.replace(/\\/g, "/").toLowerCase();
   return [
@@ -467,7 +516,7 @@ export function canonicalCommand(command: string): string {
 }
 
 export function verificationLaneKey(tool: NormalizedToolCall): string {
-  const command = canonicalCommand(toolCommand(tool) ?? tool.name);
+  const command = canonicalCommand(verificationCommand(tool) ?? toolCommand(tool) ?? tool.name);
   const workdir = executionDirectory(tool) ?? `unknown-workdir:${tool.toolCallId}`;
   const packageScript = /\b(npm|pnpm|yarn|bun)\s+(?:run\s+)?((?:test|build|lint|check|validate|typecheck)(?:[:_-][\w-]+)*)\b/.exec(command);
   if (packageScript) return `${workdir}|${packageScript[1]}:${packageScript[2]}|${command}`;
@@ -495,7 +544,7 @@ export function verificationClosureForTools(tools: NormalizedToolCall[]): Verifi
   const semanticTools = expandToolCalls(tools);
   const lastEditByScope = new Map<string | undefined, number>();
   semanticTools.forEach((tool, index) => {
-    if (isDirectEdit(tool.name) && tool.status === "completed") lastEditByScope.set(executionScope(tool), index);
+    if (isDirectEdit(tool.name) && tool.status === "completed") lastEditByScope.set(editExecutionScope(tool), index);
   });
   if (!lastEditByScope.size) return "not_applicable";
   const finalStatuses: NormalizedToolCall["status"][] = [];
@@ -519,7 +568,7 @@ export function repeatedFailureStats(tools: NormalizedToolCall[]): { repeated: n
   let failed = 0;
   for (const tool of expandToolCalls(tools)) {
     if (isDirectEdit(tool.name) && tool.status === "completed") {
-      const scope = executionScope(tool);
+      const scope = editExecutionScope(tool);
       for (const [key, failure] of activeFailures) {
         if (executionScopesMatch(scope, failure.scope)) activeFailures.delete(key);
       }

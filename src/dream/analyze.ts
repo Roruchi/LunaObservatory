@@ -1,6 +1,8 @@
 import {
   expandToolCalls,
   executionDirectory,
+  editTargets,
+  verificationCommand,
   executionScope,
   executionScopesMatch,
   resolveExecutionPath,
@@ -127,16 +129,6 @@ const metadataNames = new Set([
 
 function baseToolName(name: string): string {
   return name.toLowerCase().split(/__|[.:/]/).filter(Boolean).at(-1) ?? name.toLowerCase();
-}
-
-function valueText(value: unknown): string {
-  if (typeof value === "string") return value;
-  if (value === undefined) return "";
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
 }
 
 function evidenceId(sessionId: string, suffix: string): string {
@@ -276,11 +268,6 @@ function pathValues(value: unknown, depth = 0): string[] {
     }
   }
   return paths;
-}
-
-function patchTargets(tool: NormalizedToolCall): string[] {
-  const text = valueText(tool.arguments);
-  return [...text.matchAll(/^\*\*\* (?:Add|Update|Delete) File:\s*(.+)$/gm)].map((match) => match[1].trim());
 }
 
 function shellVariables(command: string): Map<string, string> {
@@ -452,7 +439,7 @@ function effectiveOutcome(tool: NormalizedToolCall): EffectiveOutcome {
 
 function mutationKind(action: OrderedAction): {
   mutation: boolean;
-  targets: string[];
+  targets: Array<string | undefined>;
   shell?: ShellMutation;
   forcedType?: DreamChangeType;
   confidence?: DreamConfidence;
@@ -465,7 +452,7 @@ function mutationKind(action: OrderedAction): {
   if (shell) return { mutation: true, targets: shell.targets, shell };
 
   if (isEditTool(tool)) {
-    const targets = [...patchTargets(tool), ...pathValues(argumentRecord(tool))];
+    const targets = editTargets(tool);
     return { mutation: true, targets };
   }
 
@@ -556,7 +543,7 @@ function filesystemTarget(value: string | undefined, directory?: string): string
 function verificationType(action: OrderedAction): { type: DreamVerificationType; target?: string } | undefined {
   const { tool } = action;
   const name = baseToolName(tool.name);
-  const command = toolCommand(tool);
+  const command = verificationCommand(tool);
   const normalized = command?.replace(/\\/g, "/").toLowerCase() ?? "";
   const directTargets = pathValues(argumentRecord(tool));
   const directory = executionDirectory(tool);

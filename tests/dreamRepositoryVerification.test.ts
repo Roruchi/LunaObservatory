@@ -416,3 +416,24 @@ it("uses wrapped execution context consistently in session metrics and frozen Dr
     expect(report.scores.find(score => score.category === "Verification quality")?.score).toBe(matching && exit === 0 ? 5 : 0);
   }
 });
+
+
+it.each(["Edit", "Write"])("checks native Claude %s targets before awarding verification", name => {
+  const root = fs.mkdtempSync(path.resolve("tests/.claude-edit-scope-"));
+  try {
+    for (const target of ["/repo/a/map.ts", "/repo/b/map.ts"]) {
+      const events = [
+        { type: "assistant", uuid: "edit-request", message: { id: "edit-message", content: [{ type: "tool_use", id: "edit", name, input: { file_path: target, content: "changed" } }] } },
+        { type: "user", uuid: "edit-result", message: { content: [{ type: "tool_result", tool_use_id: "edit", content: "Done", is_error: false }] } },
+        { type: "assistant", uuid: "check-request", message: { id: "check-message", content: [{ type: "tool_use", id: "check", name: "Bash", input: { command: "bash -lc 'npm test'" } }] } },
+        { type: "user", uuid: "check-result", toolUseResult: { exitCode: 0 }, message: { content: [{ type: "tool_result", tool_use_id: "check", content: "Tests passed", is_error: false }] } }
+      ].map((event, index) => ({ ...event, sessionId: "claude-scope", cwd: "/repo/a", timestamp: new Date(Date.UTC(2026, 0, 1, 10, 0, index)).toISOString() }));
+      const transcript = path.join(root, "events.jsonl");
+      writeJsonl(transcript, events);
+      const { session } = parseSessionFile(transcript, "claude");
+      session.lifecycleStatus = "completed";
+      expect(session.metrics.verificationClosure).toBe(target.startsWith("/repo/a/") ? "passed" : "missing");
+      expect(scoreSession(session).outcomeScore).toBe(target.startsWith("/repo/a/") ? 90 : 50);
+    }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
