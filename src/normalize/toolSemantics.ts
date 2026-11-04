@@ -326,17 +326,18 @@ function nestedOperations(tool: NormalizedToolCall): NormalizedToolCall[] {
 export function expandToolCalls(tools: NormalizedToolCall[]): NormalizedToolCall[] {
   const operations = tools.flatMap(nestedOperations);
   const commands = new Map<string, NormalizedToolCall>();
-  const byId = new Map<string, NormalizedToolCall>();
+  const commandByCallId = new Map<string, NormalizedToolCall>();
   for (const tool of operations) {
-    byId.set(tool.toolCallId, tool);
+    if (isDirectCommand(tool.name)) commandByCallId.set(tool.toolCallId, tool);
     const result = tool.commandResults?.at(-1);
     if (isDirectCommand(tool.name) && result?.sessionId) commands.set(result.sessionId, tool);
     if (baseToolName(tool.name) !== "write_stdin" || !result) continue;
     const args = commandArgumentRecord(tool.arguments);
     const sessionId = args?.session_id === undefined ? undefined : String(args.session_id);
-    const target = tool.pollForToolCallId ? byId.get(tool.pollForToolCallId) : sessionId ? commands.get(sessionId) : undefined;
+    const target = tool.pollForToolCallId ? commandByCallId.get(tool.pollForToolCallId) : sessionId ? commands.get(sessionId) : undefined;
     const targetSession = target?.commandResults?.at(-1)?.sessionId;
     if (!target || !targetSession || result.sessionId && result.sessionId !== targetSession) continue;
+    if (result.sessionId) commandByCallId.set(tool.toolCallId, target);
     target.status = result.status;
   }
   return operations;

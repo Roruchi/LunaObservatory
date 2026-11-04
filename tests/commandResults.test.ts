@@ -112,6 +112,60 @@ describe("command polling identity", () => {
     }
   });
 
+  it.each(["codex", "copilot"] as const)("resolves transitive %s poll bindings to the command", source => {
+    const start = 'const r = await tools.exec_command({cmd:"npm test"}); text(r);';
+    const polls = 'const p = await tools.write_stdin({session_id:r.session_id,chars:""}); text(p); const q = await tools.write_stdin({session_id:p.session_id,chars:""}); text(q); const final = await tools.write_stdin({session_id:q.session_id,chars:""}); text(final);';
+    for (const [exit, expected] of [[0, "passed"], [1, "failed"], [null, "missing"]] as const) {
+      const results = [envelope(null, 101), envelope(null, 101), envelope(null, 101), envelope(exit, exit === null ? 101 : undefined)];
+      const staleWithin = capture([wrapped(start + 'await tools.apply_patch("patch");' + polls, results)], source);
+      expect(staleWithin.metrics.verificationClosure).toBe("missing");
+      for (const separate of [false, true]) {
+        const calls = separate ? [
+          wrapped(start, [results[0]]),
+          { ...wrapped(polls.replace('session_id:r.session_id', 'session_id:101'), results.slice(1)), turn: "next" }
+        ] : [wrapped(start + polls, results)];
+        const session = capture([edit, ...calls], source);
+        expect(session.metrics.verificationClosure).toBe(expected);
+        expect(session.metrics.verificationEvents).toBe(1);
+        expect(session.metrics.verificationPassed).toBe(exit === 0 ? 1 : 0);
+        expect(session.metrics.verificationFailed).toBe(exit === 1 ? 1 : 0);
+        expect(scoreSession(session).outcomeScore).toBe(exit === 0 ? 80 : exit === 1 ? 30 : 55);
+        const stale = capture([calls[0], edit, ...calls.slice(1)], source);
+        expect(stale.metrics.verificationClosure).toBe("missing");
+      }
+    }
+  });
+
+  it.each(["codex", "copilot"] as const)("isolates siblings and unmatched %s poll chains", source => {
+    const initial = [edit,
+      wrapped('text(await tools.exec_command({cmd:"npm test"}));', [envelope(null, 101)]),
+      wrapped('text(await tools.exec_command({cmd:"npm run build"}));', [envelope(null, 202)])
+    ];
+    const chain = (id: number, exit: number, resultId?: number): Call => wrapped(
+      `const p = await tools.write_stdin({session_id:${id},chars:""}); text(p); const q = await tools.write_stdin({session_id:p.session_id,chars:""}); text(q);`,
+      [envelope(null, resultId ?? id), envelope(exit)]
+    );
+    const partial = capture([...initial, chain(333, 0), chain(101, 0)], source);
+    expect(partial.metrics.verificationClosure).toBe("missing");
+    expect(partial.metrics.verificationPassed).toBe(1);
+    expect(partial.metrics.verificationFailed).toBe(0);
+    const complete = capture([...initial, chain(101, 0), chain(202, 0)], source);
+    expect(complete.metrics.verificationClosure).toBe("passed");
+    expect(complete.metrics.verificationPassed).toBe(2);
+    const failed = capture([...initial, chain(101, 0), chain(202, 1)], source);
+    expect(failed.metrics.verificationClosure).toBe("failed");
+    expect(failed.metrics.verificationFailed).toBe(1);
+    const conflicting = capture([...initial, chain(101, 0, 202)], source);
+    expect(conflicting.metrics.verificationClosure).toBe("missing");
+    expect(conflicting.metrics.verificationPassed).toBe(0);
+    const missingIdentity = capture([...initial, wrapped(
+      'const p = await tools.write_stdin({session_id:101,chars:""}); text(p); const q = await tools.write_stdin({session_id:p.session_id,chars:""}); text(q);',
+      [envelope(null), envelope(0)]
+    )], source);
+    expect(missingIdentity.metrics.verificationClosure).toBe("missing");
+    expect(missingIdentity.metrics.verificationPassed).toBe(0);
+  });
+
   it("does not promote a pre-edit command to fresh verification when polled later", () => {
     const session = capture([
       { name: "exec_command", args: { cmd: "npm test" }, output: envelope(null, 101) }, edit,
