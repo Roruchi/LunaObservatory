@@ -17,6 +17,7 @@ import type {
   InstructionCheck
 } from "./types.js";
 import type { VerificationClosure } from "../normalize/types.js";
+import { repositoryVerificationMatches } from "./analyze.js";
 import { buildDreamDecisionReport } from "./decisionReport.js";
 
 function packetRef(session: DreamSession, metric: string, summary: string): DreamEvidenceRef {
@@ -230,14 +231,13 @@ function normalizedTarget(target?: string): string | undefined {
   return target?.replace(/\\/g, "/").replace(/["']/g, "").replace(/\/$/, "").toLowerCase();
 }
 
-function targetMatches(change: DreamChangeClassification, check: DreamTaskWindow["verificationChecks"][number]): boolean {
+function targetMatches(change: DreamChangeClassification, check: DreamTaskWindow["verificationChecks"][number], repoRoot?: string): boolean {
+  if (check.target?.startsWith("repo:")) return repositoryVerificationMatches(change, check, repoRoot);
+  if (["product_code", "tests", "documentation", "repository_metadata"].includes(change.changeType) && (!change.target || !check.target)) return false;
   if (!change.target || !check.target) return true;
   const changeTarget = normalizedTarget(change.target);
   const checkTarget = normalizedTarget(check.target);
   if (!changeTarget || !checkTarget) return true;
-  if (checkTarget.startsWith("repo:")) {
-    return ["product_code", "tests", "documentation", "repository_metadata"].includes(change.changeType);
-  }
   return changeTarget === checkTarget || changeTarget.endsWith(checkTarget) || checkTarget.endsWith(changeTarget);
 }
 
@@ -246,7 +246,7 @@ function changeGroupKey(change: DreamChangeClassification): string {
   return `${change.changeType}:${normalizedTarget(change.target) ?? "unknown-target"}`;
 }
 
-function assessTaskVerification(task: DreamTaskWindow): TaskVerificationAssessment[] {
+function assessTaskVerification(task: DreamTaskWindow, repoRoot?: string): TaskVerificationAssessment[] {
   const stateChanges = task.changes.filter((change) => change.stateChanging);
   if (!stateChanges.length) return [{ status: "not_required", changes: task.changes, matchingChecks: [] }];
   const grouped = new Map<string, DreamChangeClassification[]>();
@@ -266,7 +266,7 @@ function assessTaskVerification(task: DreamTaskWindow): TaskVerificationAssessme
     const checks = task.verificationChecks
       .filter((check) => (check.actionIndex ?? Number.MAX_SAFE_INTEGER) > lastChange && check.fresh !== false)
       .filter((check) => accepted.has(check.verificationType ?? legacyVerificationType(check.command)))
-      .filter((check) => changes.some((change) => targetMatches(change, check)))
+      .filter((check) => changes.some((change) => targetMatches(change, check, repoRoot)))
       .sort((left, right) => (left.actionIndex ?? 0) - (right.actionIndex ?? 0));
     if (!checks.length) return { status: "missing", changes, matchingChecks: [] };
     const latestByLane = new Map<string, typeof checks[number]>();
@@ -298,7 +298,7 @@ function verificationFindings(session: DreamSession, findings: DreamFinding[]): 
   let verifiedTask: DreamTaskWindow | undefined;
   let verifiedEvidenceRefs: DreamEvidenceRef[] = [];
   for (const task of taskWindows(session)) {
-    for (const assessment of assessTaskVerification(task)) {
+    for (const assessment of assessTaskVerification(task, session.repoRoot)) {
       const evidenceRefs = assessment.changes.flatMap((change) => change.evidenceRefs);
       const primary = assessment.changes[0];
       if (!primary) continue;
@@ -616,7 +616,7 @@ function scoreGrounding(unsupported: ClaimCheck[], sessions: DreamSession[]): Dr
 }
 
 function scoreVerification(sessions: DreamSession[]): DreamScore {
-  const assessments = sessions.flatMap((session) => taskWindows(session).flatMap(assessTaskVerification));
+  const assessments = sessions.flatMap((session) => taskWindows(session).flatMap(task => assessTaskVerification(task, session.repoRoot)));
   const relevant = assessments.filter((assessment) => assessment.status !== "not_required");
   if (!relevant.length) {
     return {

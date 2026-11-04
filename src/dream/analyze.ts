@@ -1,7 +1,6 @@
 import path from "node:path";
 import {
   expandToolCalls,
-  isCommandTool,
   isEditTool,
   isGlobTool,
   isViewTool,
@@ -384,8 +383,19 @@ function repoName(session: NormalizedSession): string | undefined {
   return normalized?.split("/").at(-1);
 }
 
-function repoTarget(session: NormalizedSession): string {
-  return `repo:${repoName(session) ?? canonicalTarget(session.repoRoot) ?? "unknown"}`;
+function repoTarget(session: Pick<NormalizedSession, "repoRoot">): string | undefined {
+  const root = canonicalTarget(session.repoRoot);
+  return root ? `repo:${root}` : undefined;
+}
+
+export function repositoryVerificationMatches(change: DreamChangeClassification, check: VerificationCheck, repoRoot?: string): boolean {
+  const root = canonicalTarget(repoRoot);
+  const target = canonicalTarget(change.target);
+  if (!root || !target || check.target !== repoTarget({ repoRoot })) return false;
+  if (!["product_code", "tests", "documentation", "repository_metadata"].includes(change.changeType)) return false;
+  return !path.posix.isAbsolute(target) && !path.win32.isAbsolute(target) && !/^[$%~]/.test(target)
+    ? !path.posix.normalize(target).startsWith("../")
+    : target === root || target.startsWith(`${root}/`);
 }
 
 function isRepoPath(target: string, session: NormalizedSession): boolean {
@@ -445,10 +455,7 @@ function classifyTarget(target: string | undefined, session: NormalizedSession, 
 }
 
 function effectiveOutcome(tool: NormalizedToolCall): EffectiveOutcome {
-  const output = tool.outputText ?? "";
   if (tool.status === "failed") return "failed";
-  if (/apply_patch verification failed|failed to find expected lines|invalid context|patch failed/i.test(output)) return "failed";
-  if (/Exit code:\s*(?!0\b)\d+|Script failed|Tool call failed/i.test(output)) return "failed";
   if (tool.status === "completed") return "passed";
   return "unknown";
 }
@@ -545,15 +552,31 @@ function classifyChanges(session: NormalizedSession, taskId: string, actions: Or
   return changes;
 }
 
-function commandWorkdir(tool: NormalizedToolCall): string | undefined {
+function commandRepoTarget(tool: NormalizedToolCall, session: NormalizedSession): string | undefined {
+  const root = canonicalTarget(session.repoRoot);
   const record = argumentRecord(tool);
-  if (typeof record?.workdir === "string") return record.workdir;
-  const nested = record?.arguments;
-  if (nested && typeof nested === "object" && typeof (nested as Record<string, unknown>).workdir === "string") {
-    return (nested as Record<string, unknown>).workdir as string;
+  const nested = record?.arguments as Record<string, unknown> | undefined;
+  const workdir = record?.workdir ?? nested?.workdir;
+  const resolve = (value: unknown, base?: string): string | undefined => {
+    if (typeof value !== "string") return base;
+    const target = canonicalTarget(value);
+    if (!target || /^[$%~]/.test(target)) return undefined;
+    if (path.posix.isAbsolute(target) || path.win32.isAbsolute(target)) return path.posix.normalize(target);
+    return base ? path.posix.normalize(`${base}/${target}`) : undefined;
+  };
+  let context = resolve(workdir, root);
+  let command = (toolCommand(tool) ?? "").trim();
+  const prefix = /^(?:cd|set-location)\s+(?:"([^"]+)"|'([^']+)'|([^\s;|&]+))\s*(?:&&|;)\s*/i;
+  let match: RegExpExecArray | null;
+  while ((match = prefix.exec(command))) {
+    context = resolve(match[1] ?? match[2] ?? match[3], context);
+    command = command.slice(match[0].length);
   }
-  const command = toolCommand(tool) ?? "";
-  return /(?:^|[;&]\s*)(?:cd|set-location)\s+["']?([^"';|]+)["']?/i.exec(command)?.[1]?.trim();
+  if (/(?:^|[;&]\s*)(?:cd|set-location)\s/i.test(command)) return undefined;
+  match = /^git\s+-C\s+(?:"([^"]+)"|'([^']+)'|([^\s;|&]+))/i.exec(command);
+  if (match) context = resolve(match[1] ?? match[2] ?? match[3], context);
+  if (!context) return undefined;
+  return root && (context === root || context.startsWith(`${root}/`)) ? repoTarget(session) : `repo:${context}`;
 }
 
 function verificationType(action: OrderedAction, session: NormalizedSession): { type: DreamVerificationType; target?: string } | undefined {
@@ -564,7 +587,7 @@ function verificationType(action: OrderedAction, session: NormalizedSession): { 
   const directTargets = pathValues(argumentRecord(tool));
 
   if (/\bgit\b[^\r\n;|]*\b(?:diff|status)\b/.test(normalized) || /\bdiff\s+--check\b/.test(normalized)) {
-    return { type: "diff_check", target: repoTarget(session) };
+    return { type: "diff_check", target: commandRepoTarget(tool, session) };
   }
 
   // PowerShell's Test-Path is an observation, not a repository test suite.
@@ -581,18 +604,18 @@ function verificationType(action: OrderedAction, session: NormalizedSession): { 
     return { type: "read_back", target: canonical };
   }
 
-  if (/\b(?:typecheck|type-check|tsc|mypy)\b/.test(normalized)) return { type: "typecheck", target: repoTarget(session) };
+  if (/\b(?:typecheck|type-check|tsc|mypy)\b/.test(normalized)) return { type: "typecheck", target: commandRepoTarget(tool, session) };
   if (/\b(?:test|vitest|pytest|jest|cargo\s+test|go\s+test|dotnet\s+test|gut)\b/.test(normalized)) {
-    return { type: "test", target: repoTarget(session) };
+    return { type: "test", target: commandRepoTarget(tool, session) };
   }
-  if (/\b(?:lint|eslint|ruff|cspell)\b/.test(normalized)) return { type: "lint", target: repoTarget(session) };
+  if (/\b(?:lint|eslint|ruff|cspell)\b/.test(normalized)) return { type: "lint", target: commandRepoTarget(tool, session) };
   if (
     /\b(?:pandoc|mkdocs|sphinx-build|render_docx|export_whitepaper|build[_:-]?(?:docs?|document|whitepaper)|docs?:build)\b/.test(normalized) ||
     (/\b(?:build|render|export)\b/.test(normalized) && /\b(?:docs?|document|docx|pdf|markdown|whitepaper)\b/.test(normalized))
   ) {
-    return { type: "document_build", target: repoTarget(session) };
+    return { type: "document_build", target: commandRepoTarget(tool, session) };
   }
-  if (/\b(?:build|validate|check)\b/.test(normalized)) return { type: "build", target: repoTarget(session) };
+  if (/\b(?:build|validate|check)\b/.test(normalized)) return { type: "build", target: commandRepoTarget(tool, session) };
 
   if (isViewTool(tool)) {
     const target = canonicalTarget(directTargets[0]);
@@ -605,7 +628,6 @@ function verificationType(action: OrderedAction, session: NormalizedSession): { 
   if (externalReadNames.test(tool.name) || /(?:browser|chrome|computer).*(?:screenshot|inspect|read|snapshot)/i.test(tool.name)) {
     return { type: "external_confirmation", target: canonicalTarget(directTargets[0]) };
   }
-  if (isCommandTool(tool) && commandWorkdir(tool)) return undefined;
   return undefined;
 }
 
@@ -626,7 +648,7 @@ function repoChange(change: DreamChangeClassification): boolean {
 }
 
 function targetsMatch(change: DreamChangeClassification, check: VerificationCheck, session: NormalizedSession): boolean {
-  if (repoChange(change)) return check.target === repoTarget(session);
+  if (repoChange(change)) return repositoryVerificationMatches(change, check, session.repoRoot);
   if (!change.target || !check.target) return false;
   if (change.target === check.target) return true;
   if (change.changeType === "local_file_organization") {
