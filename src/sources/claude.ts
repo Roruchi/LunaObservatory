@@ -21,7 +21,7 @@ export function isClaudeEventsFile(events: RawLogEvent[]): boolean {
   return events.some(event => isClaudeRecord(event.data));
 }
 
-type NativeRow = { data: RecordValue; line: number };
+type NativeRow = { data: RecordValue; line: number; sourceFile: string };
 const requestKey = (row: RecordValue): string | undefined => {
   const messageId = str(obj(row.message).id);
   const requestId = str(row.requestId);
@@ -42,7 +42,7 @@ export function readClaudeTranscript(file: string) {
     try {
       const row = obj(JSON.parse(line));
       if (typeof row.type !== "string") throw new Error("Missing type");
-      rows.push({ data: row, line: index + 1 });
+      rows.push({ data: row, line: index + 1, sourceFile: file });
     } catch { parseErrors += 1; }
   });
   return { rows, parseErrors, digest: createHash("sha256").update(bytes).digest("hex") };
@@ -66,9 +66,25 @@ export function createClaudeCorpus(inputs: Map<string, Transcript>) {
   const seenTools = new Set<string>();
   const transcripts = [...inputs].map(([file, input]) => ({ file, input, scope: transcriptScope(file, input.rows) }));
   transcripts.sort((a, b) => a.scope.sessionId < b.scope.sessionId ? -1 : a.scope.sessionId > b.scope.sessionId ? 1 : a.file < b.file ? -1 : a.file > b.file ? 1 : 0);
-  const corpus = new Map<string, { input: Transcript; history: ReturnType<typeof normalizeHistory> }>();
-  for (const { file, input, scope } of transcripts) {
-    corpus.set(file, { input, history: normalizeHistory(input.rows, scope, seenRequests, seenEvents, seenTools) });
+  const corpus = new Map<string, { input: Transcript; history: ReturnType<typeof normalizeHistory>; sourceFiles: string[]; sessionParseErrors: number }>();
+  const groups = new Map<string, typeof transcripts>();
+  for (const transcript of transcripts) {
+    const group = groups.get(transcript.scope.sessionId) ?? [];
+    group.push(transcript);
+    groups.set(transcript.scope.sessionId, group);
+  }
+  for (const group of groups.values()) {
+    const digests = new Set<string>();
+    const copies = group.filter(({ input }) => {
+      if (digests.has(input.digest)) return false;
+      digests.add(input.digest);
+      return true;
+    });
+    const history = normalizeHistory(copies.flatMap(item => item.input.rows), group[0].scope, seenRequests, seenEvents, seenTools);
+    if (copies.length > 1) history.unknowns.add("conflicting_session_copies");
+    const sourceFiles = group.map(item => item.file);
+    const sessionParseErrors = copies.reduce((sum, item) => sum + item.input.parseErrors, 0);
+    for (const { file, input } of group) corpus.set(file, { input, history, sourceFiles, sessionParseErrors });
   }
   return corpus;
 }
@@ -105,8 +121,8 @@ function normalizeHistory(input: NativeRow[], scope: ReturnType<typeof transcrip
     else if (data.type !== "assistant") unknowns.add("history_event_identity_missing");
     return true;
   });
-  const rows: NativeRow[] = retained.flatMap(({ data, line }) => {
-    if (data.type !== "user" || !Array.isArray(obj(data.message).content)) return [{ data, line }];
+  const rows: NativeRow[] = retained.flatMap(({ data, line, sourceFile }) => {
+    if (data.type !== "user" || !Array.isArray(obj(data.message).content)) return [{ data, line, sourceFile }];
     const message = obj(data.message);
     const content = (message.content as unknown[]).filter(value => {
       const block = obj(value);
@@ -115,8 +131,8 @@ function normalizeHistory(input: NativeRow[], scope: ReturnType<typeof transcrip
       inherited.add(eventKey(data) ?? `tool_result:${id}`);
       return false;
     });
-    if (content.length === (message.content as unknown[]).length) return [{ data, line }];
-    return content.length ? [{ data: { ...data, message: { ...message, content } }, line }] : [];
+    if (content.length === (message.content as unknown[]).length) return [{ data, line, sourceFile }];
+    return content.length ? [{ data: { ...data, message: { ...message, content } }, line, sourceFile }] : [];
   });
   ownTools.forEach(id => seenTools.add(id));
   if (inherited.size) unknowns.add("history_inherited_events");
@@ -128,7 +144,7 @@ function normalizeHistory(input: NativeRow[], scope: ReturnType<typeof transcrip
 
 /** Reads native top-level Claude records without changing the Codex/Copilot reader. */
 export function parseClaudeSessionFile(file: string, corpus = createClaudeCorpus(new Map([[file, readClaudeTranscript(file)]]))) {
-  const { input, history } = corpus.get(file)!;
+  const { input, history, sourceFiles, sessionParseErrors } = corpus.get(file)!;
   const parseErrors = input.parseErrors;
   const { rows, sessionId, childAgentId, child, inheritedEvents, unresolvedInheritedEvents } = history;
   const unknowns = new Set(history.unknowns);
@@ -143,14 +159,14 @@ export function parseClaudeSessionFile(file: string, corpus = createClaudeCorpus
   let finalAnswer: NormalizedSession["finalAnswer"];
   let current: NormalizedTurn | undefined;
   const times: string[] = [];
-  const ref = (row: RecordValue, line: number, fieldPath: string): EvidenceRef => ({
-    sourceFile: file, lineNumber: line, eventId: str(row.uuid), eventType: String(row.type), fieldPath, summary: "native Claude transcript field"
-  });
   const turn = (): NormalizedTurn => {
     if (!current) { current = { turnId: `${sessionId}:turn:${turns.length + 1}`, assistantMessages: [], toolCalls: [], hooks: [] }; turns.push(current); }
     return current;
   };
-  for (const { data: row, line } of rows) {
+  for (const { data: row, line, sourceFile } of rows) {
+    const ref = (row: RecordValue, line: number, fieldPath: string): EvidenceRef => ({
+      sourceFile, lineNumber: line, eventId: str(row.uuid), eventType: String(row.type), fieldPath, summary: "native Claude transcript field"
+    });
     const stamp = str(row.timestamp);
     const time = stamp && Number.isFinite(Date.parse(stamp)) ? new Date(stamp).toISOString() : undefined;
     if (time) times.push(time); else unknowns.add("timestamp_missing_or_invalid");
@@ -254,18 +270,19 @@ export function parseClaudeSessionFile(file: string, corpus = createClaudeCorpus
   for (const { message } of messages.values()) if (!message.model) unknowns.add("model_missing");
   times.sort();
   const base: Omit<NormalizedSession, "metrics"> = {
-    sessionId, ...(child && childAgentId ? { agentPath: childAgentId } : {}), source: "claude", sourceFiles: [file], repoMatch: "unknown", repoRoot: worktreePaths.size === 1 ? [...worktreePaths][0] : undefined,
+    sessionId, ...(child && childAgentId ? { agentPath: childAgentId } : {}), source: "claude", sourceFiles, repoMatch: "unknown", repoRoot: worktreePaths.size === 1 ? [...worktreePaths][0] : undefined,
     startedAt: times[0], endedAt: times.at(-1), durationMs: durationMs(times[0], times.at(-1)), lifecycleStatus: "unknown", interactions: [], turns,
     userIntent: firstInstruction, finalAnswer,
     attribution: { branches: [...branches].sort(), worktreePaths: [...worktreePaths].sort(), firstInstruction,
       isSidechain: sidechains.size === 1 ? [...sidechains][0] : undefined, agentId,
       inheritedEvents, unresolvedInheritedEvents,
-      notes: ["Assistant requests are counted once per scan by message ID plus request ID, falling back to event UUID. Transcripts are processed by native transcript ID, then source path; this does not reconstruct lineage. Reused identities and richer later copies can undercount usage or tool outcomes.",
+      notes: [...(unknowns.has("conflicting_session_copies") ? ["Conflicting copies of this native session were combined before request deduplication; attribution remains unverified."] : []),
+        "Assistant requests are counted once per scan by message ID plus request ID, falling back to event UUID. Transcripts are processed by native transcript ID, then source path; this does not reconstruct lineage. Reused identities and richer later copies can undercount usage or tool outcomes.",
         ...(unresolvedInheritedEvents === null ? ["Inherited history is unresolved without another transcript containing the same requests; observed totals may include replayed history."] : [])],
-      historyCoverage: inheritedEvents > 0 || unknowns.has("history_lineage_unknown") || unknowns.has("history_event_identity_missing") || parseErrors > 0 ? "partial" : "complete",
-      usageCoverage: unknowns.has("usage_missing_or_partial") || parseErrors > 0 ? "partial" : "complete", unknowns: [...unknowns].sort() }
+      historyCoverage: inheritedEvents > 0 || unknowns.has("history_lineage_unknown") || unknowns.has("history_event_identity_missing") || sessionParseErrors > 0 ? "partial" : "complete",
+      usageCoverage: unknowns.has("usage_missing_or_partial") || sessionParseErrors > 0 ? "partial" : "complete", unknowns: [...unknowns].sort() }
   };
-  const metrics = calculateMetrics(base, parseErrors);
+  const metrics = calculateMetrics(base, sessionParseErrors);
   // The common model's input count is non-cache input; cache writes remain separate.
   metrics.modelRequests = messages.size;
   return { session: { ...base, metrics } as NormalizedSession, eventsParsed: input.rows.length, parseErrors, traceDigest: input.digest };

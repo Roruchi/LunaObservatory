@@ -35,6 +35,7 @@ export type Correlation = {
   confidence: "high" | "medium" | "low" | "none";
   taskId: string | null; attemptId: string | null;
   candidates: Candidate[]; reasons: string[];
+  nativeIdentityUnknowns: string[];
 };
 const canonicalPath = (value: string) => value.replace(/\\/g, "/").replace(/\/+$/, "");
 const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -52,6 +53,7 @@ export function sessionObservations(session: NormalizedSession): SessionObservat
 
 /** No fuzzy names, command-output parsing, nearest-time winner, or inferred attempts. */
 export function correlateSession(session: NormalizedSession, records: TaskRecord[], observations = sessionObservations(session)): Correlation {
+  const nativeIdentityUnknowns = session.attribution?.unknowns.filter(reason => reason === "session_id_missing") ?? [];
   const candidates: Candidate[] = [];
   const instruction = observations.firstInstruction ?? "";
   records.forEach((record, index) => {
@@ -75,7 +77,7 @@ export function correlateSession(session: NormalizedSession, records: TaskRecord
     if (Number.isFinite(end) && end < Date.parse(record.startedAt)) return;
     if (Number.isFinite(start) && record.endedAt !== null && start > Date.parse(record.endedAt)) return;
     const evidence = [branch && "branch", path && "worktree_path", inbox && "first_instruction_inbox", task && "first_instruction_task", completeTime && "time_overlap"].filter((value): value is string => Boolean(value));
-    const unknowns = [...(session.attribution?.unknowns.filter(reason => ["sidechain_agent_identity_missing", "mixed_sidechain_markers", "timestamp_missing_or_invalid", "history_lineage_unknown"].includes(reason)) ?? []), !completeTime && "time_window_incomplete", !record.attemptId && "attempt_identity_unknown", !(branch || inbox || task) && "task_identity_unverified"].filter((value): value is string => Boolean(value));
+    const unknowns = [...nativeIdentityUnknowns, ...(session.attribution?.unknowns.filter(reason => ["conflicting_session_copies", "sidechain_agent_identity_missing", "mixed_sidechain_markers", "timestamp_missing_or_invalid", "history_lineage_unknown"].includes(reason)) ?? []), !completeTime && "time_window_incomplete", !record.attemptId && "attempt_identity_unknown", !(branch || inbox || task) && "task_identity_unverified"].filter((value): value is string => Boolean(value));
     // Exact repeated caller records are one observation; contradictory metadata remains ambiguous.
     const duplicate = candidates.find(candidate => candidate.taskId === record.taskId && candidate.attemptId === record.attemptId &&
       candidate.project === record.project && candidate.spawnGeneration === record.spawnGeneration &&
@@ -91,6 +93,7 @@ export function correlateSession(session: NormalizedSession, records: TaskRecord
     status: matched ? "matched" : candidates.length ? "ambiguous" : "unmatched",
     confidence: matched ? only.evidence.includes("worktree_path") ? "high" : "medium" : candidates.length ? "low" : "none",
     taskId: matched ? only.taskId : null, attemptId: matched ? only.attemptId : null,
+    nativeIdentityUnknowns,
     candidates, reasons: matched ? ["unique_verified_attempt"] : candidates.length > 1 ? ["multiple_candidates"] : candidates.length ? only!.unknowns : ["no_compatible_evidence"]
   };
 }
@@ -156,7 +159,7 @@ export function evaluationIdentity(correlation: Correlation, refId: string): Wor
   const unknown = (reason: string): Field<string> => ({ availability: "unknown", reason });
   const known = (value: string): Field<string> => ({ availability: "known", value, refs: [refId] });
   return {
-    sessionId: known(correlation.sessionId),
+    sessionId: correlation.nativeIdentityUnknowns.length ? unknown(correlation.nativeIdentityUnknowns.join(",")) : known(correlation.sessionId),
     attemptId: correlation.status === "matched" && correlation.attemptId ? known(correlation.attemptId) : unknown(correlation.status),
     missionId: unknown("not_supplied"), workerId: unknown("not_supplied"), role: unknown("not_supplied"), model: unknown("not_supplied"),
     orchestrator: correlation.status === "matched" ? known("Firstmate") : unknown("unverified")

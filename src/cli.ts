@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { Command } from "commander";
 import { defaultConfig } from "./config.js";
@@ -84,6 +85,7 @@ function scan(options: {
 
   const parseSession = createSessionParser(discovered.flatMap(source => source.files.map(file => ({ file, source: source.source }))));
   const sessions: NormalizedSession[] = [];
+  const seenSessions = new Map<string, { session: NormalizedSession; file: string; digest?: string }>();
   const repoFilter = [];
   let eventsParsed = 0;
   let parseErrors = 0;
@@ -95,6 +97,23 @@ function scan(options: {
       filesScanned += 1;
       eventsParsed += parsed.eventsParsed;
       parseErrors += parsed.parseErrors;
+      const key = `${parsed.session.source}:${parsed.session.sessionId}`;
+      const previous = seenSessions.get(key);
+      if (previous) {
+        if (parsed.session.source !== "claude") {
+          const digest = (file: string) => createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+          previous.session.sourceFiles = [...new Set([...previous.session.sourceFiles, ...parsed.session.sourceFiles])];
+          if ((previous.digest ?? digest(previous.file)) !== (parsed.traceDigest ?? digest(file))) {
+            const attribution = previous.session.attribution ??= { branches: [], worktreePaths: [], unknowns: [] };
+            if (!attribution.unknowns.includes("conflicting_session_copies")) {
+              attribution.unknowns.push("conflicting_session_copies");
+              (attribution.notes ??= []).push("Conflicting session copies: Scan retains the first discovered copy's activity.");
+            }
+          }
+        }
+        continue;
+      }
+      seenSessions.set(key, { session: parsed.session, file, digest: parsed.traceDigest });
       const decision = applyRepoFilter(parsed.session, repoRoot, Boolean(options.allRepos));
       repoFilter.push(decision);
       sessions.push(parsed.session);
