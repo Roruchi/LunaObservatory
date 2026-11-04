@@ -73,6 +73,7 @@ export function modelSummary(models: Record<string, number>): string {
 }
 
 function existingRepoRoot(candidate: string): string | undefined {
+  if (process.platform !== "win32" && /^(?:[A-Za-z]:[\\/]|\\\\)/.test(candidate)) return undefined;
   let current = path.resolve(candidate);
   try {
     if (fs.existsSync(current) && !fs.statSync(current).isDirectory()) current = path.dirname(current);
