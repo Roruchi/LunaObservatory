@@ -71,40 +71,32 @@ function orderCopiedRows(rows: NativeRow[], copies: Transcript[]): NativeRow[] {
     const timestamp = Date.parse(str(row.data.timestamp) ?? "");
     return Number.isFinite(timestamp) ? timestamp : Infinity;
   };
-  const buckets = new Map<number, NativeRow[]>();
-  for (const row of rows) {
-    const bucket = buckets.get(time(row)) ?? [];
-    bucket.push(row);
-    buckets.set(time(row), bucket);
-  }
   const successors = new Map(rows.map(row => [key(row), new Set<string>()]));
   const incoming = new Map(rows.map(row => [key(row), 0]));
   for (const copy of copies) {
-    const previous = new Map<number, string>();
+    let previous: string | undefined;
     const seen = new Set<string>();
     for (const row of copy.rows) {
       const id = key(row);
       if (!incoming.has(id) || seen.has(id)) continue;
       seen.add(id);
-      const before = previous.get(time(row));
+      const before = previous;
       if (before && before !== id && !successors.get(before)!.has(id)) {
         successors.get(before)!.add(id);
         incoming.set(id, incoming.get(id)! + 1);
       }
-      previous.set(time(row), id);
+      previous = id;
     }
   }
-  return [...buckets].sort(([a], [b]) => a - b).flatMap(([, bucket]) => {
-    const remaining = new Map(bucket.map(row => [key(row), row]));
-    const ordered: NativeRow[] = [];
-    while (remaining.size) {
-      const id = [...remaining.keys()].find(id => incoming.get(id) === 0) ?? remaining.keys().next().value!;
-      ordered.push(remaining.get(id)!);
-      remaining.delete(id);
-      for (const next of successors.get(id)!) incoming.set(next, incoming.get(next)! - 1);
-    }
-    return ordered;
-  });
+  const remaining = new Map([...rows].sort((a, b) => time(a) - time(b)).map(row => [key(row), row]));
+  const ordered: NativeRow[] = [];
+  while (remaining.size) {
+    const id = [...remaining.keys()].find(id => incoming.get(id) === 0) ?? remaining.keys().next().value!;
+    ordered.push(remaining.get(id)!);
+    remaining.delete(id);
+    for (const next of successors.get(id)!) incoming.set(next, incoming.get(next)! - 1);
+  }
+  return ordered;
 }
 
 export function createClaudeCorpus(inputs: Map<string, Transcript>) {

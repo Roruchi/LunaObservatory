@@ -59,8 +59,9 @@ describe("session identity boundaries", () => {
     expect(correlation).toHaveLength(1);
     expect(correlation[0].reasons).toEqual(["conflicting_session_copies"]);
   });
-  it.each([[false, false], [true, false], [true, true]])("orders overlapping copies before extracting evidence (tied: %s, partial: %s)", (tied, partial) => {
-    const logs = path.join(directory, `chronology-${tied}-${partial}`); fs.mkdirSync(logs);
+  it.each(["dated", "tied", "undated-use", "undated-result", "interleaved", "undated-instruction-answer", "reversed-time"].flatMap(mode => [false, true].map(partial => ({ mode, partial }))))("orders overlapping copies before extracting evidence ($mode, partial: $partial)", ({ mode, partial }) => {
+    const tied = mode === "tied";
+    const logs = path.join(directory, `chronology-${mode}-${partial}`); fs.mkdirSync(logs);
     const base = { sessionId: "fictional-chronology", cwd: "/fictional/repo", gitBranch: "fm/fictional-nebula" };
     const history = [0, 1].flatMap(index => {
       const stamp = (offset: number) => `2026-01-01T10:00:0${tied ? 0 : index * 4 + offset}Z`;
@@ -75,11 +76,16 @@ describe("session identity boundaries", () => {
         { ...base, type: "assistant", uuid: `answer-${index}`, requestId: `request-answer-${index}`, timestamp: stamp(3), message: { id: `message-answer-${index}`, content: [{ type: "text", text: index ? "Final answer" : "Earlier answer" }] } }
       ];
     });
+    const undated = mode === "undated-use" ? ["edit", "tool-0", "tool-1"] :
+      mode === "undated-result" ? ["edit-result", "result-0", "result-1"] :
+      mode === "interleaved" ? ["user-0", "tool-0", "answer-0", "result-1"] :
+      mode === "undated-instruction-answer" ? ["user-0", "answer-1"] : [];
+    const records = history.map((row, index) => ({ ...row, timestamp: undated.includes(row.uuid) ? undefined : mode === "reversed-time" ? `2026-01-01T10:00:${String(30 - index).padStart(2, "0")}Z` : row.timestamp }));
     const suffix = path.join(logs, "a.jsonl"); const complete = path.join(logs, "b.jsonl");
-    write(suffix, history.slice(tied ? 2 : 6));
-    write(complete, partial ? history.slice(0, 6) : history);
+    write(suffix, records.slice(2));
+    write(complete, partial ? records.slice(0, 6) : records);
     if (tied) {
-      fs.appendFileSync(complete, `\n${JSON.stringify(history[1])}`);
+      fs.appendFileSync(complete, `\n${JSON.stringify(records[1])}`);
     }
     for (const files of [[suffix, complete], [complete, suffix]]) {
       const session = createSessionParser(files.map(file => ({ file, source: "claude" })))(suffix, "claude").session;
@@ -100,7 +106,20 @@ describe("session identity boundaries", () => {
       expect(session.metrics.verificationFailed).toBe(1);
       expect(session.metrics.verificationClosure).toBe("passed");
       expect(session.attribution?.unknowns).not.toContain("orphan_tool_result");
-      expect(session.turns.map(turn => turn.startedAt)).toEqual(["2026-01-01T10:00:00.000Z", tied ? "2026-01-01T10:00:00.000Z" : "2026-01-01T10:00:04.000Z"]);
+      if (mode === "dated" || tied) expect(session.turns.map(turn => turn.startedAt)).toEqual(["2026-01-01T10:00:00.000Z", tied ? "2026-01-01T10:00:00.000Z" : "2026-01-01T10:00:04.000Z"]);
+      if (undated.length) expect(session.attribution?.unknowns).toContain("timestamp_missing_or_invalid");
+    }
+  });
+  it("uses timestamps to order records without a recorded relative order", () => {
+    const files = [2, 1].map((second, index) => {
+      const file = path.join(directory, `unconstrained-${index}.jsonl`);
+      write(file, [{ type: "assistant", sessionId: "fictional-unconstrained", uuid: `answer-${second}`, requestId: `request-${second}`, timestamp: `2026-01-01T10:00:0${second}Z`, message: { id: `message-${second}`, content: [{ type: "text", text: `Answer ${second}` }] } }]);
+      return file;
+    });
+    for (const order of [files, [...files].reverse()]) {
+      const session = createSessionParser(order.map(file => ({ file, source: "claude" })))(files[0], "claude").session;
+      expect(session.turns.flatMap(turn => turn.assistantMessages).map(message => message.text)).toEqual(["Answer 1", "Answer 2"]);
+      expect(session.finalAnswer?.text).toBe("Answer 2");
     }
   });
   it("keeps unidentified observations at the same line in different copies separate", () => {
