@@ -180,14 +180,14 @@ function firstPathArg(args: unknown): string | undefined {
   return undefined;
 }
 
-function extractSessionId(events: RawLogEvent[], sourceFile: string): string {
+function extractNativeSessionId(events: RawLogEvent[]): string | null {
   for (const event of events) {
     const data = objectData(event);
     const input = data.input && typeof data.input === "object" ? (data.input as Record<string, unknown>) : undefined;
-    const sessionId = stringValue(data.id) ?? stringValue(input?.sessionId) ?? stringValue(data.sessionId) ?? stringValue(data.session_id);
+    const sessionId = (event.type === "session_meta" ? stringValue(data.id) : undefined) ?? stringValue(input?.sessionId) ?? stringValue(data.sessionId) ?? stringValue(data.session_id);
     if (sessionId) return sessionId;
   }
-  return stableId(sourceFile);
+  return null;
 }
 
 function codexTurnId(data: Record<string, unknown>): string | undefined {
@@ -393,7 +393,8 @@ export function normalizeEventsToSession(
 ): NormalizedSession {
   events = scopeSubagentEvents(events);
   const turns = new Map<string, MutableTurn>();
-  const sessionId = extractSessionId(events, sourceFile);
+  const nativeSessionId = extractNativeSessionId(events);
+  const sessionId = nativeSessionId ?? stableId(sourceFile);
   const interactions = new Set<string>();
   const turnModels = new Map<string, string>();
   const directUserInstructions: NormalizedInstructionEvidence[] = [];
@@ -863,6 +864,7 @@ export function normalizeEventsToSession(
 
   const sessionBase = {
     sessionId,
+    nativeSessionId,
     ...(parentSessionId ? { parentSessionId } : {}),
     ...(agentPath ? { agentPath } : {}),
     source,

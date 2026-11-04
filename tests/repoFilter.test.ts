@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -8,6 +8,16 @@ import type { NormalizedSession } from "../src/normalize/types.js";
 import { repositoryRootForPath } from "../src/utils/pathMatch.js";
 
 const fixture = path.resolve("tests/fixtures/copilot-events.jsonl");
+
+const temporaryRoots: string[] = [];
+function temporaryRoot(): string {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "lunaobs-repo-filter-"));
+  temporaryRoots.push(root);
+  return root;
+}
+afterEach(() => {
+  for (const root of temporaryRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
 
 describe("repo filter", () => {
   it("includes sessions where hook cwd is inside repo", () => {
@@ -36,19 +46,22 @@ describe("repo filter", () => {
 
   it("normalizes nested working directories to one repository root", () => {
     const { session } = parseSessionFile(fixture, "copilot");
-    session.turns[0].hooks.push({
+    const root = temporaryRoot();
+    fs.mkdirSync(path.join(root, ".git"));
+    fs.mkdirSync(path.join(root, "src"));
+    session.turns[0].hooks = [{
       hookInvocationId: "nested",
       hookType: "context",
       startedAt: "2026-07-14T00:00:00.000Z",
-      cwd: path.resolve("src"),
+      cwd: path.join(root, "src"),
       toolCallIds: []
-    });
-    const decision = applyRepoFilter(session, path.resolve("."), true);
-    expect(path.resolve(decision.repoRoot ?? "")).toBe(path.resolve("."));
+    }];
+    const decision = applyRepoFilter(session, root, true);
+    expect(decision.repoRoot).toBe(root);
   });
 
   it("normalizes a linked git worktree to its shared repository", () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "lunaobs-worktree-"));
+    const root = temporaryRoot();
     const main = path.join(root, "main");
     const worktree = path.join(root, "worktree");
     const nested = path.join(worktree, "src");

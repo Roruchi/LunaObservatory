@@ -37,7 +37,22 @@ export type SessionLifecycleStatus = "completed" | "in_progress" | "aborted" | "
 export type VerificationClosure = "passed" | "failed" | "missing" | "not_applicable";
 
 export type NormalizedSession = {
+  /** Native metadata only; absence is unknown. Never inferred from tool output. */
+  attribution?: {
+    branches: string[];
+    worktreePaths: string[];
+    firstInstruction?: NormalizedTextEvidence;
+    isSidechain?: boolean;
+    agentId?: string;
+    notes?: string[];
+    inheritedEvents?: number;
+    unresolvedInheritedEvents?: number | null;
+    historyCoverage?: "complete" | "partial";
+    usageCoverage?: "complete" | "partial";
+    unknowns: string[];
+  };
   sessionId: string;
+  nativeSessionId?: string | null;
   parentSessionId?: string;
   agentPath?: string;
   source: SourceName;
@@ -71,6 +86,7 @@ export type NormalizedTurn = {
 };
 
 export type NormalizedAssistantMessage = {
+  cacheCreationTokens?: MetricValue;
   messageId?: string;
   kind?: "text" | "reasoning" | "token_usage" | "unknown";
   text?: string;
@@ -91,6 +107,7 @@ export type NormalizedAssistantMessage = {
 };
 
 export type NormalizedToolCall = {
+  exitCode?: number;
   toolCallId: string;
   name: string;
   arguments?: unknown;

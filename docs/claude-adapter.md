@@ -1,0 +1,26 @@
+# Claude Code transcripts
+
+`lunaobs scan --source claude --logs /fictional/traces` accepts native Claude Code JSONL, including the `projects/**/*.jsonl` layout. `--source all --logs ...` also detects native Claude records. Codex and Copilot keep their existing parser. Existing Scan and Dream report formats and scoring semantics are unchanged.
+
+The adapter retains native session identity, timestamps, first user instruction, cwd, git branch, model, text, tool calls/results and evidence line references. It groups assistant streaming records by the exact pair of `message.id` and `requestId` (falling back to event UUID), deduplicates identical content blocks, and joins results by `tool_use_id`. Usage repeated on split blocks is counted once per request, using the maximum observed value for each field as streaming usage advances. Equal text in separate native requests remains separate activity.
+
+`inputTokens` means Claude's reported non-cache input; `cachedTokens` means cache reads. Cache writes are retained separately as `cacheCreationTokens` on the normalized message. No total billed-token or price estimate is invented. Missing fields remain unavailable; partial session sums cover only reported requests, with `usage_missing_or_partial` in attribution unknowns. Incomplete message/request identities cannot be reconstructed; event UUIDs provide the fallback key, and usage coverage is flagged partial. Without either key, records remain separate observations with explicit unknowns.
+
+`Read`, `MultiEdit` and `NotebookEdit` map to existing semantic tools; other names are preserved, including Bash, Edit and Write. File paths normalize to the existing `path` argument. Verification uses the existing command rules. Exit codes are retained from typed result metadata. An explicit `is_error: false` confirms a foreground tool result succeeded, while background results and command results without success evidence stay unknown. Tool completion does not prove accepted task quality. Truncated transcripts may retain requested calls or orphan results; unknowns make that visible.
+
+Sidechain and agent markers are retained. A sidechain with an agent ID gets a session ID scoped by that agent, preventing native session/agent identity collisions. Missing child agent identity is flagged. The final conversational record defines the transcript's native identity; parent relationships are not reconstructed.
+
+Copies sharing a native session/agent identity produce one normalized session before filtering and scoring. Byte-identical copies contribute once; differing copies combine distinct records before request deduplication and carry `conflicting_session_copies` with all source paths retained. Conflicting attribution remains unverified in correlation. Before conversational normalization, retained records preserve relative order established by overlapping copies across all timestamps, including missing or tied timestamps. Timestamps order otherwise unconstrained records. Unidentified requests use source file plus line as their fallback key. Evidence retains the original source file and line.
+
+Scan and correlation read each Claude transcript once and share sets of already counted assistant requests, native events and tool IDs for that command. Transcripts are processed by native transcript ID, then source path, in lexical order. All split assistant records in the first transcript containing a message/request pair belong to one request; repeated usage uses the maximum reported value per field. Later transcripts containing that pair exclude its assistant records and associated tool results before extracting metadata, turns, tools or usage, even when split events have different UUIDs. Copied user/history events and repeated events are deduplicated by native event identity. No ancestry, timestamp ownership, directory search or request-alias graph is used.
+
+`inheritedEvents` counts excluded history; `historyCoverage` and `usageCoverage` are partial when history is excluded or lacks stable identity. A sidechain supplied alone cannot establish which history was inherited: `unresolvedInheritedEvents` is null and coverage is partial. Observed usage remains available with those notes. Per-transcript allocation does not establish native lineage, acceptance or disjoint measured effort.
+
+The simple rule accepts these rare undercounts, also called out in output `notes`:
+
+- Independent calls reusing an identical message/request pair, or a fallback event UUID, collapse into one observation.
+- A first native session with a partial request stream can omit final token/cache updates, additional tool blocks or completion receipts found only in a later session. The later session is treated as already counted; requests and receipts are not moved or merged between transcripts.
+
+Distinct pairs remain distinct, even when only one component matches. Without a complete pair or a shared UUID, the adapter cannot deduplicate split requests across transcripts; explicit unknowns keep that uncertainty visible. Session completion stays unknown because a final assistant message alone does not establish task completion.
+
+All checked-in fixtures are handmade and fictional. See [Privacy](../README.md#privacy) for handling traces and Scan output, and the [correlation guide](session-correlation.md) for that command's output contract.

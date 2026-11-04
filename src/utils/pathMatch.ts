@@ -1,43 +1,52 @@
 import path from "node:path";
 import fs from "node:fs";
 
+export function pathStyle(value: string): typeof path.win32 | typeof path.posix {
+  return /^[A-Za-z]:[\\/]/.test(value) || /^\\\\/.test(value) ? path.win32 : path;
+}
+
 export function normalizeForMatch(value: string): string {
-  return path.resolve(value).toLowerCase();
+  return pathStyle(value).resolve(value).toLowerCase();
 }
 
 export function isPathInside(child: string, parent: string): boolean {
   const normalizedChild = normalizeForMatch(child);
   const normalizedParent = normalizeForMatch(parent);
+  const separator = pathStyle(parent).sep;
   return (
     normalizedChild === normalizedParent ||
-    normalizedChild.startsWith(normalizedParent.endsWith(path.sep) ? normalizedParent : `${normalizedParent}${path.sep}`)
+    normalizedChild.startsWith(normalizedParent.endsWith(separator) ? normalizedParent : `${normalizedParent}${separator}`)
   );
 }
 
 export function repositoryRootForPath(candidate: string): string | undefined {
-  let current = path.resolve(candidate);
-  try {
-    if (fs.existsSync(current) && !fs.statSync(current).isDirectory()) current = path.dirname(current);
-    while (true) {
-      const gitMarker = path.join(current, ".git");
-      if (fs.existsSync(gitMarker)) {
-        if (fs.statSync(gitMarker).isFile()) {
-          const pointer = fs.readFileSync(gitMarker, "utf8").match(/^gitdir:\s*(.+)$/im)?.[1]?.trim();
-          const gitDir = pointer ? path.resolve(current, pointer) : undefined;
-          const sharedRoot = gitDir?.match(/^(.+)[\\/]\.git[\\/]worktrees[\\/][^\\/]+$/i)?.[1];
-          if (sharedRoot) return path.resolve(sharedRoot);
+  const style = pathStyle(candidate);
+  let current = style.resolve(candidate);
+  // Foreign absolute paths cannot be resolved against this machine's filesystem.
+  if (style === path || process.platform === "win32") {
+    try {
+      if (fs.existsSync(current) && !fs.statSync(current).isDirectory()) current = path.dirname(current);
+      while (true) {
+        const gitMarker = path.join(current, ".git");
+        if (fs.existsSync(gitMarker)) {
+          if (fs.statSync(gitMarker).isFile()) {
+            const pointer = fs.readFileSync(gitMarker, "utf8").match(/^gitdir:\s*(.+)$/im)?.[1]?.trim();
+            const gitDir = pointer ? path.resolve(current, pointer) : undefined;
+            const sharedRoot = gitDir?.match(/^(.+)[\\/]\.git[\\/]worktrees[\\/][^\\/]+$/i)?.[1];
+            if (sharedRoot) return path.resolve(sharedRoot);
+          }
+          return current;
         }
-        return current;
+        const parent = path.dirname(current);
+        if (parent === current) break;
+        current = parent;
       }
-      const parent = path.dirname(current);
-      if (parent === current) break;
-      current = parent;
+    } catch {
+      // Fall through to path-shape inference for stale or unavailable paths.
     }
-  } catch {
-    // Fall through to path-shape inference for stale or unavailable paths.
   }
 
-  const normalized = path.resolve(candidate).replace(/\//g, "\\");
+  const normalized = style.resolve(candidate).replace(/\//g, "\\");
   const repoWorktreeMatch = normalized.match(/^(.+\\[^\\\s"'`|<>]+\.worktrees\\[^\\\s"'`|<>]+)/i);
   if (repoWorktreeMatch) return repoWorktreeMatch[1];
   const repoMatch = normalized.match(/^([A-Za-z]:\\Repo\\[^\\\s"'`|<>]+\\[^\\\s"'`|<>]+)/i);

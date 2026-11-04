@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { Command } from "commander";
 import { defaultConfig } from "./config.js";
@@ -7,7 +8,7 @@ import { discoverSources } from "./fs/discovery.js";
 import { readJsonlObjects, writeJsonl } from "./fs/jsonl.js";
 import { detectRepoRoot, ensureLunaObsDirs, getLunaObsPaths } from "./fs/paths.js";
 import { applyRepoFilter, canonicalizeObservedRepoRoots } from "./normalize/repoFilter.js";
-import { parseSessionFile } from "./normalize/parser.js";
+import { createSessionParser } from "./normalize/parser.js";
 import type { NormalizedSession } from "./normalize/types.js";
 import { generateScanHtmlReport } from "./reports/html.js";
 import { generateInspectReport } from "./reports/inspect.js";
@@ -24,6 +25,8 @@ import {
 import { scoreSession, type InefficiencyScore } from "./scoring/score.js";
 import { installDreamSkill, type SkillAgent } from "./skills/install.js";
 import type { RequestedSource } from "./sources/types.js";
+import { correlateTraceDirectory } from "./correlation/index.js";
+import { pathStyle } from "./utils/pathMatch.js";
 
 function numberOption(value: string): number {
   const parsed = Number(value);
@@ -75,13 +78,15 @@ function scan(options: {
   top: number;
 }): void {
   const outputRoot = detectRepoRoot();
-  const repoRoot = options.repo ? path.resolve(options.repo) : outputRoot;
+  const repoRoot = options.repo ? pathStyle(options.repo).resolve(options.repo) : outputRoot;
   initProject(outputRoot, options.out);
   const paths = getLunaObsPaths(outputRoot, options.out);
   const discovered = discoverSources(options.source, options.logs);
   fs.writeFileSync(path.join(paths.index, "discovered-sources.json"), `${JSON.stringify(discovered, null, 2)}\n`, "utf8");
 
+  const parseSession = createSessionParser(discovered.flatMap(source => source.files.map(file => ({ file, source: source.source }))));
   const sessions: NormalizedSession[] = [];
+  const seenSessions = new Map<string, { session: NormalizedSession; file: string; digest?: string }>();
   const repoFilter = [];
   let eventsParsed = 0;
   let parseErrors = 0;
@@ -89,10 +94,27 @@ function scan(options: {
 
   for (const source of discovered) {
     for (const file of source.files) {
-      const parsed = parseSessionFile(file, source.source);
+      const parsed = parseSession(file, source.source);
       filesScanned += 1;
       eventsParsed += parsed.eventsParsed;
       parseErrors += parsed.parseErrors;
+      const key = `${parsed.session.source}:${parsed.session.sessionId}`;
+      const previous = seenSessions.get(key);
+      if (previous) {
+        if (parsed.session.source !== "claude") {
+          const digest = (file: string) => createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+          previous.session.sourceFiles = [...new Set([...previous.session.sourceFiles, ...parsed.session.sourceFiles])];
+          if ((previous.digest ?? digest(previous.file)) !== (parsed.traceDigest ?? digest(file))) {
+            const attribution = previous.session.attribution ??= { branches: [], worktreePaths: [], unknowns: [] };
+            if (!attribution.unknowns.includes("conflicting_session_copies")) {
+              attribution.unknowns.push("conflicting_session_copies");
+              (attribution.notes ??= []).push("Conflicting session copies: Scan retains the first discovered copy's activity.");
+            }
+          }
+        }
+        continue;
+      }
+      seenSessions.set(key, { session: parsed.session, file, digest: parsed.traceDigest });
       const decision = applyRepoFilter(parsed.session, repoRoot, Boolean(options.allRepos));
       repoFilter.push(decision);
       sessions.push(parsed.session);
@@ -210,6 +232,18 @@ function validateDream(input: string, out?: string): void {
 const program = new Command();
 
 program.name("lunaobs").description("Local-first observatory for coding-agent session traces.").version("0.1.0");
+
+program.command("correlate")
+  .description("Join local traces to caller-supplied Firstmate task records without scoring.")
+  .requiredOption("--logs <path>", "explicit trace directory or file")
+  .requiredOption("--tasks <path>", "typed task-record JSON file")
+  .requiredOption("--out <path>", "correlation JSON output file")
+  .option("--source <source>", "copilot|codex|claude|all", sourceOption, "all")
+  .action((options: { logs: string; tasks: string; out: string; source: RequestedSource }) => {
+    const result = correlateTraceDirectory(options.logs, options.tasks, options.source);
+    fs.writeFileSync(options.out, `${JSON.stringify(result, null, 2)}\n`, "utf8");
+    console.log(`Correlated ${result.correlations.length} session(s); parse errors: ${result.parseErrors}`);
+  });
 
 program
   .command("init")

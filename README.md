@@ -10,7 +10,7 @@ LunaObs is a local-first CLI tool for observing coding-agent session traces.
 
 ## Modules
 
-- Scan: deterministic local analyzer that discovers native Codex and Copilot session logs, filters them to the current repo, normalizes trace evidence, scores suspicious sessions, and writes Markdown plus HTML reports.
+- Scan: deterministic local analyzer that discovers native Codex, Copilot and Claude Code session logs, filters them to the current repo, normalizes trace evidence, scores suspicious sessions, and writes Markdown plus HTML reports.
 - Dream: offline evaluator for frozen Scan evidence. Humans usually trigger dream mode; agents execute the reusable LunaObs Dream skill to prepare packets, validate them, inspect the generated report, and summarize evidence-backed lessons.
 - Workpackage evaluation: a [slice 1 prototype](docs/workpackage-evaluation.md) with a typed evidence contract, pure deterministic rubric and synthetic regression corpus. This scores evidence, not people. It adds no data collection or Scan/Dream integration.
 
@@ -80,15 +80,17 @@ These are trace-derived indicators. They help locate sessions worth inspecting; 
 
 - Copilot: `COPILOT_HOME` or `~/.copilot`, using `session-state/*/events.jsonl`.
 - Codex: `CODEX_HOME` or `~/.codex`, using `sessions/**/*.jsonl` and `archived_sessions/**/*.jsonl`. The normalizer handles native Codex session metadata, turn context, lifecycle events, response items, tool calls, and cumulative token samples.
-- Claude: `~/.claude`, using generic JSONL discovery. Claude-specific event normalization is not yet first-class.
+- Claude: `~/.claude`, including native `projects/**/*.jsonl` transcripts. See [Claude adapter](docs/claude-adapter.md) for streaming deduplication, usage semantics and unknowns.
 
-Codex and Copilot traces are supported natively. Unknown or incomplete event fields remain explicit rather than being guessed.
+Unknown or incomplete event fields remain explicit rather than being guessed.
 
 ## Repo Filtering
 
 `lunaobs scan` detects the current repo with `git rev-parse --show-toplevel`, falling back to `process.cwd()`.
 
-Sessions are included when hook `cwd` is inside the repo or when tool path arguments mostly point inside the repo. Unclear sessions are marked ambiguous. Clearly unrelated sessions are excluded. Use `--all-repos` to disable filtering while preserving the repository observed in each trace. Git worktree pointers resolve to their shared repository; deleted Codex worktrees are also collapsed when the same scan contains one unambiguous durable root with the same repository name.
+Sessions are included when hook `cwd` is inside the repo or when tool path arguments mostly point inside the repo. Unclear sessions are marked ambiguous. Clearly unrelated sessions are excluded. Windows drive and UNC paths use Windows path rules even when Scan runs on another platform, so nested working directories can match the selected repository.
+
+Use `--all-repos` to disable filtering and group observed working directories by repository root. Available Git metadata resolves nested directories and worktree pointers to their shared repository. For unavailable paths, recognized repository and worktree path layouts supply inferred grouping roots. Deleted Codex worktrees are also collapsed when the same scan contains one unambiguous durable root with the same repository name. These grouping rules do not verify task/attempt attribution; see [correlation rules](docs/session-correlation.md).
 
 ## Output Structure
 
@@ -123,7 +125,7 @@ Sessions are included when hook `cwd` is inside the repo or when tool path argum
 
 ## Privacy
 
-LunaObs does not copy raw `encryptedContent` or `reasoningOpaque` into reports. The scaffold records only boolean flags such as `hasEncryptedContent` and `hasOpaqueReasoning`, plus metrics and source references. It does not capture full chat transcripts.
+LunaObs does not copy raw `encryptedContent` or `reasoningOpaque` into reports. For those fields, it records boolean flags such as `hasEncryptedContent` and `hasOpaqueReasoning`, plus metrics and source references. Normalized Scan output retains plaintext messages and tool arguments from traces; keep real traces and generated artifacts private.
 
 ## Limitations
 
@@ -135,4 +137,8 @@ LunaObs is still a small v0 evidence analyzer, not a task benchmark or semantic 
 - Redundancy detection recognizes exact canonical tool calls within an unchanged edit state. It can miss semantically equivalent calls, and an intentional fresh read may still need human interpretation.
 - Instruction and claim checks depend on text and evidence captured in the trace. Missing or ambiguous evidence yields `insufficient` or `unknown`, not a positive score.
 - Token fields, changed-file and changed-line counts, AI credits, and estimated cost depend on what the source trace exposes. Unsupported values remain unavailable rather than being estimated.
-- Claude JSONL discovery exists, but Claude-specific normalization and validation still need implementation and real-session coverage.
+- Claude native normalization has synthetic regression coverage; real-session scoring and independent attribution adjudication remain separate work.
+
+## Session-to-attempt correlation
+
+`lunaobs correlate --logs /fictional/traces --tasks /fictional/task-records.json --out /fictional/correlation.json` joins local traces to caller-supplied typed Firstmate records. It emits matched, ambiguous or unmatched identities with evidence kinds and digests; it does not score sessions. See [correlation rules and limits](docs/session-correlation.md) and the fully fictional `tests/fixtures/correlation-tasks.json` example.

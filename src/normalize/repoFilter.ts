@@ -1,6 +1,5 @@
-import { extractPathLikeValues, isPathInside, repositoryRootForPath } from "../utils/pathMatch.js";
+import { extractPathLikeValues, isPathInside, pathStyle, repositoryRootForPath } from "../utils/pathMatch.js";
 import type { EvidenceRef, NormalizedSession } from "./types.js";
-import path from "node:path";
 
 export type RepoFilterDecision = {
   sessionId: string;
@@ -94,7 +93,7 @@ export function canonicalizeObservedRepoRoots(sessions: NormalizedSession[]): vo
   for (const session of sessions) {
     const root = session.repoRoot;
     if (!root || isEphemeralCodexWorktree(root)) continue;
-    const name = path.basename(root.replace(/[\\/]+$/, "")).toLowerCase();
+    const name = pathStyle(root).basename(root.replace(/[\\/]+$/, "")).toLowerCase();
     const roots = durableByName.get(name) ?? new Set<string>();
     roots.add(root);
     durableByName.set(name, roots);
@@ -103,7 +102,7 @@ export function canonicalizeObservedRepoRoots(sessions: NormalizedSession[]): vo
   for (const session of sessions) {
     const root = session.repoRoot;
     if (!root || !isEphemeralCodexWorktree(root)) continue;
-    const name = path.basename(root.replace(/[\\/]+$/, "")).toLowerCase();
+    const name = pathStyle(root).basename(root.replace(/[\\/]+$/, "")).toLowerCase();
     const durable = [...(durableByName.get(name) ?? [])];
     if (durable.length === 1) session.repoRoot = durable[0];
   }

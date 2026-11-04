@@ -217,12 +217,11 @@ The module has no collection, persistence or retention policy implementation.
 Public fixtures contain only invented identifiers and synthetic URIs. Keep raw
 prompts, secrets and private session content out of public packets and reports.
 
-**Next slice:** separately reviewed Claude Code JSONL ingestion (including
-message/usage deduplication), trace-to-task/attempt correlation, final-state check
-freshness and curated evidence adapters. Firstmate integration and any dashboard
-visualisation are later slices needing separate approval. No integration,
-telemetry collection, real-session evaluation or independent research process
-was added here.
+The second slice adds [Claude Code ingestion](claude-adapter.md) and
+[trace-to-task/attempt correlation](session-correlation.md) alongside this module.
+Final-state check freshness, curated evidence adapters, live Firstmate integration
+and dashboard visualisation remain later work needing separate approval.
+Real-session evaluation and independent adjudication are not implemented.
 
 ## Prior-art credit
 

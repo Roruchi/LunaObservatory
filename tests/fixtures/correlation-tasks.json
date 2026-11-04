@@ -1,0 +1,18 @@
+[
+  {
+    "taskId": "fictional-nebula",
+    "attemptId": "fictional-nebula-attempt-a",
+    "project": "fictional-observatory",
+    "harness": "claude",
+    "spawnGeneration": "fictional-generation-a",
+    "branchName": "fm/fictional-nebula",
+    "worktreePath": "/fictional/worktrees/nebula",
+    "steeringInboxPath": "/fictional/state/fictional-nebula.inbox",
+    "startedAt": "2026-01-01T09:59:00Z",
+    "endedAt": "2026-01-01T10:02:00Z",
+    "provenance": {
+      "uri": "fixture:fictional-dispatch",
+      "digest": "synthetic-digest"
+    }
+  }
+]
