@@ -383,13 +383,28 @@ export function executionDirectory(tool: NormalizedToolCall): string | undefined
   let command = (toolCommand(tool) ?? "").trim().replace(/^rtk\s+(?:proxy\s+)?/i, "");
   const prefix = /^(?:cd|set-location)\s+(?:"([^"]+)"|'([^']+)'|([^\s;|&]+))\s*(?:&&|;)\s*/i;
   let match: RegExpExecArray | null;
-  while ((match = prefix.exec(command))) {
-    context = resolveExecutionPath(match[1] ?? match[2] ?? match[3], context);
+  while (true) {
+    if (/[$`]/.test(command)) return undefined;
+    match = /^(?:\/(?:usr\/)?bin\/)?(?:bash|sh)\s+-(?:lc|cl|c)\s+(?:'([^']*)'|"([^"]*)")\s*$/i.exec(command);
+    if (match) {
+      command = (match[1] ?? match[2]).trim().replace(/^rtk\s+(?:proxy\s+)?/i, "");
+      continue;
+    }
+    match = prefix.exec(command);
+    if (!match) break;
+    const directory = match[1] ?? match[2] ?? match[3];
+    if (directory === "-" || /[*?{}]/.test(directory)) return undefined;
+    context = resolveExecutionPath(directory, context);
     command = command.slice(match[0].length).replace(/^rtk\s+(?:proxy\s+)?/i, "");
   }
-  if (/(?:^|[;&]\s*)(?:cd|set-location)\s/i.test(command)) return undefined;
+  if (/(?:^|[\s;&|])(?:\/(?:usr\/)?bin\/)?(?:bash|sh|zsh|pwsh|powershell|cmd)(?:\s|$)/i.test(command)) return undefined;
+  if (/\b(?:cd|set-location|pushd|popd|source|eval)\s/i.test(command)) return undefined;
   match = /^git\s+-C\s+(?:"([^"]+)"|'([^']+)'|([^\s;|&]+))/i.exec(command);
-  if (match) context = resolveExecutionPath(match[1] ?? match[2] ?? match[3], context);
+  if (match) {
+    const directory = match[1] ?? match[2] ?? match[3];
+    if (/[*?{}]/.test(directory)) return undefined;
+    context = resolveExecutionPath(directory, context);
+  }
   return context;
 }
 
@@ -397,6 +412,11 @@ export function executionScope(tool: NormalizedToolCall): string | undefined {
   const directory = executionDirectory(tool);
   const root = resolveExecutionPath(tool.executionRoot);
   return directory && root && (directory === root || directory.startsWith(`${root}/`)) ? root : directory;
+}
+
+export function executionScopesMatch(left: string | undefined, right: string | undefined): boolean {
+  const scope = resolveExecutionPath(left);
+  return Boolean(scope && scope === resolveExecutionPath(right));
 }
 
 export function isViewTool(tool: NormalizedToolCall): boolean {
@@ -448,7 +468,7 @@ export function canonicalCommand(command: string): string {
 
 export function verificationLaneKey(tool: NormalizedToolCall): string {
   const command = canonicalCommand(toolCommand(tool) ?? tool.name);
-  const workdir = executionDirectory(tool) ?? "unknown-workdir";
+  const workdir = executionDirectory(tool) ?? `unknown-workdir:${tool.toolCallId}`;
   const packageScript = /\b(npm|pnpm|yarn|bun)\s+(?:run\s+)?((?:test|build|lint|check|validate|typecheck)(?:[:_-][\w-]+)*)\b/.exec(command);
   if (packageScript) return `${workdir}|${packageScript[1]}:${packageScript[2]}|${command}`;
   const godot = /\btools\/godot\.ps1\b.*?\b(parse|boot|test|export(?:-web)?|check-android-env)\b/.exec(command);
@@ -473,37 +493,45 @@ export function canonicalToolSignature(tool: NormalizedToolCall): string {
 
 export function verificationClosureForTools(tools: NormalizedToolCall[]): VerificationClosure {
   const semanticTools = expandToolCalls(tools);
-  const lastEdit = semanticTools.reduce((last, tool, index) => (isDirectEdit(tool.name) && tool.status === "completed" ? index : last), -1);
-  if (lastEdit < 0) return "not_applicable";
-  const checks = semanticTools
-    .map((tool, index) => ({ tool, index }))
-    .filter(({ tool, index }) => index > lastEdit && looksLikeVerificationTool(tool));
-  if (!checks.length) return "missing";
-
-  const finalByLane = new Map<string, NormalizedToolCall["status"]>();
-  for (const { tool } of checks) finalByLane.set(verificationLaneKey(tool), tool.status);
-  const finalStatuses = [...finalByLane.values()];
+  const lastEditByScope = new Map<string | undefined, number>();
+  semanticTools.forEach((tool, index) => {
+    if (isDirectEdit(tool.name) && tool.status === "completed") lastEditByScope.set(executionScope(tool), index);
+  });
+  if (!lastEditByScope.size) return "not_applicable";
+  const finalStatuses: NormalizedToolCall["status"][] = [];
+  for (const [scope, lastEdit] of lastEditByScope) {
+    const finalByLane = new Map<string, NormalizedToolCall["status"]>();
+    if (scope) semanticTools.forEach((tool, index) => {
+      if (index > lastEdit && looksLikeVerificationTool(tool) && executionScopesMatch(scope, executionScope(tool))) {
+        finalByLane.set(verificationLaneKey(tool), tool.status);
+      }
+    });
+    finalStatuses.push(...(finalByLane.size ? finalByLane.values() : ["unknown" as const]));
+  }
   if (finalStatuses.some((status) => status === "failed")) return "failed";
   if (finalStatuses.every((status) => status === "completed")) return "passed";
   return "missing";
 }
 
 export function repeatedFailureStats(tools: NormalizedToolCall[]): { repeated: number; failed: number } {
-  const activeFailures = new Map<string, number>();
+  const activeFailures = new Map<string, { attempts: number; scope?: string }>();
   let repeated = 0;
   let failed = 0;
   for (const tool of expandToolCalls(tools)) {
     if (isDirectEdit(tool.name) && tool.status === "completed") {
-      activeFailures.clear();
+      const scope = executionScope(tool);
+      for (const [key, failure] of activeFailures) {
+        if (executionScopesMatch(scope, failure.scope)) activeFailures.delete(key);
+      }
       continue;
     }
     if (!isCommandTool(tool)) continue;
     const key = canonicalToolSignature(tool);
     if (tool.status === "failed") {
       failed += 1;
-      const attempts = activeFailures.get(key) ?? 0;
+      const attempts = activeFailures.get(key)?.attempts ?? 0;
       if (attempts > 0) repeated += 1;
-      activeFailures.set(key, attempts + 1);
+      activeFailures.set(key, { attempts: attempts + 1, scope: executionScope(tool) });
     } else if (tool.status === "completed") {
       activeFailures.delete(key);
     }

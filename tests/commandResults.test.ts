@@ -3,23 +3,25 @@ import { normalizeEventsToSession } from "../src/normalize/sessions.js";
 import { scoreSession } from "../src/scoring/score.js";
 import type { RawLogEvent } from "../src/normalize/types.js";
 
-type Call = { name: string; args: unknown; output: unknown; turn?: string };
+type Call = { name: string; args: unknown; output: unknown; turn?: string; cwd?: string };
 const edit: Call = { name: "apply_patch", args: "patch", output: "Done" };
 const envelope = (exit_code: number | null, session_id?: number, output = "") => ({ exit_code, session_id, output });
 const wrapped = (script: string, results: unknown[]): Call => ({ name: "exec", args: script, output: JSON.stringify(results) });
 
-function capture(calls: Call[], source: "codex" | "copilot" = "codex") {
+function capture(calls: Call[], source: "codex" | "copilot" = "codex", nativeCwd: string | null = "/repo/a") {
   const events: RawLogEvent[] = [];
   function add(type: string, data: unknown) {
     events.push({ id: `event-${events.length}`, type, data, timestamp: new Date(Date.UTC(2026, 0, 1, 10, 0, events.length)).toISOString(), sourceFile: "fictional.jsonl", lineNumber: events.length + 1 });
   }
+  if (nativeCwd) add(source === "codex" ? "session_meta" : "session.start", source === "codex" ? { cwd: nativeCwd } : { context: { cwd: nativeCwd } });
   for (const [index, call] of calls.entries()) {
     const id = `call-${index}`;
     if (source === "codex") {
+      if (call.cwd) add("turn_context", { turn_id: call.turn ?? "one", cwd: call.cwd });
       add("response_item", { type: "function_call", call_id: id, name: call.name, arguments: JSON.stringify(call.args), turn_id: call.turn ?? "one" });
       add("response_item", { type: "function_call_output", call_id: id, output: call.output, turn_id: call.turn ?? "one" });
     } else {
-      add("tool.execution_start", { toolCallId: id, toolName: call.name, arguments: call.args, turnId: call.turn ?? "one" });
+      add("tool.execution_start", { toolCallId: id, toolName: call.name, arguments: call.args, cwd: call.cwd, turnId: call.turn ?? "one" });
       add("tool.execution_complete", { toolCallId: id, toolName: call.name, success: true, result: call.output, turnId: call.turn ?? "one" });
     }
   }
@@ -227,5 +229,58 @@ describe("command polling identity", () => {
       { name: "write_stdin", args: { session_id: 101, chars: "" }, output: envelope(0) }
     ]);
     expect(session.metrics.verificationClosure).toBe("missing");
+  });
+});
+
+
+describe("scoped session verification", () => {
+  it.each(["codex", "copilot"] as const)("rejects foreign checks before scoring completed %s sessions", source => {
+    for (const check of [
+      { name: "exec_command", args: { cmd: "npm test", workdir: "/repo/b" }, output: envelope(0) },
+      { name: "exec_command", args: JSON.stringify({ arguments: JSON.stringify({ command: "npm test", workdir: "/repo/b" }) }), output: envelope(0) },
+      wrapped('text(await tools.exec_command({cmd:"npm test",workdir:"/repo/b"}));', [envelope(0)])
+    ]) {
+      const session = capture([edit, check], source);
+      session.lifecycleStatus = "completed";
+      expect(session.metrics.verificationClosure).toBe("missing");
+      expect(scoreSession(session).outcomeScore).toBe(50);
+    }
+    const genuine = capture([edit, { name: "exec_command", args: { cmd: "npm test" }, output: envelope(0) }], source);
+    genuine.lifecycleStatus = "completed";
+    expect(genuine.metrics.verificationClosure).toBe("passed");
+    expect(scoreSession(genuine).outcomeScore).toBe(90);
+  });
+
+  it.each(["codex", "copilot"] as const)("requires fresh verification for every edited %s scope", source => {
+    const editA = { ...edit, cwd: "/repo/a" };
+    const editB = { ...edit, cwd: "/repo/b" };
+    const checkA: Call = { name: "exec_command", args: { cmd: "npm test" }, output: envelope(0), cwd: "/repo/a" };
+    const checkB = { ...checkA, cwd: "/repo/b" };
+    expect(capture([editA, checkA, editB, checkB], source).metrics.verificationClosure).toBe("passed");
+    expect(capture([editA, editB, checkB], source).metrics.verificationClosure).toBe("missing");
+    expect(capture([editA, { ...checkA, output: envelope(1) }, editB, checkB], source).metrics.verificationClosure).toBe("failed");
+    expect(capture([editA, checkA, editA, editB, checkB], source).metrics.verificationClosure).toBe("missing");
+    const unknownEdit = capture([edit, { ...checkA, args: { cmd: "npm test", workdir: "/repo/a" } }], source, null);
+    expect(unknownEdit.metrics.verificationClosure).toBe("missing");
+  });
+
+  it.each(["codex", "copilot"] as const)("honors wrapped shell execution contexts for %s", source => {
+    for (const [cmd, matching] of [
+      ["rtk proxy bash -lc 'cd /repo/b && npm test'", false],
+      ["rtk proxy sh -c 'cd ../b && npm test'", false],
+      ['rtk proxy bash -lc "cd /repo/a && npm test"', true],
+      ["rtk proxy sh -c 'cd src && npm test'", true],
+      ["bash -lc 'npm test'", true],
+      ["rtk proxy bash -lc 'cd $TARGET && npm test'", false],
+      ["rtk proxy bash -lc 'cd /repo/$TARGET && npm test'", false],
+      ["env bash -lc 'cd /repo/b && npm test'", false]
+    ] as const) for (const exit of [0, 1]) for (const nested of [true, false]) {
+      const check = nested ? wrapped(`text(await tools.exec_command(${JSON.stringify({ cmd })}));`, [envelope(exit)])
+        : { name: "exec_command", args: { cmd }, output: envelope(exit) };
+      const session = capture([edit, check], source);
+      session.lifecycleStatus = "completed";
+      expect(session.metrics.verificationClosure, `${source}: ${cmd}, exit=${exit}, nested=${nested}`).toBe(matching ? exit === 0 ? "passed" : "failed" : "missing");
+      expect(scoreSession(session).outcomeScore).toBe(matching ? exit === 0 ? 90 : 30 : 50);
+    }
   });
 });

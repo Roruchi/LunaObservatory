@@ -2,6 +2,7 @@ import {
   expandToolCalls,
   executionDirectory,
   executionScope,
+  executionScopesMatch,
   resolveExecutionPath,
   isEditTool,
   isGlobTool,
@@ -387,7 +388,7 @@ export function repositoryVerificationMatches(change: DreamChangeClassification,
   if (!scope || !target || !checkScope) return false;
   if (!["product_code", "tests", "documentation", "repository_metadata"].includes(change.changeType)) return false;
   return (target === scope || target.startsWith(`${scope}/`)) &&
-    checkScope === scope;
+    executionScopesMatch(scope, checkScope);
 }
 
 function isRepoPath(target: string, executionScope?: string): boolean {

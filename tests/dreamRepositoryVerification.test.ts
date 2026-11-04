@@ -399,3 +399,20 @@ describe("verification coverage boundaries", () => {
     expect(report.scores.find(score => score.category === "Verification quality")?.score).toBe(matches ? 5 : 0);
   });
 });
+
+
+it("uses wrapped execution context consistently in session metrics and frozen Dream", () => {
+  for (const [cmd, target, matching] of [
+    ["rtk proxy bash -lc 'cd /repo/b && npm test'", "repo:/repo/b", false],
+    ["rtk proxy sh -c 'cd /repo/a/src && npm test'", "repo:/repo/a", true],
+    ["rtk proxy bash -lc 'cd $TARGET && npm test'", undefined, false]
+  ] as const) for (const exit of [0, 1]) {
+    const session = dreamCapture("/repo/a", cmd, undefined, exit);
+    expect(session.metrics.verificationClosure).toBe(matching ? exit === 0 ? "passed" : "failed" : "missing");
+    const { packet, report } = frozenVerification(session);
+    const check = packet.selectedSessions[0].tasks![0].verificationChecks[0];
+    expect(check.target).toBe(target);
+    expect(check.fresh).toBe(matching);
+    expect(report.scores.find(score => score.category === "Verification quality")?.score).toBe(matching && exit === 0 ? 5 : 0);
+  }
+});
