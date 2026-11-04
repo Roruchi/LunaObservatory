@@ -6,6 +6,8 @@ import { scoreSession } from "../src/scoring/score.js";
 import { parseSessionFile } from "../src/normalize/parser.js";
 import {
   commandResults,
+  executionDirectory,
+  executionScope,
   expandToolCalls,
   toolCommand,
   canonicalToolSignature,
@@ -282,5 +284,62 @@ describe("command completion evidence", () => {
         }
       }
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+
+describe("resolved execution identity", () => {
+  const command = (id: string, cwd: string | undefined, status: NormalizedToolCall["status"] = "completed"): NormalizedToolCall => ({
+    toolCallId: id, name: "exec_command", arguments: { cmd: "npm test" }, status,
+    executionCwd: cwd, executionRoot: "/repo/a"
+  });
+
+  it("keeps native cwd separate from native worktree scope", () => {
+    const child = command("child", "/repo/a/packages/ui");
+    expect(executionDirectory(child)).toBe("/repo/a/packages/ui");
+    expect(executionScope(child)).toBe("/repo/a");
+    const foreign = command("foreign", "/repo/b");
+    expect(executionScope(foreign)).toBe("/repo/b");
+    expect(executionScope(command("unknown", undefined))).toBeUndefined();
+  });
+
+  it("uses resolved native cwd for closure, recovery, failure episodes, and duplicates", () => {
+    const edit = tool("apply_patch", "completed", "patch", "edit");
+    const failure = command("failed-root", "/repo/a", "failed");
+    const childPass = command("passed-child", "/repo/a/packages/ui");
+    const rootPass = command("passed-root", "/repo/a");
+    expect(verificationLaneKey(failure)).not.toBe(verificationLaneKey(childPass));
+    expect(canonicalToolSignature(failure)).not.toBe(canonicalToolSignature(childPass));
+    expect(verificationClosureForTools([edit, failure, childPass])).toBe("failed");
+    expect(verificationClosureForTools([edit, failure, childPass, rootPass])).toBe("passed");
+    expect(repeatedFailureStats([failure, childPass, { ...failure, toolCallId: "failed-again" }])).toEqual({ repeated: 1, failed: 2 });
+    expect(redundantToolStats([rootPass, childPass])).toEqual({ duplicate: 0, comparable: 2 });
+    expect(redundantToolStats([rootPass, { ...rootPass, toolCallId: "root-again" }])).toEqual({ duplicate: 1, comparable: 2 });
+  });
+
+  it.each(["npm test", "rtk npm test", "rtk proxy npm test"])("resolves relative workdirs for %s", cmd => {
+    const call = { ...command("relative", "/repo/a"), arguments: { cmd, workdir: "packages/ui" } };
+    expect(executionDirectory(call)).toBe("/repo/a/packages/ui");
+    expect(verificationLaneKey(call)).toMatch(/^\/repo\/a\/packages\/ui\|/);
+    expect(executionDirectory({ ...call, executionCwd: undefined })).toBeUndefined();
+  });
+
+  it.each(["git", "rtk git", "rtk proxy git"])("uses %s -C in the shared lane identity", prefix => {
+    const call = { ...command("git", "/repo/a"), arguments: { cmd: `${prefix} -C ../b diff --check` } };
+    expect(executionDirectory(call)).toBe("/repo/b");
+    expect(verificationLaneKey(call)).toMatch(/^\/repo\/b\|/);
+  });
+
+  it("carries native scope and cwd through nested operations", () => {
+    const wrapper = { ...command("wrapper", "/repo/a/src"), name: "exec", arguments: 'text(await tools.exec_command({cmd:"npm test",workdir:".."}));' };
+    const nested = expandToolCalls([wrapper])[0];
+    expect(nested.executionRoot).toBe("/repo/a");
+    expect(nested.executionCwd).toBe("/repo/a/src");
+    expect(executionDirectory(nested)).toBe("/repo/a");
+  });
+
+  it("does not conflate relative reads in different directories", () => {
+    const read = { ...command("read", "/repo/a"), name: "view", arguments: { path: "images/chart.png" } };
+    expect(redundantToolStats([read, { ...read, toolCallId: "other-read", executionCwd: "/repo/b" }]).duplicate).toBe(0);
   });
 });

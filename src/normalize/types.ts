@@ -114,6 +114,7 @@ export type CommandResult = {
 
 export type NormalizedToolCall = {
   executionCwd?: string;
+  executionRoot?: string;
   exitCode?: number;
   toolCallId: string;
   name: string;

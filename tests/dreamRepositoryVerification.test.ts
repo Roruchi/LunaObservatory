@@ -117,7 +117,7 @@ describe("Dream authoritative outcomes and repository scope", () => {
     ] as const) {
       const task = analyzeDreamTasks(dreamCapture(root, cmd, workdir))[0];
       expect(task.verificationChecks[0].fresh, `${root}: ${cmd} in ${workdir}`).toBe(matches);
-      if (matches) expect(task.verificationChecks[0].target).toBe(workdir === "packages/ui" ? "repo:/repo/a/packages/ui" : "repo:/repo/a");
+      if (matches) expect(task.verificationChecks[0].target).toBe("repo:/repo/a");
     }
   });
 
@@ -209,6 +209,7 @@ describe("native cwd provenance", () => {
     session.repoRoot = "/repo/main";
     const tools = session.turns.flatMap(turn => turn.toolCalls);
     expect(tools.map(tool => tool.executionCwd)).toEqual(["/linked/a", checkCwd]);
+    expect(tools.map(tool => tool.executionRoot)).toEqual(["/repo/main", "/repo/main"]);
     const task = analyzeDreamTasks(session)[0];
     expect(task.changes[0]).toMatchObject({ target: "/linked/a/map.ts", executionScope: "/linked/a", stateChanging: true });
     expect(task.verificationChecks[0]).toMatchObject({ target: `repo:${checkCwd}`, status: "passed", fresh: checkCwd === "/linked/a" });
@@ -224,6 +225,7 @@ describe("native cwd provenance", () => {
     const session = normalizeEventsToSession(nativeEvents(events), "copilot", "native.jsonl");
     const tool = session.turns.flatMap(turn => turn.toolCalls)[0];
     expect(tool.executionCwd).toBe("/linked/a");
+    expect(tool.executionRoot).toBe(contextSource === "session" ? "/linked/a" : undefined);
     expect(analyzeDreamTasks(session)[0].verificationChecks[0]).toMatchObject({ target: "repo:/linked/a", status: "passed" });
   });
 
@@ -248,4 +250,68 @@ it("does not let one execution scope satisfy a sibling scope during frozen valid
     task.changes.push({ ...sibling.changes[0], changeId: "sibling-change", actionIndex: 2 });
     expect(validateDreamPacket(packet).scores.find(score => score.category === "Verification quality")?.score).toBe(3);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+
+describe("execution cwd and native worktree scope", () => {
+  it.each(["/repo/a", "/linked/worktree/a", "/home/user/.codex/worktrees/deleted/a"])("accepts root checks for child edits in %s", nativeRoot => {
+    for (const [command, file] of [
+      ["npm test", "map.ts"], ["npm run typecheck", "map.ts"], ["npm run lint", "map.ts"],
+      ["npm run build", "map.ts"], ["npm run docs:build", "guide.md"], ["rtk proxy git diff --check", "map.ts"]
+    ]) {
+      const session = normalizeEventsToSession(nativeEvents([
+        ["session_meta", { id: "root-worker", cwd: nativeRoot }],
+        ["turn_context", { turn_id: "one", cwd: `${nativeRoot}/src` }],
+        ["response_item", { type: "message", role: "user", content: [{ type: "input_text", text: "Fix and verify." }] }],
+        ["response_item", { type: "function_call", call_id: "edit", name: "apply_patch", arguments: JSON.stringify(`*** Begin Patch\n*** Update File: ${file}\n*** End Patch`) }],
+        ["response_item", { type: "function_call_output", call_id: "edit", output: "Success" }],
+        ["response_item", { type: "function_call", call_id: "check", name: "exec_command", arguments: JSON.stringify({ cmd: command, workdir: nativeRoot }) }],
+        ["response_item", { type: "function_call_output", call_id: "check", output: { exit_code: 0, output: "ok" } }]
+      ]), "codex", "native.jsonl");
+      session.repoRoot = "/grouped/main";
+      const task = analyzeDreamTasks(session)[0];
+      expect(task.changes[0]).toMatchObject({ executionScope: nativeRoot, target: `${nativeRoot}/src/${file}`, stateChanging: true });
+      expect(task.verificationChecks[0], command).toMatchObject({ target: `repo:${nativeRoot}`, fresh: true, status: "passed" });
+    }
+  });
+
+  it("keeps different native cwd lanes distinct through frozen Dream validation", () => {
+    const root = fs.mkdtempSync(path.resolve("tests/.dream-lanes-"));
+    try {
+      const session = dreamCapture("/repo/a", "npm test", undefined, 1);
+      const second = dreamCapture("/repo/a", "npm test");
+      const secondCall = second.turns.flatMap(turn => turn.toolCalls)[0];
+      secondCall.toolCallId = "second-wrapper";
+      secondCall.name = "exec_command";
+      secondCall.arguments = { cmd: "npm test" };
+      secondCall.commandResults = [{ status: "completed" }];
+      secondCall.executionCwd = "/repo/a/packages/ui";
+      session.turns.at(-1)!.toolCalls.push(secondCall);
+      writeJsonl(path.join(root, "sessions.jsonl"), [session]);
+      writeJsonl(path.join(root, "inefficiency-scores.jsonl"), [scoreSession(session)]);
+      const packet = prepareDreamPacket(root, 1);
+      const checks = packet.selectedSessions[0].tasks![0].verificationChecks;
+      expect(checks.map(check => check.fresh)).toEqual([true, true]);
+      expect(checks.map(check => check.status)).toEqual(["failed", "passed"]);
+      expect(checks[0].lane).not.toBe(checks[1].lane);
+      expect(validateDreamPacket(packet).scores.find(score => score.category === "Verification quality")?.score).toBe(0);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(["view_image", "view", "glob", "imagegen_inspect", "shell_command"])("resolves relative filesystem verification for %s", name => {
+    const session = dreamCapture("/repo/a", "npm test");
+    const edit = session.turns.flatMap(turn => turn.toolCalls)[0];
+    edit.name = "write_file";
+    edit.arguments = { path: "images/chart.png" };
+    const check = { ...edit, toolCallId: "file-check", name,
+      arguments: name === "shell_command" ? { command: "cat images/chart.png" } : { path: "images/chart.png" }, outputText: "image contents" };
+    session.turns.at(-1)!.toolCalls.push(check);
+    const task = analyzeDreamTasks(session)[0];
+    expect(task.changes[0].target).toBe("/repo/a/images/chart.png");
+    expect(task.verificationChecks[0]).toMatchObject({ target: "/repo/a/images/chart.png", fresh: name === "view_image" || name === "view" || name === "imagegen_inspect" || name === "shell_command" });
+    check.executionCwd = "/repo/b";
+    expect(analyzeDreamTasks(session)[0].verificationChecks[0].fresh).toBe(false);
+    check.executionCwd = undefined;
+    expect(analyzeDreamTasks(session)[0].verificationChecks[0].target).toBeUndefined();
+  });
 });

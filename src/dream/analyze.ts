@@ -1,6 +1,8 @@
-import path from "node:path";
 import {
   expandToolCalls,
+  executionDirectory,
+  executionScope,
+  resolveExecutionPath,
   isEditTool,
   isGlobTool,
   isViewTool,
@@ -385,7 +387,7 @@ export function repositoryVerificationMatches(change: DreamChangeClassification,
   if (!scope || !target || !checkScope) return false;
   if (!["product_code", "tests", "documentation", "repository_metadata"].includes(change.changeType)) return false;
   return (target === scope || target.startsWith(`${scope}/`)) &&
-    (checkScope === scope || checkScope.startsWith(`${scope}/`));
+    checkScope === scope;
 }
 
 function isRepoPath(target: string, executionScope?: string): boolean {
@@ -466,7 +468,7 @@ function mutationKind(action: OrderedAction): {
     return { mutation: true, targets };
   }
 
-  if (generatedToolNames.test(`${tool.name} ${name}`)) {
+  if (generatedToolNames.test(`${tool.name} ${name}`) && !/view|inspect|read/i.test(tool.name)) {
     const outputPaths = [...(tool.outputText ?? "").matchAll(/(?:[a-z]:)?[^\s"']+\.(?:png|jpe?g|webp|gif|svg|mp3|wav|mp4|pdf|docx|pptx|xlsx)/gi)].map(
       (match) => match[0]
     );
@@ -507,14 +509,15 @@ function classifyChanges(session: NormalizedSession, taskId: string, actions: Or
     const semantic = mutationKind(action);
     if (!semantic.mutation) continue;
     const outcome = effectiveOutcome(action.tool);
-    const executionScope = executionDirectory(action.tool);
+    const directory = executionDirectory(action.tool);
+    const scope = executionScope(action.tool);
     const rawTargets = semantic.targets.length ? semantic.targets : [undefined];
     rawTargets.forEach((rawTarget, targetIndex) => {
       const target = rawTarget === undefined ? undefined : semantic.forcedType === "external_system"
-        ? canonicalTarget(rawTarget) : resolveExecutionPath(rawTarget, executionScope);
+        ? canonicalTarget(rawTarget) : filesystemTarget(rawTarget, directory);
       const classified = semantic.forcedType
         ? { type: semantic.forcedType, confidence: semantic.confidence ?? "medium", reason: semantic.reason ?? "tool semantics" }
-        : classifyTarget(target ?? canonicalTarget(rawTarget), executionScope, semantic.shell?.operation);
+        : classifyTarget(target ?? canonicalTarget(rawTarget), scope, semantic.shell?.operation);
       const policy = DREAM_CHANGE_POLICY[classified.type];
       const refs = toDreamRefs(session.sessionId, action.tool.evidence, `${taskId}:change:${action.actionIndex}:${targetIndex}`);
       changes.push({
@@ -522,7 +525,7 @@ function classifyChanges(session: NormalizedSession, taskId: string, actions: Or
         actionIndex: action.actionIndex,
         changeType: classified.type,
         target: target ?? canonicalTarget(rawTarget),
-        executionScope,
+        executionScope: scope,
         stateChanging: outcome === "passed",
         verificationRequired: policy.verificationRequired,
         acceptableVerificationTypes: [...policy.acceptableVerificationTypes],
@@ -543,30 +546,10 @@ function classifyChanges(session: NormalizedSession, taskId: string, actions: Or
   return changes;
 }
 
-function resolveExecutionPath(value: unknown, base?: string): string | undefined {
-  if (value === undefined) return base;
-  if (typeof value !== "string") return undefined;
+function filesystemTarget(value: string | undefined, directory?: string): string | undefined {
   const target = canonicalTarget(value);
-  if (!target || /^[$%~]/.test(target)) return undefined;
-  if (path.posix.isAbsolute(target) || path.win32.isAbsolute(target)) return path.posix.normalize(target);
-  return base ? path.posix.normalize(`${base}/${target}`) : undefined;
-}
-
-function executionDirectory(tool: NormalizedToolCall): string | undefined {
-  const record = argumentRecord(tool);
-  const nested = record?.arguments as Record<string, unknown> | undefined;
-  let context = resolveExecutionPath(record?.workdir ?? nested?.workdir, resolveExecutionPath(tool.executionCwd));
-  let command = (toolCommand(tool) ?? "").trim().replace(/^rtk\s+(?:proxy\s+)?/i, "");
-  const prefix = /^(?:cd|set-location)\s+(?:"([^"]+)"|'([^']+)'|([^\s;|&]+))\s*(?:&&|;)\s*/i;
-  let match: RegExpExecArray | null;
-  while ((match = prefix.exec(command))) {
-    context = resolveExecutionPath(match[1] ?? match[2] ?? match[3], context);
-    command = command.slice(match[0].length).replace(/^rtk\s+(?:proxy\s+)?/i, "");
-  }
-  if (/(?:^|[;&]\s*)(?:cd|set-location)\s/i.test(command)) return undefined;
-  match = /^git\s+-C\s+(?:"([^"]+)"|'([^']+)'|([^\s;|&]+))/i.exec(command);
-  if (match) context = resolveExecutionPath(match[1] ?? match[2] ?? match[3], context);
-  return context;
+  if (!target) return undefined;
+  return /^%(?:codex_home|userprofile)%\//.test(target) ? target : resolveExecutionPath(target, directory);
 }
 
 function verificationType(action: OrderedAction): { type: DreamVerificationType; target?: string } | undefined {
@@ -576,7 +559,8 @@ function verificationType(action: OrderedAction): { type: DreamVerificationType;
   const normalized = command?.replace(/\\/g, "/").toLowerCase() ?? "";
   const directTargets = pathValues(argumentRecord(tool));
   const directory = executionDirectory(tool);
-  const repositoryTarget = directory ? `repo:${directory}` : undefined;
+  const scope = executionScope(tool);
+  const repositoryTarget = scope ? `repo:${scope}` : undefined;
 
   if (/\bgit\b[^\r\n;|]*\b(?:diff|status)\b/.test(normalized) || /\bdiff\s+--check\b/.test(normalized)) {
     return { type: "diff_check", target: repositoryTarget };
@@ -586,7 +570,7 @@ function verificationType(action: OrderedAction): { type: DreamVerificationType;
   // Resolve read targets before applying the broad command-name matchers below.
   const readTarget = command ? shellReadTarget(command) : undefined;
   if (readTarget) {
-    const canonical = canonicalTarget(readTarget);
+    const canonical = filesystemTarget(readTarget, directory);
     if (canonical && /%codex_home%\/automations\//.test(canonical) && /\b(?:Test-Path|Select-String)\b/i.test(command ?? "")) {
       return { type: "persistence_check", target: canonical };
     }
@@ -610,12 +594,12 @@ function verificationType(action: OrderedAction): { type: DreamVerificationType;
   if (/\b(?:build|validate|check)\b/.test(normalized)) return { type: "build", target: repositoryTarget };
 
   if (isViewTool(tool)) {
-    const target = canonicalTarget(directTargets[0]);
+    const target = filesystemTarget(directTargets[0], directory);
     return { type: target && generatedAssetPath(target) ? "asset_inspection" : "read_back", target };
   }
-  if (isGlobTool(tool)) return { type: "filesystem_check", target: canonicalTarget(directTargets[0]) };
+  if (isGlobTool(tool)) return { type: "filesystem_check", target: filesystemTarget(directTargets[0], directory) };
   if (generatedToolNames.test(tool.name) && /view|inspect|read/i.test(tool.name)) {
-    return { type: "asset_inspection", target: canonicalTarget(directTargets[0]) };
+    return { type: "asset_inspection", target: filesystemTarget(directTargets[0], directory) };
   }
   if (externalReadNames.test(tool.name) || /(?:browser|chrome|computer).*(?:screenshot|inspect|read|snapshot)/i.test(tool.name)) {
     return { type: "external_confirmation", target: canonicalTarget(directTargets[0]) };
@@ -640,7 +624,7 @@ function repoChange(change: DreamChangeClassification): boolean {
 }
 
 function targetsMatch(change: DreamChangeClassification, check: VerificationCheck): boolean {
-  if (repoChange(change)) return repositoryVerificationMatches(change, check);
+  if (repoChange(change) && check.target?.startsWith("repo:")) return repositoryVerificationMatches(change, check);
   if (!change.target || !check.target) return false;
   if (change.target === check.target) return true;
   if (change.changeType === "local_file_organization") {

@@ -233,12 +233,11 @@ function normalizedTarget(target?: string): string | undefined {
 
 function targetMatches(change: DreamChangeClassification, check: DreamTaskWindow["verificationChecks"][number]): boolean {
   if (check.target?.startsWith("repo:")) return repositoryVerificationMatches(change, check);
-  if (["product_code", "tests", "documentation", "repository_metadata"].includes(change.changeType) && (!change.target || !check.target)) return false;
-  if (!change.target || !check.target) return true;
+  if (!change.target || !check.target) return false;
   const changeTarget = normalizedTarget(change.target);
   const checkTarget = normalizedTarget(check.target);
-  if (!changeTarget || !checkTarget) return true;
-  return changeTarget === checkTarget || changeTarget.endsWith(checkTarget) || checkTarget.endsWith(changeTarget);
+  if (!changeTarget || !checkTarget) return false;
+  return changeTarget === checkTarget;
 }
 
 function changeGroupKey(change: DreamChangeClassification): string {

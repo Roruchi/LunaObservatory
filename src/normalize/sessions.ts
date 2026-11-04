@@ -152,6 +152,7 @@ function addOrUpdateTool(turn: MutableTurn, tool: NormalizedToolCall): Normalize
       ...tool,
       arguments: tool.arguments ?? existing.arguments,
       executionCwd: tool.executionCwd ?? existing.executionCwd,
+      executionRoot: tool.executionRoot ?? existing.executionRoot,
       evidence: [...(existing.evidence ?? []), ...(tool.evidence ?? [])]
     });
     return existing;
@@ -659,6 +660,7 @@ export function normalizeEventsToSession(
             name: toolName,
             arguments: parsedArgs,
             executionCwd: turnCwds.get(responseTurnId) ?? sessionCwd,
+            executionRoot: sessionCwd,
             requestedAt: event.timestamp,
             status: "requested",
             evidence: [
@@ -751,6 +753,7 @@ export function normalizeEventsToSession(
           name: toolName,
           arguments: request.arguments,
           executionCwd: stringValue(data.cwd) ?? sessionCwd,
+          executionRoot: sessionCwd,
           intentionSummary: stringValue(request.intentionSummary),
           requestedAt: event.timestamp,
           status: "requested",
@@ -776,6 +779,7 @@ export function normalizeEventsToSession(
         name: toolName,
         arguments: data.arguments,
         executionCwd: stringValue(data.cwd) ?? sessionCwd,
+        executionRoot: sessionCwd,
         executionStartedAt: event.timestamp,
         status: "started",
         evidence: [
@@ -844,6 +848,7 @@ export function normalizeEventsToSession(
           name: toolName,
           arguments: parsedArgs,
           executionCwd: stringValue(input.cwd),
+          executionRoot: sessionCwd,
           status: "unknown",
           evidence: [
             evidence(event, "data.input.toolCalls", `tool=${toolName}`),

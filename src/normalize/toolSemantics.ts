@@ -1,3 +1,4 @@
+import path from "node:path";
 import type { CommandResult, NormalizedToolCall, VerificationClosure } from "./types.js";
 
 const viewToolNames = new Set(["view", "read_file", "read_text_file", "get_file", "view_image"]);
@@ -373,7 +374,6 @@ function commandArgument(args: unknown): string | undefined {
 
 function toolWorkdir(tool: NormalizedToolCall): string | undefined {
   const args = tool.arguments;
-  if (typeof args === "string") return embeddedProperty(args, "workdir");
   if (!args || typeof args !== "object") return undefined;
   const record = args as Record<string, unknown>;
   if (typeof record.workdir === "string") return record.workdir;
@@ -382,6 +382,36 @@ function toolWorkdir(tool: NormalizedToolCall): string | undefined {
     return (nested as Record<string, unknown>).workdir as string;
   }
   return undefined;
+}
+
+export function resolveExecutionPath(value: unknown, base?: string): string | undefined {
+  if (value === undefined) return base;
+  if (typeof value !== "string") return undefined;
+  const target = value.trim().replace(/^["']|["']$/g, "").replace(/\\/g, "/").toLowerCase();
+  if (!target || /^[$%~]/.test(target)) return undefined;
+  if (path.posix.isAbsolute(target) || path.win32.isAbsolute(target)) return path.posix.normalize(target).replace(/\/$/, "");
+  return base ? path.posix.normalize(`${base}/${target}`).replace(/\/$/, "") : undefined;
+}
+
+export function executionDirectory(tool: NormalizedToolCall): string | undefined {
+  let context = resolveExecutionPath(toolWorkdir(tool), resolveExecutionPath(tool.executionCwd));
+  let command = (toolCommand(tool) ?? "").trim().replace(/^rtk\s+(?:proxy\s+)?/i, "");
+  const prefix = /^(?:cd|set-location)\s+(?:"([^"]+)"|'([^']+)'|([^\s;|&]+))\s*(?:&&|;)\s*/i;
+  let match: RegExpExecArray | null;
+  while ((match = prefix.exec(command))) {
+    context = resolveExecutionPath(match[1] ?? match[2] ?? match[3], context);
+    command = command.slice(match[0].length).replace(/^rtk\s+(?:proxy\s+)?/i, "");
+  }
+  if (/(?:^|[;&]\s*)(?:cd|set-location)\s/i.test(command)) return undefined;
+  match = /^git\s+-C\s+(?:"([^"]+)"|'([^']+)'|([^\s;|&]+))/i.exec(command);
+  if (match) context = resolveExecutionPath(match[1] ?? match[2] ?? match[3], context);
+  return context;
+}
+
+export function executionScope(tool: NormalizedToolCall): string | undefined {
+  const directory = executionDirectory(tool);
+  const root = resolveExecutionPath(tool.executionRoot);
+  return directory && root && (directory === root || directory.startsWith(`${root}/`)) ? root : directory;
 }
 
 export function isViewTool(tool: NormalizedToolCall): boolean {
@@ -433,9 +463,7 @@ export function canonicalCommand(command: string): string {
 
 export function verificationLaneKey(tool: NormalizedToolCall): string {
   const command = canonicalCommand(toolCommand(tool) ?? tool.name);
-  const explicitWorkdir = toolWorkdir(tool)?.replace(/\\/g, "/").replace(/\/$/, "").toLowerCase();
-  const commandWorkdir = /(?:^|[;&|]\s*)(?:cd|set-location)\s+["']?([^"';|]+)["']?/i.exec(command)?.[1]?.trim();
-  const workdir = explicitWorkdir ?? commandWorkdir ?? "unknown-workdir";
+  const workdir = executionDirectory(tool) ?? "unknown-workdir";
   const packageScript = /\b(npm|pnpm|yarn|bun)\s+(?:run\s+)?((?:test|build|lint|check|validate|typecheck)(?:[:_-][\w-]+)*)\b/.exec(command);
   if (packageScript) return `${workdir}|${packageScript[1]}:${packageScript[2]}|${command}`;
   const godot = /\btools\/godot\.ps1\b.*?\b(parse|boot|test|export(?:-web)?|check-android-env)\b/.exec(command);
@@ -455,7 +483,7 @@ export function canonicalToolSignature(tool: NormalizedToolCall): string {
     if (!toolCommand(tool)) return `${baseToolName(tool.name)}:unknown:${tool.toolCallId}`;
     return `${baseToolName(tool.name)}:${verificationLaneKey(tool)}`;
   }
-  return `${baseToolName(tool.name)}:${JSON.stringify(stableValue(tool.arguments))}`;
+  return `${baseToolName(tool.name)}:${executionDirectory(tool) ?? "unknown-workdir"}:${JSON.stringify(stableValue(tool.arguments))}`;
 }
 
 export function verificationClosureForTools(tools: NormalizedToolCall[]): VerificationClosure {
