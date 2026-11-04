@@ -40,7 +40,7 @@ export type Correlation = {
 const canonicalPath = (value: string) => value.replace(/\\/g, "/").replace(/\/+$/, "");
 const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-/** The default consumes normalized evidence only. CLI adds native header fields below. */
+/** The default consumes normalized evidence only. */
 export function sessionObservations(session: NormalizedSession): SessionObservations {
   return {
     branches: session.attribution?.branches ?? [],

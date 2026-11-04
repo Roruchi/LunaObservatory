@@ -6,7 +6,7 @@ Build with `npm run build`, then run locally:
 node dist/cli.js correlate --logs /fictional/traces --tasks /fictional/task-records.json --out /fictional/correlation.json
 ```
 
-There is no network access or automatic Firstmate home discovery. The caller supplies a JSON array of task records exported or curated from verifiable Firstmate records. See `tests/fixtures/correlation-tasks.json` for a fully fictional example. Required fields are `taskId`, `attemptId` (nullable), `project`, `harness` (`claude`, `codex`, `copilot`), `spawnGeneration` (nullable), `startedAt`, `endedAt` (nullable), and `provenance: {uri, digest}`. Optional fields are `branchName`, `worktreePath`, and `steeringInboxPath`. Invalid records and reversed task windows are rejected. Digests identify supplied evidence; this tool cannot authenticate an export or independently validate a caller's claim of provenance.
+There is no network access or automatic Firstmate home discovery. The caller supplies a JSON array of task records exported or curated from verifiable Firstmate records. The authoritative [task record schemas](../src/correlation/index.ts) define required and optional fields, nullability and validation; see [the fictional task records](../tests/fixtures/correlation-tasks.json) for an example. Invalid records and reversed task windows are rejected. Digests identify supplied evidence; this tool cannot authenticate an export or independently validate a caller's claim of provenance.
 
 A matched session requires one unique compatible record with a known attempt ID, a complete overlapping session/attempt time window, the same harness, and at least one task identity anchor:
 

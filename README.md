@@ -88,7 +88,9 @@ Unknown or incomplete event fields remain explicit rather than being guessed.
 
 `lunaobs scan` detects the current repo with `git rev-parse --show-toplevel`, falling back to `process.cwd()`.
 
-Sessions are included when hook `cwd` is inside the repo or when tool path arguments mostly point inside the repo. Unclear sessions are marked ambiguous. Clearly unrelated sessions are excluded. Use `--all-repos` to disable filtering while preserving the repository observed in each trace. Git worktree pointers resolve to their shared repository; deleted Codex worktrees are also collapsed when the same scan contains one unambiguous durable root with the same repository name.
+Sessions are included when hook `cwd` is inside the repo or when tool path arguments mostly point inside the repo. Unclear sessions are marked ambiguous. Clearly unrelated sessions are excluded. Windows drive and UNC paths use Windows path rules even when Scan runs on another platform, so nested working directories can match the selected repository.
+
+Use `--all-repos` to disable filtering and group observed working directories by repository root. Available Git metadata resolves nested directories and worktree pointers to their shared repository. For unavailable paths, recognized repository and worktree path layouts supply inferred grouping roots. Deleted Codex worktrees are also collapsed when the same scan contains one unambiguous durable root with the same repository name. These grouping rules do not verify task/attempt attribution; see [correlation rules](docs/session-correlation.md).
 
 ## Output Structure
 
