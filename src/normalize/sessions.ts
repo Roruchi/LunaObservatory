@@ -2,7 +2,7 @@ import type { SourceName } from "../sources/types.js";
 import { stableId } from "../utils/stableId.js";
 import { durationMs, maxIso, minIso } from "../utils/time.js";
 import { calculateMetrics, reported, unavailable } from "./metrics.js";
-import { isEditTool } from "./toolSemantics.js";
+import { commandOutputStatus, isCommandTool, isEditTool, orchestrationScript } from "./toolSemantics.js";
 import type {
   EvidenceRef,
   NormalizedAssistantMessage,
@@ -223,8 +223,9 @@ function toolOutputText(value: unknown, depth = 0): string {
   if (Array.isArray(value)) return value.map((item) => toolOutputText(item, depth + 1)).filter(Boolean).join("\n");
   if (typeof value !== "object") return String(value);
   const record = value as Record<string, unknown>;
-  return ["text", "value", "output", "result", "content"]
-    .map((key) => toolOutputText(record[key], depth + 1))
+  const metadata = Object.fromEntries(["exit_code", "session_id"].filter((key) => key in record).map((key) => [key, record[key]]));
+  return [Object.keys(metadata).length ? JSON.stringify(metadata) : "", ...["text", "value", "output", "result", "content"]
+    .map((key) => toolOutputText(record[key], depth + 1))]
     .filter(Boolean)
     .join("\n");
 }
@@ -660,20 +661,19 @@ export function normalizeEventsToSession(
           const toolTurn = findTurnByToolCall(turns, [toolCallId]) ?? turn;
           const output = toolOutputText(data.output);
           const existing = toolTurn.toolMap.get(toolCallId);
-          const isOrchestration = /(?:^|[.:/])exec(?:_command)?$/i.test(existing?.name ?? "") &&
-            typeof existing?.arguments === "string" && /\btools\.[\w_]+\s*\(/.test(existing.arguments);
+          const isOrchestration = Boolean(existing && orchestrationScript(existing));
           const editFailed = Boolean(existing && isEditTool(existing)) &&
             /\b(?:apply_patch verification failed|failed to find expected|invalid context|patch failed|could not apply patch)\b/i.test(output);
           const failed = isOrchestration
             ? /\bScript (?:failed|timed out|terminated)\b|\bTool call failed\b/i.test(output)
-            : /Exit code:\s*(?!0\b)\d+/i.test(output) || editFailed;
+            : commandOutputStatus(output) === "failed" || editFailed;
           touchTurnTime(toolTurn, event.timestamp);
           addOrUpdateTool(toolTurn, {
             toolCallId,
             name: toolTurn.toolMap.get(toolCallId)?.name ?? "unknown",
             executionEndedAt: event.timestamp,
             outputText: output,
-            status: failed ? "failed" : "completed",
+            status: failed ? "failed" : commandOutputStatus(output) === "requested" ? "requested" : "completed",
             evidence: output
               ? [evidence(event, "data.output", `${failed ? "failed" : "completed"} output: ${excerpt(output, 220)}`)]
               : undefined
@@ -772,14 +772,17 @@ export function normalizeEventsToSession(
       touchTurnTime(turn, event.timestamp);
       const status = stringValue(data.status)?.toLowerCase();
       const failed = data.success === false || status === "failed" || status === "error" || status === "cancelled";
-      const existingArguments = turn.toolMap.get(toolCallId)?.arguments;
+      const existing = turn.toolMap.get(toolCallId);
+      const existingArguments = existing?.arguments;
+      const output = toolOutputText(data.result ?? data.output);
+      const resultStatus = existing && isCommandTool(existing) && !orchestrationScript(existing) ? commandOutputStatus(output) : "completed";
       addOrUpdateTool(turn, {
         toolCallId,
         name: stringValue(data.toolName) ?? turn.toolMap.get(toolCallId)?.name ?? "unknown",
         arguments: existingArguments,
-        outputText: toolOutputText(data.result ?? data.output),
+        outputText: output,
         executionEndedAt: event.timestamp,
-        status: failed ? "failed" : "completed"
+        status: failed ? "failed" : resultStatus
       });
       continue;
     }

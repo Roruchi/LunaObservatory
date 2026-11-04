@@ -37,7 +37,7 @@ describe("tool semantics", () => {
   it("expands current Codex orchestration into ordered edit and command operations", () => {
     const script =
       'const patch = "*** Begin Patch\\n*** Update File: src/x.ts\\n-old\\n+new\\n*** End Patch"; await tools.apply_patch(patch); await tools.shell_command({command:"npm run test:unit",workdir:"C:\\\\Repo\\\\A"});';
-    const outer = tool("exec", "completed", script, "outer");
+    const outer = { ...tool("exec", "completed", script, "outer"), outputText: "Exit code: 0" };
     const operations = expandToolCalls([outer]);
     expect(operations.map((operation) => operation.name)).toEqual(["apply_patch", "shell_command"]);
     expect(isEditTool(operations[0])).toBe(true);
@@ -196,5 +196,54 @@ describe("native command argument regressions", () => {
       expect(expandToolCalls([outer]).map(call => call.status)).toEqual(["requested", "requested"]);
       expect(verificationClosureForTools([edit, outer])).toBe("missing");
     }
+  });
+});
+
+
+describe("command completion evidence", () => {
+  it("requires output evidence even for one nested command", () => {
+    const edit = tool("apply_patch", "completed", "patch");
+    const wrapper = tool("exec", "completed", 'await tools.exec_command({cmd:"npm test"});');
+    expect(verificationClosureForTools([edit, wrapper])).toBe("missing");
+    expect(verificationClosureForTools([edit, { ...wrapper, outputText: "Exit code: 0" }])).toBe("passed");
+    expect(verificationClosureForTools([edit, { ...wrapper, outputText: '{"exit_code":1}' }])).toBe("failed");
+  });
+
+  it.each(["codex", "copilot"] as const)("preserves structured completion evidence for %s", source => {
+    const root = fs.mkdtempSync(path.resolve("tests/.command-evidence-"));
+    try {
+      const fixture = path.join(root, "events.jsonl");
+      for (const nested of [false, true]) {
+        for (const [result, expected] of [
+          [{ exit_code: 1, output: "tests failed" }, "failed"],
+          [{ exit_code: -1, output: "terminated" }, "failed"],
+          [{ exit_code: null, session_id: 123, output: "started" }, "missing"],
+          [{ session_id: 123, output: "started" }, "missing"],
+          [{ exit_code: 0, output: "tests passed" }, "passed"],
+          ["Process running with session ID 123", "missing"]
+        ] as const) {
+          for (const output of [result, JSON.stringify(result), [{ type: "text", text: typeof result === "string" ? result : JSON.stringify(result) }]]) {
+            const events: unknown[] = [];
+            for (const [id, name, args, response] of [
+              ["edit", "apply_patch", "patch", "Done"],
+              ["check", nested ? "exec" : "exec_command", nested ? 'await tools.exec_command({cmd:"npm test"});' : { cmd: "npm test" }, output]
+            ] as const) {
+              if (source === "codex") events.push(
+                { type: "response_item", payload: { type: "function_call", call_id: id, name, arguments: JSON.stringify(args) } },
+                { type: "response_item", payload: { type: "function_call_output", call_id: id, output: response } }
+              );
+              else events.push(
+                { type: "tool.execution_start", data: { toolCallId: id, toolName: name, arguments: args } },
+                { type: "tool.execution_complete", data: { toolCallId: id, toolName: name, success: true, result: response } }
+              );
+            }
+            fs.writeFileSync(fixture, events.map(event => JSON.stringify({ ...event as object, timestamp: "2026-01-01T10:00:00Z" })).join("\n"));
+            const { session } = parseSessionFile(fixture, source);
+            expect(session.metrics.verificationClosure).toBe(expected);
+            expect(session.metrics.verificationPassed).toBe(expected === "passed" ? 1 : 0);
+          }
+        }
+      }
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 });

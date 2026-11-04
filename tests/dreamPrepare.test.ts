@@ -2,7 +2,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { prepareDreamPacket } from "../src/dream/prepare.js";
+import { loadScanPacket, prepareDreamPacket } from "../src/dream/prepare.js";
+import { scoreSession } from "../src/scoring/score.js";
 import { writeJsonl } from "../src/fs/jsonl.js";
 import { parseSessionFile } from "../src/normalize/parser.js";
 
@@ -30,4 +31,23 @@ describe("dream preparation", () => {
     expect(selected.verificationChecks.some((check) => check.command?.includes("npm test") && check.fresh === false)).toBe(true);
     expect(selected.finalClaims.some((claim) => claim.text.includes("npm test passed") && claim.supported === false)).toBe(true);
   });
+});
+
+
+it("recomputes obsolete cached scores before Dream selection", () => {
+  const root = fs.mkdtempSync(path.resolve("tests/.dream-cache-"));
+  try {
+    const { session } = parseSessionFile(codexFixture, "codex");
+    session.repoMatch = "matched";
+    session.lifecycleStatus = "completed";
+    session.turns.forEach(turn => { turn.toolCalls = []; });
+    session.finalAnswer = { text: "Finished." };
+    const current = scoreSession(session);
+    writeJsonl(path.join(root, "sessions.jsonl"), [session]);
+    writeJsonl(path.join(root, "inefficiency-scores.jsonl"), [{ ...current, scoringVersion: 3, outcomeScore: 65, inefficiencyScore: 0 }]);
+    expect(loadScanPacket(root).scores[0]).toMatchObject({ scoringVersion: 4, outcomeScore: null, inefficiencyScore: null });
+    expect(prepareDreamPacket(root, 1).selectedSessions).toEqual([]);
+    writeJsonl(path.join(root, "inefficiency-scores.jsonl"), [current]);
+    expect(loadScanPacket(root).scores).toEqual([current]);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

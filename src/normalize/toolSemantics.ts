@@ -139,7 +139,7 @@ function embeddedPatch(value: string): string | undefined {
   return template?.[1].replace(/\\n/g, "\n").replace(/\\r/g, "\r");
 }
 
-function orchestrationScript(tool: NormalizedToolCall): string | undefined {
+export function orchestrationScript(tool: NormalizedToolCall): string | undefined {
   const name = baseToolName(tool.name);
   return (name === "exec" || name === "exec_command") && typeof tool.arguments === "string" && /\btools\.[\w_]+\s*\(/.test(tool.arguments)
     ? tool.arguments
@@ -170,17 +170,22 @@ function isSemanticOperationName(name: string): boolean {
   return isDirectView(name) || isDirectGlob(name) || isDirectSearch(name) || isDirectEdit(name) || isDirectCommand(name);
 }
 
+export function commandOutputStatus(output: string): NormalizedToolCall["status"] {
+  if (/Exit code:\s*(?!0\b)-?\d+|"exit_code"\s*:\s*(?!0\b)-?\d+/i.test(output)) return "failed";
+  if (/Script running with cell ID|Process running with session ID|"session_id"\s*:\s*\d+|"exit_code"\s*:\s*null/i.test(output)) return "requested";
+  return "completed";
+}
+
 function nestedOperations(tool: NormalizedToolCall): NormalizedToolCall[] {
   const script = orchestrationScript(tool);
   if (!script) return [tool];
   const matches = scriptCalls(script);
   const nestedCommandCount = matches.filter((match) => isDirectCommand(match.name)).length;
-  const wrapperFailed = tool.status === "failed" || /Exit code:\s*(?!0\b)\d+|"exit_code"\s*:\s*(?!0\b)-?\d+/i.test(tool.outputText ?? "");
+  const wrapperFailed = tool.status === "failed" || commandOutputStatus(tool.outputText ?? "") === "failed";
   const output = tool.outputText ?? "";
   const resultCount = [...output.matchAll(/Exit code:\s*-?\d+|"exit_code"\s*:\s*-?\d+/gi)].length;
   // A wrapper finishing does not prove that every nested command finished.
-  const partial = /Script running with cell ID|"session_id"\s*:\s*\d+|"exit_code"\s*:\s*null/i.test(output) ||
-    nestedCommandCount > 1 && resultCount < nestedCommandCount;
+  const partial = commandOutputStatus(output) === "requested" || resultCount < nestedCommandCount;
   const operations: NormalizedToolCall[] = [];
   for (let index = 0; index < matches.length; index += 1) {
     const name = matches[index].name;
