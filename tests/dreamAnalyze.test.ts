@@ -112,7 +112,7 @@ describe("dream task analysis", () => {
     ]);
   });
 
-  it("treats PowerShell Test-Path as a filesystem observation instead of a test suite", () => {
+  it("leaves an unsupported PowerShell conditional without verification credit", () => {
     const analyzed = analyzeDreamTasks(
       session([
         turn("one", "Inspect the automation memory.", [
@@ -124,10 +124,8 @@ describe("dream task analysis", () => {
       ])
     )[0];
 
-    expect(analyzed.verificationChecks).toContainEqual(
-      expect.objectContaining({ verificationType: "persistence_check", status: "unknown" })
-    );
-    expect(analyzed.verificationChecks).not.toContainEqual(expect.objectContaining({ verificationType: "test" }));
+    // The conditional's execution and read target are outside the bounded shell grammar.
+    expect(analyzed.verificationChecks).toEqual([]);
   });
 
   it("accepts a fresh build after a product-code edit", () => {
