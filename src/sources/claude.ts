@@ -57,7 +57,7 @@ function transcriptScope(file: string, input: NativeRow[]) {
   const child = scope.filter(({ data }) => typeof data.isSidechain === "boolean").at(-1)?.data.isSidechain === true;
   const childAgentId = str(scope.filter(({ data }) => data.isSidechain === child && str(data.agentId)).at(-1)?.data.agentId);
   const sessionId = child && childAgentId ? `${nativeSessionId}:agent:${childAgentId}` : nativeSessionId;
-  return { childAgentId, child, sessionId, sessionIdMissing: !str(last?.sessionId) };
+  return { childAgentId, child, sessionId, nativeSessionId: str(last?.sessionId) ?? null, sessionIdMissing: !str(last?.sessionId) };
 }
 
 export function createClaudeCorpus(inputs: Map<string, Transcript>) {
@@ -81,7 +81,16 @@ export function createClaudeCorpus(inputs: Map<string, Transcript>) {
       return true;
     });
     const history = normalizeHistory(copies.flatMap(item => item.input.rows), group[0].scope, seenRequests, seenEvents, seenTools);
-    if (copies.length > 1) history.unknowns.add("conflicting_session_copies");
+    if (copies.length > 1) {
+      history.unknowns.add("conflicting_session_copies");
+      history.rows.sort((a, b) => {
+        const time = (row: NativeRow) => {
+          const timestamp = Date.parse(str(row.data.timestamp) ?? "");
+          return Number.isFinite(timestamp) ? timestamp : Infinity;
+        };
+        return (time(a) - time(b) || 0) || (a.sourceFile < b.sourceFile ? -1 : a.sourceFile > b.sourceFile ? 1 : a.line - b.line);
+      });
+    }
     const sourceFiles = group.map(item => item.file);
     const sessionParseErrors = copies.reduce((sum, item) => sum + item.input.parseErrors, 0);
     for (const { file, input } of group) corpus.set(file, { input, history, sourceFiles, sessionParseErrors });
@@ -197,7 +206,7 @@ export function parseClaudeSessionFile(file: string, corpus = createClaudeCorpus
     if (row.type === "assistant") {
       const requestId = str(row.requestId);
       const messageId = str(native.id);
-      const key = requestKey(row) ?? `line:${line}`;
+      const key = requestKey(row) ?? `line:${JSON.stringify([sourceFile, line])}`;
       let group = messages.get(key);
       if (!group) {
         const message: NormalizedAssistantMessage = { messageId, requestId, kind: "text", model: str(native.model), contentLength: 0, hasContent: false,
@@ -270,7 +279,7 @@ export function parseClaudeSessionFile(file: string, corpus = createClaudeCorpus
   for (const { message } of messages.values()) if (!message.model) unknowns.add("model_missing");
   times.sort();
   const base: Omit<NormalizedSession, "metrics"> = {
-    sessionId, ...(child && childAgentId ? { agentPath: childAgentId } : {}), source: "claude", sourceFiles, repoMatch: "unknown", repoRoot: worktreePaths.size === 1 ? [...worktreePaths][0] : undefined,
+    sessionId, nativeSessionId: history.nativeSessionId, ...(child && childAgentId ? { agentPath: childAgentId } : {}), source: "claude", sourceFiles, repoMatch: "unknown", repoRoot: worktreePaths.size === 1 ? [...worktreePaths][0] : undefined,
     startedAt: times[0], endedAt: times.at(-1), durationMs: durationMs(times[0], times.at(-1)), lifecycleStatus: "unknown", interactions: [], turns,
     userIntent: firstInstruction, finalAnswer,
     attribution: { branches: [...branches].sort(), worktreePaths: [...worktreePaths].sort(), firstInstruction,

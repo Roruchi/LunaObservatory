@@ -53,7 +53,7 @@ export function sessionObservations(session: NormalizedSession): SessionObservat
 
 /** No fuzzy names, command-output parsing, nearest-time winner, or inferred attempts. */
 export function correlateSession(session: NormalizedSession, records: TaskRecord[], observations = sessionObservations(session)): Correlation {
-  const nativeIdentityUnknowns = session.attribution?.unknowns.filter(reason => reason === "session_id_missing") ?? [];
+  const nativeIdentityUnknowns = session.nativeSessionId ? [] : ["session_id_missing"];
   const candidates: Candidate[] = [];
   const instruction = observations.firstInstruction ?? "";
   records.forEach((record, index) => {

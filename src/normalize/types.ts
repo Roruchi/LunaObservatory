@@ -52,6 +52,7 @@ export type NormalizedSession = {
     unknowns: string[];
   };
   sessionId: string;
+  nativeSessionId?: string | null;
   parentSessionId?: string;
   agentPath?: string;
   source: SourceName;
