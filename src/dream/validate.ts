@@ -235,6 +235,9 @@ function targetMatches(change: DreamChangeClassification, check: DreamTaskWindow
   const changeTarget = normalizedTarget(change.target);
   const checkTarget = normalizedTarget(check.target);
   if (!changeTarget || !checkTarget) return true;
+  if (checkTarget.startsWith("repo:")) {
+    return ["product_code", "tests", "documentation", "repository_metadata"].includes(change.changeType);
+  }
   return changeTarget === checkTarget || changeTarget.endsWith(checkTarget) || checkTarget.endsWith(changeTarget);
 }
 
