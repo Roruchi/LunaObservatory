@@ -142,3 +142,7 @@ LunaObs is still a small v0 evidence analyzer, not a task benchmark or semantic 
 ## Session-to-attempt correlation
 
 `lunaobs correlate --logs /fictional/traces --tasks /fictional/task-records.json --out /fictional/correlation.json` joins local traces to caller-supplied typed Firstmate records. It emits matched, ambiguous or unmatched identities with evidence kinds and digests; it does not score sessions. See [correlation rules and limits](docs/session-correlation.md) and the fully fictional `tests/fixtures/correlation-tasks.json` example.
+
+### Worker report cards
+
+`lunaobs report-card --logs /path/to/traces --tasks /path/to/task-records.json --out /private/worker-cards.md` writes a private evidence card for each worker session and diagnostic parent associated with the supplied tasks. Cards include harness/model, observed duration, tools, verification, outcome limitations, plain inefficiency reasons and correlation confidence. Missing acceptance evidence remains **Unscored / low confidence**; final answers alone do not establish quality. See [recording attempt identities and report-card limits](docs/session-correlation.md#durable-spawn-records).

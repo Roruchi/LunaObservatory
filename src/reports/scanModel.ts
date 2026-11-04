@@ -16,7 +16,7 @@ export type RepositoryReportRow = {
   examplePath: string;
   sessions: number;
   suspicious: number;
-  maxScore: number;
+  maxScore: number | "Unscored";
   toolCalls: number;
   verificationEvents: number;
 };
@@ -158,7 +158,7 @@ function repositoryRows(sessions: NormalizedSession[], scores: InefficiencyScore
         examplePath: repo,
         sessions: 0,
         suspicious: 0,
-        maxScore: 0,
+        maxScore: "Unscored",
         toolCalls: 0,
         verificationEvents: 0
       };
@@ -166,7 +166,8 @@ function repositoryRows(sessions: NormalizedSession[], scores: InefficiencyScore
     row.sessions += 1;
     row.toolCalls += session.metrics.toolRequests;
     row.verificationEvents += session.metrics.verificationEvents;
-    row.maxScore = Math.max(row.maxScore, score?.inefficiencyScore ?? 0);
+    if (score?.inefficiencyScore != null)
+      row.maxScore = Math.max(typeof row.maxScore === "number" ? row.maxScore : 0, score.inefficiencyScore);
     if (score && (score.classification === "suspicious" || score.classification === "inefficient")) row.suspicious += 1;
     if (row.examplePath === "unknown" && repo !== "unknown") row.examplePath = repo;
     repos.set(name, row);
@@ -221,15 +222,16 @@ export function buildScanReportModel(
     .filter(
       (score) =>
         (score.repoMatch === "matched" || score.repoMatch === "ambiguous") &&
+        score.inefficiencyScore !== null && score.outcomeScore !== null &&
         ["suspicious", "inefficient", "expensive_but_justified"].includes(score.classification)
     )
-    .sort((a, b) => b.inefficiencyScore - a.inefficiencyScore)
+    .sort((a, b) => (b.inefficiencyScore ?? -1) - (a.inefficiencyScore ?? -1))
     .slice(0, top)
     .map((score, index) => ({
       rank: index + 1,
       sessionId: score.sessionId,
-      score: score.inefficiencyScore,
-      outcomeScore: score.outcomeScore,
+      score: score.inefficiencyScore!,
+      outcomeScore: score.outcomeScore!,
       classification: score.classification,
       repository: repoName(repoPath(sessions.find((session) => session.sessionId === score.sessionId) ?? ({ repoRoot: score.repoRoot } as NormalizedSession))),
       lifecycleStatus: score.lifecycleStatus,

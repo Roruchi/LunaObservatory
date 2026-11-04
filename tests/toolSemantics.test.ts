@@ -5,6 +5,9 @@ import { describe, expect, it } from "vitest";
 import { parseSessionFile } from "../src/normalize/parser.js";
 import {
   expandToolCalls,
+  toolCommand,
+  canonicalToolSignature,
+  redundantToolStats,
   isCommandTool,
   isEditTool,
   looksLikeVerificationTool,
@@ -109,5 +112,89 @@ describe("tool semantics", () => {
     expect(session.metrics.failedCommands).toBe(1);
     expect(session.metrics.verificationEvents).toBe(1);
     expect(session.turns[0].toolCalls[0].arguments).toEqual({ command: "dotnet test C:\\Repo\\A\\test.csproj", workdir: "C:\\Repo\\A" });
+  });
+});
+
+describe("native command argument regressions", () => {
+  it.each(["exec_command", "functions.exec_command", "Bash", "run_in_terminal"])("extracts cmd and command envelopes for %s", name => {
+    for (const args of [{ cmd: "npm test" }, { command: "npm test" }, { arguments: { cmd: "npm test" } }, JSON.stringify({ cmd: "npm test" })]) {
+      const check = tool(name, "completed", args);
+      expect(toolCommand(check)).toBe("npm test");
+      expect(looksLikeVerificationTool(check)).toBe(true);
+    }
+  });
+
+  it("keeps nested cmd calls distinct and never borrows a later command", () => {
+    const script = 'await tools.exec_command({cmd:"npm test", workdir:"/fictional/repo"}); await tools.exec_command({cmd:"npm run build", workdir:"/fictional/repo"}); await tools.exec_command({cmd: dynamicCommand, workdir:"/fictional/repo"});';
+    const outer = tool("functions.exec", "completed", script);
+    const expanded = expandToolCalls([outer]);
+    expect(expanded.map(toolCommand)).toEqual(["npm test", "npm run build", undefined]);
+    expect(new Set(expanded.map(canonicalToolSignature)).size).toBe(3);
+    expect(redundantToolStats([outer])).toEqual({ duplicate: 0, comparable: 3 });
+    expect(redundantToolStats([outer, { ...outer, toolCallId: "other" }])).toEqual({ duplicate: 2, comparable: 6 });
+  });
+
+  it("handles single-quoted literals, escaped quotes, and tool names inside strings", () => {
+    const outer = tool("exec", "completed", String.raw`await tools.exec_command({cmd: 'npm test', workdir: '/fictional/repo'}); await tools.exec_command({cmd: "echo \"tools.exec_command({cmd: fake})\"", workdir: "/fictional/repo"});`);
+    const expanded = expandToolCalls([outer]);
+    expect(expanded).toHaveLength(2);
+    expect(toolCommand(expanded[0])).toBe("npm test");
+    expect(toolCommand(expanded[1])).toContain("tools.exec_command");
+  });
+
+  it.each(["codex", "claude", "copilot"] as const)("retains direct and nested cmd checks through realistic %s events", source => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "lunaobs-native-cmd-"));
+    try {
+      const fixture = path.join(root, "events.jsonl");
+      const calls = [
+        { name: "apply_patch", args: "*** Begin Patch\n*** End Patch" },
+        { name: source === "claude" ? "Bash" : source === "copilot" ? "run_in_terminal" : "exec_command", args: { cmd: "npm test", workdir: "/fictional/repo" } },
+        { name: "exec", args: 'const results = await Promise.allSettled([tools.exec_command({cmd:"npm run build",workdir:"/fictional/repo"}), tools.exec_command({cmd:"npm run lint",workdir:"/fictional/repo"})]); for (const result of results) text(result);' }
+      ];
+      const stamp = "2026-01-01T10:00:00Z";
+      const events: unknown[] = source === "codex" ? [{ type: "session_meta", timestamp: stamp, payload: { id: "fictional-cmd" } }, { type: "turn_context", timestamp: stamp, payload: { turn_id: "turn" } }] : [];
+      calls.forEach((call, index) => {
+        const id = `call-${index}`;
+        if (source === "codex") events.push(
+          { type: "response_item", timestamp: stamp, payload: { type: call.name === "exec" ? "custom_tool_call" : "function_call", call_id: id, name: call.name, ...(call.name === "exec" ? { input: call.args } : { arguments: JSON.stringify(call.args) }) } },
+          { type: "response_item", timestamp: stamp, payload: { type: "function_call_output", call_id: id, output: [{ type: "input_text", text: "Script completed" }, { type: "input_text", text: call.name === "exec" ? "Exit code: 0\nExit code: 0" : "Exit code: 0" }] } }
+        );
+        else if (source === "claude") events.push(
+          { type: "assistant", uuid: `${id}-request`, sessionId: "fictional-cmd", timestamp: stamp, message: { id, model: "fictional-model", content: [{ type: "tool_use", id, name: call.name, input: call.args }] } },
+          { type: "user", uuid: `${id}-result`, sessionId: "fictional-cmd", timestamp: stamp, message: { content: [{ type: "tool_result", tool_use_id: id, content: call.name === "exec" ? "Exit code: 0\nExit code: 0" : "Exit code: 0", is_error: false }] } }
+        );
+        else events.push(
+          { id: `${id}-request`, type: "tool.execution_start", timestamp: stamp, data: { turnId: "turn", toolCallId: id, toolName: call.name, arguments: call.args } },
+          { id: `${id}-result`, type: "tool.execution_complete", timestamp: stamp, data: { turnId: "turn", toolCallId: id, toolName: call.name, success: true, result: { content: call.name === "exec" ? "Exit code: 0\nExit code: 0" : "Exit code: 0" } } }
+        );
+      });
+      fs.writeFileSync(fixture, events.map(event => JSON.stringify(event)).join("\n"));
+      const { session, parseErrors } = parseSessionFile(fixture, source);
+      expect(parseErrors).toBe(0);
+      expect(session.metrics.verificationEvents).toBe(3);
+      expect(session.metrics.verificationPassed).toBe(3);
+      expect(session.metrics.verificationClosure).toBe("passed");
+      expect(session.metrics.duplicateToolCalls).toBe(0);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("leaves dynamic commands unknown instead of extracting literals from other properties", () => {
+    for (const script of [
+      'await tools.exec_command({cmd: dynamic, note: \'{cmd:"npm test"}\'});',
+      'await tools.exec_command({cmd: "npm test" + suffix});',
+      'await tools.exec_command({cmd: `npm test ${target}`});'
+    ]) {
+      expect(toolCommand(expandToolCalls([tool("exec", "completed", script)])[0])).toBeUndefined();
+    }
+  });
+
+  it("does not promote partial or multi-command failed results into passing verification", () => {
+    const edit = tool("apply_patch", "completed", "patch");
+    const script = 'await tools.exec_command({cmd:"npm test"}); await tools.exec_command({cmd:"npm run build"});';
+    for (const outputText of ['{"exit_code":null,"session_id":123}', '{"exit_code":0}', '{"session_id":123}', 'Script running with cell ID 123', '{"exit_code":1,"output":"failed"}']) {
+      const outer = { ...tool("exec", "completed", script), outputText };
+      expect(expandToolCalls([outer]).map(call => call.status)).toEqual(["requested", "requested"]);
+      expect(verificationClosureForTools([edit, outer])).toBe("missing");
+    }
   });
 });

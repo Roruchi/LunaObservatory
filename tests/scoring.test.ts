@@ -18,6 +18,12 @@ function baseSession(partial: Partial<NormalizedSession>): NormalizedSession {
 }
 
 describe("scoring", () => {
+  it("abstains on completed final-answer-only workers instead of returning 65/0", () => {
+    const item = baseSession({ lifecycleStatus: "completed", finalAnswer: { text: "Finished." }, turns: [
+      { turnId: "one", lifecycleStatus: "completed", assistantMessages: [], toolCalls: [], hooks: [] }
+    ] });
+    expect(scoreSession(item)).toMatchObject({ scoringVersion: 4, outcomeScore: null, inefficiencyScore: null, classification: "unknown", evidenceStatus: "unscored", confidence: "low" });
+  });
   it("adds high tool churn and missing verification reason codes", () => {
     const session = baseSession({
       turns: [
@@ -148,7 +154,9 @@ describe("scoring", () => {
       ]
     });
     expect(session.metrics.taskCompletionRate).toBe(0.5);
-    expect(scoreSession(session).outcomeScore).toBeLessThanOrEqual(35);
+    expect(scoreSession(session).outcomeScore).toBeNull();
+    expect(scoreSession(session).inefficiencyScore).toBeNull();
+    expect(scoreSession(session).evidenceStatus).toBe("unscored");
   });
 
   it("classifies a verified high-churn success as expensive rather than efficient", () => {

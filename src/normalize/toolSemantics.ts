@@ -50,9 +50,84 @@ function parseQuotedString(value: string): string | undefined {
   }
 }
 
+/** Decode static JS string literals without evaluating trace code. */
+function literalValue(literal: string): string | undefined {
+  if (literal.startsWith('"')) return parseQuotedString(literal);
+  if (literal.startsWith("`") && literal.includes("${")) return undefined;
+  let value = "";
+  const escapes: Record<string, string> = { n: "\n", r: "\r", t: "\t", b: "\b", f: "\f", v: "\v", "0": "\0" };
+  for (let index = 1; index < literal.length - 1; index++) {
+    const char = literal[index];
+    if (char !== "\\") { value += char; continue; }
+    const escaped = literal[++index];
+    if (escaped === "x" || escaped === "u") {
+      const length = escaped === "x" ? 2 : 4;
+      const hex = literal.slice(index + 1, index + 1 + length);
+      if (!new RegExp(`^[a-f0-9]{${length}}$`, "i").test(hex)) return undefined;
+      value += String.fromCharCode(parseInt(hex, 16)); index += length;
+    } else if (escaped === "\n") continue;
+    else value += escapes[escaped] ?? escaped;
+  }
+  return value;
+}
+
+function literalEnd(value: string, start: number): number {
+  const quote = value[start];
+  let end = start + 1;
+  for (; end < value.length; end++) {
+    if (value[end] === "\\") end++;
+    else if (value[end] === quote) return end + 1;
+  }
+  return value.length;
+}
+
 function embeddedProperty(value: string, property: string): string | undefined {
-  const match = new RegExp(`\\b${property}\\s*:\\s*("(?:\\\\.|[^"\\\\])*")`, "i").exec(value);
-  return match ? parseQuotedString(match[1]) : undefined;
+  const key = new RegExp(`^(?:${property}|"${property}"|'${property}')\\s*:\\s*`, "i");
+  let depth = 0;
+  for (let index = 0; index < value.length;) {
+    const preceding = value.slice(0, index).trimEnd().at(-1);
+    if (depth <= 1 && (preceding === "{" || preceding === "," || index === 0)) {
+      const match = key.exec(value.slice(index));
+      if (match) {
+        const start = index + match[0].length;
+        if (!'"\'`'.includes(value[start] ?? " ")) return undefined;
+        const end = literalEnd(value, start);
+        // A literal followed by concatenation or interpolation is not static.
+        if (!/^[,}]/.test(value.slice(end).trimStart())) return undefined;
+        return literalValue(value.slice(start, end));
+      }
+    }
+    if ('"\'`'.includes(value[index])) { index = literalEnd(value, index); continue; }
+    if (value.startsWith("//", index)) { const end = value.indexOf("\n", index); index = end < 0 ? value.length : end + 1; continue; }
+    if (value.startsWith("/*", index)) { const end = value.indexOf("*/", index + 2); index = end < 0 ? value.length : end + 2; continue; }
+    if (value[index] === "{") depth++;
+    if (value[index] === "}") depth--;
+    index++;
+  }
+  return undefined;
+}
+
+/** Locate bounded call arguments; strings/comments never introduce tool calls. */
+function scriptCalls(script: string): { name: string; source: string }[] {
+  const calls: { name: string; source: string }[] = [];
+  for (let index = 0; index < script.length;) {
+    if ('"\'`'.includes(script[index])) { index = literalEnd(script, index); continue; }
+    if (script.startsWith("//", index)) { const end = script.indexOf("\n", index); index = end < 0 ? script.length : end + 1; continue; }
+    if (script.startsWith("/*", index)) { const end = script.indexOf("*/", index + 2); index = end < 0 ? script.length : end + 2; continue; }
+    const match = /^(?:tools)\.([a-zA-Z0-9_]+)\s*\(/.exec(script.slice(index));
+    if (!match || index > 0 && /[\w$.]/.test(script[index - 1])) { index++; continue; }
+    const start = index;
+    index += match[0].length;
+    let depth = 1;
+    while (index < script.length && depth) {
+      if ('"\'`'.includes(script[index])) { index = literalEnd(script, index); continue; }
+      if (script[index] === "(") depth++;
+      if (script[index] === ")") depth--;
+      index++;
+    }
+    calls.push({ name: match[1], source: script.slice(start, index) });
+  }
+  return calls;
 }
 
 function embeddedPatch(value: string): string | undefined {
@@ -98,21 +173,24 @@ function isSemanticOperationName(name: string): boolean {
 function nestedOperations(tool: NormalizedToolCall): NormalizedToolCall[] {
   const script = orchestrationScript(tool);
   if (!script) return [tool];
-  const matches = [...script.matchAll(/\btools\.([a-zA-Z0-9_]+)\s*\(/g)];
-  const nestedCommandCount = matches.filter((match) => isDirectCommand(match[1])).length;
-  const wrapperFailed = tool.status === "failed" || /Exit code:\s*(?!0\b)\d+/i.test(tool.outputText ?? "");
+  const matches = scriptCalls(script);
+  const nestedCommandCount = matches.filter((match) => isDirectCommand(match.name)).length;
+  const wrapperFailed = tool.status === "failed" || /Exit code:\s*(?!0\b)\d+|"exit_code"\s*:\s*(?!0\b)-?\d+/i.test(tool.outputText ?? "");
+  const output = tool.outputText ?? "";
+  const resultCount = [...output.matchAll(/Exit code:\s*-?\d+|"exit_code"\s*:\s*-?\d+/gi)].length;
+  // A wrapper finishing does not prove that every nested command finished.
+  const partial = /Script running with cell ID|"session_id"\s*:\s*\d+|"exit_code"\s*:\s*null/i.test(output) ||
+    nestedCommandCount > 1 && resultCount < nestedCommandCount;
   const operations: NormalizedToolCall[] = [];
   for (let index = 0; index < matches.length; index += 1) {
-    const name = matches[index][1];
+    const name = matches[index].name;
     if (!isSemanticOperationName(name)) continue;
-    const start = matches[index].index ?? 0;
-    const end = matches[index + 1]?.index ?? script.length;
-    const callSource = script.slice(start, end);
+    const callSource = matches[index].source;
     let args: unknown = callSource;
     if (isDirectCommand(name)) {
       args = {
-        command: embeddedProperty(callSource, "command") ?? embeddedProperty(script, "command"),
-        workdir: embeddedProperty(callSource, "workdir") ?? embeddedProperty(script, "workdir")
+        command: embeddedProperty(callSource, "command") ?? embeddedProperty(callSource, "cmd"),
+        workdir: embeddedProperty(callSource, "workdir")
       };
     } else if (isDirectEdit(name)) {
       args = embeddedPatch(callSource) ?? embeddedPatch(script) ?? callSource;
@@ -125,7 +203,7 @@ function nestedOperations(tool: NormalizedToolCall): NormalizedToolCall[] {
       toolCallId: `${tool.toolCallId}:nested:${index + 1}`,
       name,
       arguments: args,
-      status: isDirectCommand(name) && wrapperFailed ? (nestedCommandCount === 1 ? "failed" : "requested") : tool.status
+      status: isDirectCommand(name) && partial ? "requested" : isDirectCommand(name) && wrapperFailed ? (nestedCommandCount === 1 ? "failed" : "requested") : tool.status
     });
   }
   return operations.length ? operations : [tool];
@@ -138,14 +216,23 @@ export function expandToolCalls(tools: NormalizedToolCall[]): NormalizedToolCall
 export function toolCommand(tool: NormalizedToolCall): string | undefined {
   if (!isCommandTool(tool)) return undefined;
   const args = tool.arguments;
-  if (typeof args === "string") return embeddedProperty(args, "command") ?? args;
+  if (typeof args === "string") {
+    try { return commandArgument(JSON.parse(args)); } catch { /* Native shell strings are also valid. */ }
+    return embeddedProperty(args, "command") ?? embeddedProperty(args, "cmd") ?? args;
+  }
+  return commandArgument(args);
+}
+
+function commandArgument(args: unknown): string | undefined {
+  if (typeof args === "string") {
+    try { return commandArgument(JSON.parse(args)); } catch { return undefined; }
+  }
   if (!args || typeof args !== "object") return undefined;
   const record = args as Record<string, unknown>;
   if (typeof record.command === "string") return record.command;
-  const nested = record.arguments;
-  if (nested && typeof nested === "object" && typeof (nested as Record<string, unknown>).command === "string") {
-    return (nested as Record<string, unknown>).command as string;
-  }
+  if (typeof record.cmd === "string") return record.cmd;
+  // Native wrappers can retain a second arguments envelope.
+  if (record.arguments !== args) return commandArgument(record.arguments);
   return undefined;
 }
 
@@ -228,7 +315,11 @@ export function verificationLaneKey(tool: NormalizedToolCall): string {
 }
 
 export function canonicalToolSignature(tool: NormalizedToolCall): string {
-  if (isCommandTool(tool)) return `${baseToolName(tool.name)}:${verificationLaneKey(tool)}`;
+  if (isCommandTool(tool)) {
+    // Unknown commands are not evidence that two operations were redundant.
+    if (!toolCommand(tool)) return `${baseToolName(tool.name)}:unknown:${tool.toolCallId}`;
+    return `${baseToolName(tool.name)}:${verificationLaneKey(tool)}`;
+  }
   return `${baseToolName(tool.name)}:${JSON.stringify(stableValue(tool.arguments))}`;
 }
 

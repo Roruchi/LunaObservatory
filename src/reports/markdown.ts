@@ -47,6 +47,8 @@ export function generateScanReport(
   const lines = [
     "# LunaObs Scan Report",
     "",
+    "Low-confidence session heuristics only; these numbers do not establish workpackage quality or acceptance. Workers without tool evidence are unscored.",
+    "",
     "## Summary",
     "",
     `- Files scanned: ${summary.filesScanned}`,

@@ -337,6 +337,9 @@ function roleSelections(scores: InefficiencyScore[], perGroupLimit: number): Arr
   };
   const activeFamilies = new Set(scores.filter((score) => score.lifecycleStatus === "in_progress").map(familyFor));
   const completedScores = scores.filter(
+    (score): score is InefficiencyScore & { outcomeScore: number; inefficiencyScore: number } =>
+      score.outcomeScore != null && score.inefficiencyScore != null
+  ).filter(
     (score) => score.lifecycleStatus !== "in_progress" && !activeFamilies.has(familyFor(score))
   );
 

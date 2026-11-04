@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { reportCardsFromTraces } from "./reports/workerReportCard.js";
 import fs from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
@@ -129,7 +130,7 @@ function scan(options: {
   const scores = sessions
     .filter((session) => session.repoMatch === "matched" || session.repoMatch === "ambiguous")
     .map((session) => scoreSession(session))
-    .sort((a, b) => b.inefficiencyScore - a.inefficiencyScore);
+    .sort((a, b) => (b.inefficiencyScore ?? -1) - (a.inefficiencyScore ?? -1));
 
   const summary: ScanSummary = {
     filesScanned,
@@ -232,6 +233,17 @@ function validateDream(input: string, out?: string): void {
 const program = new Command();
 
 program.name("lunaobs").description("Local-first observatory for coding-agent session traces.").version("0.1.0");
+
+program.command("report-card")
+  .description("Write private per-worker evidence cards without inventing quality scores.")
+  .requiredOption("--logs <path>", "explicit trace directory or file")
+  .requiredOption("--tasks <path>", "typed task-record JSON file")
+  .requiredOption("--out <path>", "Markdown report output file")
+  .option("--source <source>", "copilot|codex|claude|all", sourceOption, "all")
+  .action((options: { logs: string; tasks: string; out: string; source: RequestedSource }) => {
+    fs.writeFileSync(options.out, reportCardsFromTraces(options.logs, options.tasks, options.source), "utf8");
+    console.log(`Worker report cards: ${options.out}`);
+  });
 
 program.command("correlate")
   .description("Join local traces to caller-supplied Firstmate task records without scoring.")

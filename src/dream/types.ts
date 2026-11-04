@@ -123,8 +123,8 @@ export type DreamSession = {
   role?: DreamSelectionRole;
   selectionReason?: string;
   classification?: string;
-  inefficiencyScore?: number;
-  outcomeScore?: number;
+  inefficiencyScore?: number | null;
+  outcomeScore?: number | null;
   reasonCodes: ReasonCode[];
   metrics: Partial<SessionMetrics>;
   declaredIntents: string[];
@@ -149,8 +149,8 @@ export type DreamPacket = {
   omittedSessions: Array<{
     sessionId: string;
     classification?: string;
-    inefficiencyScore?: number;
-    outcomeScore?: number;
+    inefficiencyScore?: number | null;
+    outcomeScore?: number | null;
   }>;
 };
 

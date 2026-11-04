@@ -777,6 +777,7 @@ export function normalizeEventsToSession(
         toolCallId,
         name: stringValue(data.toolName) ?? turn.toolMap.get(toolCallId)?.name ?? "unknown",
         arguments: existingArguments,
+        outputText: toolOutputText(data.result ?? data.output),
         executionEndedAt: event.timestamp,
         status: failed ? "failed" : "completed"
       });

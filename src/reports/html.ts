@@ -300,7 +300,7 @@ export function generateScanHtmlReport(
       <div>
         <p class="eyebrow">LunaObs Scan</p>
         <h1>Session Inefficiency Report</h1>
-        <p class="subtitle">A local summary of scanned agent sessions, outcome evidence, task-normalized effort, repository spread, and telemetry coverage.</p>
+        <p class="subtitle">Low-confidence session heuristics only. These numbers do not establish workpackage quality or acceptance. Workers without tool evidence are unscored.</p>
       </div>
       <aside class="generated">
         <span>Generated at</span>
