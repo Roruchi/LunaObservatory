@@ -456,3 +456,42 @@ it.each([
 ])("classifies only common check command positions: %s", (cmd, expected) => {
   expect(commandCheckType(tool("exec_command", "completed", { cmd }))).toBe(expected);
 });
+
+
+describe("assignment-aware internal identity", () => {
+  const check = (id: string, suite: string, status: NormalizedToolCall["status"] = "completed") => tool("exec_command", status, { cmd: `TEST_SUITE=${suite} npm test` }, id);
+  it("separates literal values without changing recognition", () => {
+    const unit = check("unit", "unit");
+    const integration = check("integration", "integration");
+    expect(commandCheckType(unit)).toBe("test");
+    expect(commandCheckType(integration)).toBe("test");
+    expect(verificationLaneKey(unit)).not.toBe(verificationLaneKey(integration));
+    expect(canonicalToolSignature(unit)).not.toBe(canonicalToolSignature(integration));
+    expect(redundantToolStats([unit, integration]).duplicate).toBe(0);
+    expect(redundantToolStats([unit, check("unit-repeat", "unit")]).duplicate).toBe(1);
+    expect(verificationLaneKey(unit)).not.toBe(verificationLaneKey(check("case", "Unit")));
+  });
+  it("uses assignment names and canonical key order", () => {
+    const first = tool("exec_command", "completed", { cmd: "MODE=unit SUITE=fast npm test" }, "first");
+    const reordered = tool("exec_command", "completed", { cmd: "SUITE=fast MODE=unit npm test" }, "reordered");
+    const renamed = tool("exec_command", "completed", { cmd: "OTHER=unit SUITE=fast npm test" }, "renamed");
+    expect(verificationLaneKey(first)).toBe(verificationLaneKey(reordered));
+    expect(verificationLaneKey(first)).not.toBe(verificationLaneKey(renamed));
+  });
+  it.each(["$SUITE", "$(suite-selector)"])("abstains from equivalence for opaque values: %s", suite => {
+    const first = check("first", suite);
+    const second = check("second", suite);
+    expect(commandCheckType(first)).toBe("test");
+    expect(verificationLaneKey(first)).not.toBe(verificationLaneKey(second));
+    expect(redundantToolStats([first, second]).duplicate).toBe(0);
+    expect(repeatedFailureStats([{ ...first, status: "failed" }, second, { ...first, toolCallId: "third", status: "failed" }])).toEqual({ repeated: 0, failed: 2 });
+  });
+  it("does not let another literal suite reset a failure episode", () => {
+    const failure = check("failed", "unit", "failed");
+    expect(repeatedFailureStats([failure, check("other", "integration"), { ...failure, toolCallId: "retry" }])).toEqual({ repeated: 1, failed: 2 });
+  });
+  it("shares identity across the supported single wrapper and plain body", () => {
+    const wrapped = tool("exec_command", "completed", { cmd: "bash -c 'TEST_SUITE=unit npm test'" }, "wrapped");
+    expect(verificationLaneKey(wrapped)).toBe(verificationLaneKey(check("plain", "unit")));
+  });
+});

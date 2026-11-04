@@ -504,3 +504,18 @@ it.each([true, false])("preserves option-bearing checks through frozen Dream (fa
   expect(packet.selectedSessions[0].tasks![0].verificationChecks.map(check => check.status)).toEqual(failed ? ["failed", "passed"] : ["passed"]);
   expect(report.scores.find(score => score.category === "Verification quality")?.score).toBe(failed ? 0 : 5);
 });
+
+
+it.each(["TEST_SUITE=integration npm test", "TEST_SUITE=$SUITE npm test", "bash -c 'TEST_SUITE=integration npm test'"])("preserves assignment-selected failures in frozen Dream: %s", later => {
+  const opaque = later.includes("$SUITE");
+  const session = captureVerificationCalls([
+    { name: "apply_patch", args: "*** Begin Patch\n*** Update File: map.ts\n*** End Patch", output: "Done" },
+    { name: "exec_command", args: { cmd: opaque ? "TEST_SUITE=$SUITE npm test" : "TEST_SUITE=unit npm test" }, output: { exit_code: 1, output: "failed" } },
+    { name: "exec_command", args: { cmd: later }, output: { exit_code: 0, output: "passed" } }
+  ]);
+  const { packet, report } = frozenVerification(session);
+  const checks = packet.selectedSessions[0].tasks![0].verificationChecks;
+  expect(checks[0].lane).not.toBe(checks[1].lane);
+  expect(session.metrics.verificationClosure).toBe("failed");
+  expect(report.scores.find(score => score.category === "Verification quality")?.score).toBe(0);
+});

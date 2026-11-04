@@ -531,3 +531,22 @@ it.each(["codex", "copilot"] as const)("keeps option-bearing test failures visib
     expect(scoreSession(passed).outcomeScore).toBe(90);
   }
 });
+
+
+it.each(["codex", "copilot"] as const)("keeps assignment-selected verification lanes separate for %s", source => {
+  for (const prefix of ["", "rtk ", "env "]) for (const nested of [false, true]) {
+    const check = (suite: string, exit: number): Call => {
+      const cmd = `${prefix}TEST_SUITE=${suite} npm test`;
+      return nested ? wrapped(`text(await tools.exec_command(${JSON.stringify({ cmd })}));`, [envelope(exit)])
+        : { name: "exec_command", args: { cmd }, output: envelope(exit) };
+    };
+    const failed = capture([edit, check("unit", 1), check("integration", 0)], source);
+    failed.lifecycleStatus = "completed";
+    expect(failed.metrics.verificationClosure).toBe("failed");
+    expect(scoreSession(failed).outcomeScore).toBe(30);
+    const recovered = capture([edit, check("unit", 1), check("unit", 0)], source);
+    expect(recovered.metrics.verificationClosure).toBe("passed");
+    const unresolved = capture([edit, check("$SUITE", 1), check("$SUITE", 0)], source);
+    expect(unresolved.metrics.verificationClosure).toBe("failed");
+  }
+});

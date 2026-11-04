@@ -655,7 +655,9 @@ export function canonicalCommand(command: string): string {
 
 export function verificationLaneKey(tool: NormalizedToolCall): string {
   const command = canonicalCommand(verificationCommand(tool) ?? toolCommand(tool) ?? tool.name);
-  const workdir = executionDirectory(tool) ?? `unknown-workdir:${tool.toolCallId}`;
+  const assignments = Object.entries(commandEnvironment(tool)).sort(([left], [right]) => left.localeCompare(right));
+  const environment = assignments.length ? `|env:${JSON.stringify(assignments)}${assignments.some(([, value]) => value === null) ? `|unknown:${tool.toolCallId}` : ""}` : "";
+  const workdir = `${executionDirectory(tool) ?? `unknown-workdir:${tool.toolCallId}`}${environment}`;
   const packageScript = /\b(npm|pnpm|yarn|bun)\s+(?:run\s+)?((?:test|build|lint|check|validate|typecheck)(?:[:_-][\w-]+)*)\b/.exec(command);
   if (packageScript) return `${workdir}|${packageScript[1]}:${packageScript[2]}|${command}`;
   const godot = /\btools\/godot\.ps1\b.*?\b(parse|boot|test|export(?:-web)?|check-android-env)\b/.exec(command);
